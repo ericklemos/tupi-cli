@@ -109,6 +109,58 @@ fn collect(root: &Path) -> Result<Vec<PathBuf>, IndexError> {
         .collect())
 }
 
+const MAX_NAMES_PER_FILE: usize = 12;
+
+pub fn render(index: &Index, budget_tokens: usize) -> String {
+    if index.files.is_empty() {
+        return String::new();
+    }
+
+    let mut ordered: Vec<&IndexFile> = index.files.iter().collect();
+    ordered.sort_by(|a, b| {
+        entry_point(b)
+            .cmp(&entry_point(a))
+            .then_with(|| b.symbols.len().cmp(&a.symbols.len()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut out = String::from("root: .\n");
+    for file in ordered {
+        let line = render_line(file);
+        let candidate = format!("{out}{line}\n");
+        if crate::budget::estimate_tokens(&candidate) > budget_tokens {
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
+fn entry_point(file: &IndexFile) -> bool {
+    let name = Path::new(&file.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    matches!(name, "main.rs" | "lib.rs" | "mod.rs")
+}
+
+fn render_line(file: &IndexFile) -> String {
+    if file.symbols.is_empty() {
+        return file.path.clone();
+    }
+
+    let names: Vec<&str> = file
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let shown: Vec<&str> = names.iter().take(MAX_NAMES_PER_FILE).copied().collect();
+    let mut line = format!("{} :: {}", file.path, shown.join(", "));
+    if names.len() > shown.len() {
+        line.push_str(&format!(" (+{})", names.len() - shown.len()));
+    }
+    line
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +179,24 @@ mod tests {
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(dir.path().join("src/blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
         dir
+    }
+
+    fn file(path: &str, names: &[&str]) -> IndexFile {
+        IndexFile {
+            path: path.into(),
+            hash: "deadbeefcafe".into(),
+            language: "rust".into(),
+            symbols: names
+                .iter()
+                .map(|name| IndexSymbol {
+                    name: name.to_string(),
+                    qualified: name.to_string(),
+                    signature: format!("pub fn {name}()"),
+                    start_line: 1,
+                    end_line: 2,
+                })
+                .collect(),
+        }
     }
 
     #[test]
@@ -176,5 +246,67 @@ mod tests {
     fn repo_key_is_stable_for_the_same_root() {
         let dir = fixture();
         assert_eq!(repo_key(dir.path()), repo_key(dir.path()));
+    }
+
+    #[test]
+    fn render_puts_entry_points_first() {
+        let index = Index {
+            version: 1,
+            scanned_at_unix: 0,
+            files: vec![
+                file("src/z.rs", &["a"]),
+                file("src/lib.rs", &["b"]),
+                file("src/a.rs", &["c", "d"]),
+            ],
+        };
+        let out = render(&index, 4000);
+        let lines: Vec<&str> = out.lines().skip(1).collect();
+        assert!(lines[0].starts_with("src/lib.rs"));
+        assert!(lines[1].starts_with("src/a.rs"));
+    }
+
+    #[test]
+    fn render_never_prints_hashes_or_signatures() {
+        let index = Index {
+            version: 1,
+            scanned_at_unix: 0,
+            files: vec![file("src/lib.rs", &["alpha"])],
+        };
+        let out = render(&index, 4000);
+        assert!(out.contains("src/lib.rs :: alpha"));
+        assert!(!out.contains("deadbeef"));
+        assert!(!out.contains("pub fn"));
+    }
+
+    #[test]
+    fn render_respects_the_budget() {
+        let files: Vec<IndexFile> = (0..400)
+            .map(|n| file(&format!("src/f{n:03}.rs"), &["alpha", "beta"]))
+            .collect();
+        let index = Index {
+            version: 1,
+            scanned_at_unix: 0,
+            files,
+        };
+        let out = render(&index, 300);
+        assert!(crate::budget::estimate_tokens(&out) <= 300);
+    }
+
+    #[test]
+    fn render_is_stable_and_truncates_names() {
+        let names: Vec<String> = (0..20).map(|n| format!("s{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let index = Index {
+            version: 1,
+            scanned_at_unix: 0,
+            files: vec![file("src/lib.rs", &names)],
+        };
+        assert_eq!(render(&index, 4000), render(&index, 4000));
+        assert!(render(&index, 4000).contains("(+8)"));
+    }
+
+    #[test]
+    fn render_of_an_empty_index_is_empty() {
+        assert_eq!(render(&Index::default(), 4000), "");
     }
 }

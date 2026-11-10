@@ -35,11 +35,7 @@ pub struct EditTool {
 }
 
 impl EditTool {
-    pub fn new(
-        root_dir: PathBuf,
-        store: Arc<ResponseStore>,
-        default_budget_tokens: usize,
-    ) -> Self {
+    pub fn new(root_dir: PathBuf, store: Arc<ResponseStore>, default_budget_tokens: usize) -> Self {
         Self {
             root_dir,
             store,
@@ -56,8 +52,9 @@ impl EditTool {
             )));
         }
 
-        let original = std::fs::read(&path)
-            .map_err(|error| ToolError::Other(format!("falha ao ler {}: {error}", path.display())))?;
+        let original = std::fs::read(&path).map_err(|error| {
+            ToolError::Other(format!("falha ao ler {}: {error}", path.display()))
+        })?;
         let content = String::from_utf8(original.clone()).map_err(|_| {
             ToolError::Other(format!(
                 "{} não é UTF-8 válido; nada foi escrito",
@@ -119,7 +116,12 @@ impl EditTool {
             }
         };
 
-        let new_content = splice(&content, &span, &params.new_body, params.signature.as_deref())?;
+        let new_content = splice(
+            &content,
+            &span,
+            &params.new_body,
+            params.signature.as_deref(),
+        )?;
         if let Some(line) = first_parse_error(&new_content) {
             return Err(ToolError::InvalidSyntax(format!(
                 "o arquivo não parsearia depois da edição (erro na linha {line}); nada foi escrito"
@@ -128,8 +130,9 @@ impl EditTool {
 
         // O hash e o rename não são atômicos juntos: um format-on-save pode cair
         // na janela. Reler imediatamente antes de escrever evita o clobber.
-        let current = std::fs::read(&path)
-            .map_err(|error| ToolError::Other(format!("falha ao reler {}: {error}", path.display())))?;
+        let current = std::fs::read(&path).map_err(|error| {
+            ToolError::Other(format!("falha ao reler {}: {error}", path.display()))
+        })?;
         if current != original {
             return Err(ToolError::StaleHash(format!(
                 "arquivo mudou durante a edição; hash atual: `{}`",
@@ -303,7 +306,9 @@ fn splice(
 
 fn first_parse_error(content: &str) -> Option<usize> {
     let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
     let tree = parser.parse(content, None)?;
     let root = tree.root_node();
     if !root.has_error() {
@@ -425,7 +430,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::Arc;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tupi_kernel::{Tool, ToolError};
 
     use crate::budget::DEFAULT_BUDGET_TOKENS;
@@ -510,7 +515,10 @@ mod tests {
         let out = tool.edit(again).unwrap();
 
         assert!(out.contains("já aplicada"), "{out}");
-        assert_eq!(fs::read_to_string(dir.path().join("auth.rs")).unwrap(), after);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.rs")).unwrap(),
+            after
+        );
     }
 
     #[test]
@@ -547,7 +555,10 @@ mod tests {
         tool_for(dir.path()).edit(request).unwrap();
 
         let after = fs::read_to_string(dir.path().join("auth.rs")).unwrap();
-        assert!(after.contains("pub fn verify(raw: &str) -> u8 {\n    1\n}"), "{after}");
+        assert!(
+            after.contains("pub fn verify(raw: &str) -> u8 {\n    1\n}"),
+            "{after}"
+        );
     }
 
     #[test]
@@ -559,7 +570,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
-        assert_eq!(fs::read_to_string(dir.path().join("auth.rs")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.rs")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -571,7 +585,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidSyntax(_)), "{error:?}");
-        assert_eq!(fs::read_to_string(dir.path().join("auth.rs")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.rs")).unwrap(),
+            before
+        );
     }
 
     #[test]

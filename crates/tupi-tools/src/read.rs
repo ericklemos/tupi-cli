@@ -18,6 +18,8 @@ pub struct ReadParams {
     pub budget_tokens: Option<usize>,
     /// `"allow"` pede o corpo mesmo se esta sessão já o recebeu.
     pub repeat: Option<String>,
+    /// Opcional: lê `rev:path` (commit, tag ou ref) em vez da árvore de trabalho.
+    pub rev: Option<String>,
 }
 
 /// Uma seção e o que dizer ao ledger quando se decidir se ela entrou na resposta.
@@ -60,6 +62,26 @@ impl ReadTool {
     }
 
     pub fn read(&self, params: ReadParams) -> Result<String, ToolError> {
+        if let Some(rev) = params
+            .rev
+            .as_deref()
+            .map(str::trim)
+            .filter(|rev| !rev.is_empty())
+        {
+            let (reference, sections) = self.rev_sections(&params, rev)?;
+            let rendered = sections
+                .into_iter()
+                .map(|section| Rendered {
+                    section,
+                    pending: None,
+                })
+                .collect();
+            return Ok(format!(
+                "{reference}\n\n{}",
+                self.finish(rendered, params.budget_tokens)
+            ));
+        }
+
         let (path, content, relative) = self.prepare(&params)?;
         let rendered = self.render(&params, &path, &content, &relative)?;
 
@@ -70,7 +92,85 @@ impl ReadTool {
             )));
         }
 
-        Ok(self.finish(rendered, params.budget_tokens))
+        let hash = crate::ledger::short_hash(&crate::ledger::content_hash(&content));
+        let mut reference = format!("[ref] {relative} @{hash}");
+        if let Some(symbol) = &params.symbol {
+            reference.push_str(" :: ");
+            reference.push_str(symbol);
+        }
+
+        Ok(format!(
+            "{reference}\n\n{}",
+            self.finish(rendered, params.budget_tokens)
+        ))
+    }
+
+    pub(crate) fn prepare_rev(
+        &self,
+        params: &ReadParams,
+        rev: &str,
+    ) -> Result<(PathBuf, String, String), ToolError> {
+        let root = self
+            .root_dir
+            .canonicalize()
+            .map_err(|_| ToolError::OutsideRoot(params.path.clone()))?;
+        let candidate = Path::new(&params.path);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+        let normalized = crate::paths::normalize(&joined);
+        if !normalized.starts_with(&root) {
+            return Err(ToolError::OutsideRoot(params.path.clone()));
+        }
+        let relative = normalized
+            .strip_prefix(&root)
+            .unwrap_or(&normalized)
+            .display()
+            .to_string();
+        let output = crate::proc::program(
+            "git",
+            &["show".to_string(), format!("{rev}:{relative}")],
+            &root,
+            std::time::Duration::from_secs(30),
+        )?;
+        if !output.success {
+            return Err(ToolError::NotFound(format!("{rev}:{relative}")));
+        }
+        Ok((normalized, output.stdout, format!("{relative}@{rev}")))
+    }
+
+    pub(crate) fn rev_sections(
+        &self,
+        params: &ReadParams,
+        rev: &str,
+    ) -> Result<(String, Vec<Section>), ToolError> {
+        let (path, content, relative) = self.prepare_rev(params, rev)?;
+        let request = ReadParams {
+            path: params.path.clone(),
+            symbol: params.symbol.clone(),
+            budget_tokens: params.budget_tokens,
+            repeat: Some("allow".to_string()),
+            rev: None,
+        };
+        let rendered = self.render(&request, &path, &content, &relative)?;
+        if rendered.is_empty() {
+            return Err(ToolError::SymbolNotFound(format!(
+                "símbolo `{}` não encontrado em `{relative}`",
+                params.symbol.as_deref().unwrap_or_default()
+            )));
+        }
+        let hash = crate::ledger::short_hash(&crate::ledger::content_hash(&content));
+        let mut reference = format!("[ref] {relative} @{hash} (somente leitura)");
+        if let Some(symbol) = &params.symbol {
+            reference.push_str(" :: ");
+            reference.push_str(symbol);
+        }
+        Ok((
+            reference,
+            rendered.into_iter().map(|item| item.section).collect(),
+        ))
     }
 
     /// Resolve o caminho contra o root e lê o texto. Rejeita o que escapa.
@@ -432,6 +532,64 @@ impl Tool for ReadTool {
 }
 
 #[cfg(test)]
+mod ref_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn tool_for(dir: &std::path::Path) -> ReadTool {
+        ReadTool::new(
+            dir.to_path_buf(),
+            Arc::new(ResponseStore::new(
+                std::time::Duration::from_secs(60),
+                1024 * 1024,
+            )),
+            Arc::new(DeliveryLedger::new(64, 1 << 20)),
+            crate::budget::DEFAULT_BUDGET_TOKENS,
+        )
+    }
+
+    fn read(tool: &ReadTool, path: &str, symbol: Option<&str>) -> Result<String, ToolError> {
+        tool.read(ReadParams {
+            path: path.to_string(),
+            symbol: symbol.map(str::to_string),
+            budget_tokens: None,
+            repeat: None,
+            rev: None,
+        })
+    }
+
+    #[test]
+    fn read_starts_with_a_reference_line() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("auth.rs"), "pub fn alpha() {}\n").unwrap();
+        let tool = tool_for(dir.path());
+        let out = read(&tool, "auth.rs", None).unwrap();
+        let first = out.lines().next().unwrap();
+        assert!(first.starts_with("[ref] auth.rs @"), "{first}");
+    }
+
+    #[test]
+    fn symbol_read_names_the_symbol_in_the_reference() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("auth.rs"), "pub fn alpha() {}\n").unwrap();
+        let tool = tool_for(dir.path());
+        let out = read(&tool, "auth.rs", Some("alpha")).unwrap();
+        assert!(out.lines().next().unwrap().ends_with(" :: alpha"));
+    }
+
+    #[test]
+    fn missing_file_is_not_found_even_if_the_index_lists_it() {
+        let dir = tempdir().unwrap();
+        let tool = tool_for(dir.path());
+        assert!(matches!(
+            read(&tool, "absent.rs", None),
+            Err(ToolError::NotFound(_))
+        ));
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -474,6 +632,7 @@ mod tests {
             symbol: symbol.map(str::to_string),
             budget_tokens: budget,
             repeat: repeat.map(str::to_string),
+            rev: None,
         })
     }
 
@@ -687,6 +846,123 @@ mod tests {
         let tool = tool_for(dir.path());
 
         let error = read(&tool, "link.rs", None, None, None).unwrap_err();
+        assert!(matches!(error, ToolError::OutsideRoot(_)), "{error:?}");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_rev_read_comes_from_the_commit_not_the_worktree() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "x",
+            ],
+        );
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    2\n}\n").unwrap();
+        let tool = tool_for(dir.path());
+
+        let out = tool
+            .read(ReadParams {
+                path: "a.rs".to_string(),
+                symbol: Some("a".to_string()),
+                budget_tokens: None,
+                repeat: None,
+                rev: Some("HEAD".to_string()),
+            })
+            .unwrap();
+        assert!(out.contains("somente leitura"));
+        assert!(out.contains("    1"));
+    }
+
+    #[test]
+    fn a_rev_read_does_not_mark_the_worktree_as_delivered() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "x",
+            ],
+        );
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    2\n}\n").unwrap();
+        let tool = tool_for(dir.path());
+
+        tool.read(ReadParams {
+            path: "a.rs".to_string(),
+            symbol: Some("a".to_string()),
+            budget_tokens: None,
+            repeat: None,
+            rev: Some("HEAD".to_string()),
+        })
+        .unwrap();
+
+        let worktree = read(&tool, "a.rs", Some("a"), None, None).unwrap();
+        assert!(worktree.contains("    2"));
+        assert!(!worktree.contains("Já entregue"));
+    }
+
+    #[test]
+    fn an_unknown_rev_is_not_found() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let tool = tool_for(dir.path());
+        let error = tool
+            .read(ReadParams {
+                path: "a.rs".to_string(),
+                symbol: None,
+                budget_tokens: None,
+                repeat: None,
+                rev: Some("nao-existe".to_string()),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ToolError::NotFound(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_rev_path_outside_the_root_is_rejected() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        let tool = tool_for(dir.path());
+        let error = tool
+            .read(ReadParams {
+                path: "../fora.rs".to_string(),
+                symbol: None,
+                budget_tokens: None,
+                repeat: None,
+                rev: Some("HEAD".to_string()),
+            })
+            .unwrap_err();
         assert!(matches!(error, ToolError::OutsideRoot(_)), "{error:?}");
     }
 }

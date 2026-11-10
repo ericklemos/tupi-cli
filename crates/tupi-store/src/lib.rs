@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 mod index;
 
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 pub const MODELS_TTL_SECS: u64 = 24 * 60 * 60;
 
 const META: redb::TableDefinition<&'static str, &'static [u8]> = redb::TableDefinition::new("meta");
@@ -14,6 +14,8 @@ const MODELS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("models");
 const INDEX: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("index");
+const SETTINGS: redb::TableDefinition<&'static str, &'static [u8]> =
+    redb::TableDefinition::new("settings");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -119,6 +121,48 @@ impl Store {
         Ok(())
     }
 
+    pub fn setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        use redb::ReadableDatabase;
+
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+        let table = tx
+            .open_table(SETTINGS)
+            .map_err(|error| StoreError::Table(error.to_string()))?;
+
+        let Some(raw) = table
+            .get(key)
+            .map_err(|error| StoreError::Table(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        let value = std::str::from_utf8(raw.value())
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        Ok(Some(value.to_string()))
+    }
+
+    pub fn save_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(SETTINGS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+            table
+                .insert(key, value.as_bytes())
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+
+        Ok(())
+    }
+
     fn ensure_schema(&self) -> Result<(), StoreError> {
         let tx = self
             .db
@@ -148,6 +192,12 @@ impl Store {
                         supported: SCHEMA_VERSION,
                     });
                 }
+                Some(found) if found < SCHEMA_VERSION => {
+                    let raw = serde_json::to_vec(&SCHEMA_VERSION)
+                        .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+                    meta.insert("schema_version", raw.as_slice())
+                        .map_err(|error| StoreError::Table(error.to_string()))?;
+                }
                 Some(_) => {}
                 None => {
                     let raw = serde_json::to_vec(&SCHEMA_VERSION)
@@ -160,6 +210,8 @@ impl Store {
             tx.open_table(MODELS)
                 .map_err(|error| StoreError::Table(error.to_string()))?;
             tx.open_table(INDEX)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+            tx.open_table(SETTINGS)
                 .map_err(|error| StoreError::Table(error.to_string()))?;
         }
 
@@ -264,6 +316,17 @@ mod tests {
         assert_eq!(read_schema_version_with_redb(&path), 99);
     }
 
+    #[test]
+    fn older_schema_is_upgraded() {
+        let path = temp_path("upgrade");
+        Store::open(&path).unwrap();
+        set_schema_version_with_redb(&path, 1);
+
+        Store::open(&path).expect("abre e atualiza");
+
+        assert_eq!(read_schema_version_with_redb(&path), SCHEMA_VERSION);
+    }
+
     fn overwrite_models_raw_with_redb(path: &Path, provider_id: &str, raw: &[u8]) {
         let db = redb::Database::create(path).unwrap();
         let tx = db.begin_write().unwrap();
@@ -300,5 +363,38 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         assert!(store.models("deepseek").unwrap().is_none());
+    }
+
+    #[test]
+    fn settings_round_trip_and_survive_reopen() {
+        let path = temp_path("settings");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.setting("show_prompts_messages").unwrap(), None);
+
+            store
+                .save_setting("show_prompts_messages", "true")
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .setting("show_prompts_messages")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+
+        store
+            .save_setting("show_prompts_messages", "false")
+            .unwrap();
+        assert_eq!(
+            store
+                .setting("show_prompts_messages")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
     }
 }

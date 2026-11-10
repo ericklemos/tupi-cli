@@ -30,7 +30,15 @@ async fn live_deepseek_uses_read_and_answers_from_the_body() {
     let mut tools = ToolRegistry::new();
     tupi_tools::register(dir.path().to_path_buf(), &mut tools);
 
-    let app = App::with_tools(providers, "deepseek", model, events, None, tools);
+    let app = App::with_tools(
+        providers,
+        "deepseek",
+        model,
+        events,
+        None,
+        tools,
+        String::new(),
+    );
 
     app.handle(Command::SendMessage {
         text: "Use a tool read para ler o arquivo auth.rs, símbolo verify_token. \
@@ -95,7 +103,15 @@ async fn live_deepseek_edits_a_symbol_body() {
     let mut tools = ToolRegistry::new();
     tupi_tools::register(dir.path().to_path_buf(), &mut tools);
 
-    let app = App::with_tools(providers, "deepseek", model, events, None, tools);
+    let app = App::with_tools(
+        providers,
+        "deepseek",
+        model,
+        events,
+        None,
+        tools,
+        String::new(),
+    );
 
     app.handle(Command::SendMessage {
         text: "Use a tool read para ler auth.rs, símbolo verify_token. Pegue o blake3 do \
@@ -160,7 +176,15 @@ async fn live_deepseek_uses_search_to_find_the_symbol() {
     let mut tools = ToolRegistry::new();
     tupi_tools::register(dir.path().to_path_buf(), &mut tools);
 
-    let app = App::with_tools(providers, "deepseek", model, events, None, tools);
+    let app = App::with_tools(
+        providers,
+        "deepseek",
+        model,
+        events,
+        None,
+        tools,
+        String::new(),
+    );
 
     app.handle(Command::SendMessage {
         text: "Use a tool search com a query \"onde o token é validado\" e responda \

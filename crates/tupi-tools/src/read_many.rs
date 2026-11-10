@@ -15,6 +15,8 @@ pub struct ReadItem {
     pub path: String,
     #[serde(default)]
     pub symbol: Option<String>,
+    #[serde(default)]
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,13 +40,13 @@ impl ReadManyTool {
     pub fn read_many(&self, params: ReadManyParams) -> Result<String, ToolError> {
         if params.reads.is_empty() {
             return Err(ToolError::InvalidArguments(
-                "`reads` está vazio: nada a ler.".to_string(),
+                "\u{0060}reads\u{0060} está vazio: nada a ler.".to_string(),
             ));
         }
 
         let mut rendered: Vec<Rendered> = Vec::new();
         let mut errors = Vec::new();
-        let mut seen: HashSet<(PathBuf, Option<String>)> = HashSet::new();
+        let mut seen: HashSet<(PathBuf, Option<String>, Option<String>)> = HashSet::new();
 
         for (index, item) in params.reads.into_iter().enumerate() {
             let request = ReadParams {
@@ -52,19 +54,73 @@ impl ReadManyTool {
                 symbol: item.symbol.clone(),
                 budget_tokens: None,
                 repeat: params.repeat.clone(),
+                rev: item.rev.clone(),
             };
+
+            if let Some(rev) = item
+                .rev
+                .as_deref()
+                .map(str::trim)
+                .filter(|rev| !rev.is_empty())
+            {
+                let path = match self.inner.prepare_rev(&request, rev) {
+                    Ok((path, _, _)) => path,
+                    Err(error) => {
+                        errors.push(format!(
+                            "- item {} (\u{0060}{}\u{0060}): {error}",
+                            index + 1,
+                            item.path
+                        ));
+                        continue;
+                    }
+                };
+                if !seen.insert((path, item.symbol.clone(), Some(rev.to_string()))) {
+                    errors.push(format!(
+                        "- item {} (\u{0060}{}\u{0060}): leitura repetida no lote.",
+                        index + 1,
+                        item.path
+                    ));
+                    continue;
+                }
+                match self.inner.rev_sections(&request, rev) {
+                    Ok((reference, sections)) => {
+                        rendered.push(Rendered {
+                            section: crate::budget::Section {
+                                heading: format!("#### {reference}"),
+                                body: String::new(),
+                                priority: 250,
+                            },
+                            pending: None,
+                        });
+                        rendered.extend(sections.into_iter().map(|section| Rendered {
+                            section,
+                            pending: None,
+                        }))
+                    }
+                    Err(error) => errors.push(format!(
+                        "- item {} (\u{0060}{}\u{0060}): {error}",
+                        index + 1,
+                        item.path
+                    )),
+                }
+                continue;
+            }
 
             let (path, content, relative) = match self.inner.prepare(&request) {
                 Ok(read) => read,
                 Err(error) => {
-                    errors.push(format!("- item {} (`{}`): {error}", index + 1, item.path));
+                    errors.push(format!(
+                        "- item {} (\u{0060}{}\u{0060}): {error}",
+                        index + 1,
+                        item.path
+                    ));
                     continue;
                 }
             };
 
-            if !seen.insert((path.clone(), item.symbol.clone())) {
+            if !seen.insert((path.clone(), item.symbol.clone(), None)) {
                 errors.push(format!(
-                    "- item {} (`{}`): leitura repetida no lote.",
+                    "- item {} (\u{0060}{}\u{0060}): leitura repetida no lote.",
                     index + 1,
                     item.path
                 ));
@@ -74,20 +130,20 @@ impl ReadManyTool {
             match self.inner.render(&request, &path, &content, &relative) {
                 Ok(sections) if !sections.is_empty() => rendered.extend(sections),
                 Ok(_) => errors.push(format!(
-                    "- item {} (`{}`): símbolo `{}` não encontrado em `{relative}`.",
+                    "- item {} (\u{0060}{}\u{0060}): símbolo \u{0060}{}\u{0060} não encontrado em \u{0060}{relative}\u{0060}.",
                     index + 1,
                     item.path,
                     item.symbol.as_deref().unwrap_or_default()
                 )),
                 Err(error) => {
-                    errors.push(format!("- item {} (`{}`): {error}", index + 1, item.path))
+                    errors.push(format!("- item {} (\u{0060}{}\u{0060}): {error}", index + 1, item.path))
                 }
             }
         }
 
         if !errors.is_empty() {
             return Err(ToolError::Other(format!(
-                "### `read_many` — nada foi lido\n\n{}\n",
+                "### \u{0060}read_many\u{0060} — nada foi lido\n\n{}\n",
                 errors.join("\n")
             )));
         }
@@ -118,6 +174,10 @@ impl Tool for ReadManyTool {
                                 "symbol": {
                                     "type": "string",
                                     "description": "Opcional: nome da função/struct, simples ou qualificado, cujo corpo será devolvido."
+                                },
+                                "rev": {
+                                    "type": "string",
+                                    "description": "Opcional: lê rev:path (commit, tag ou ref) em vez da árvore de trabalho."
                                 }
                             },
                             "required": ["path"]
@@ -192,6 +252,7 @@ mod tests {
         ReadItem {
             path: path.into(),
             symbol: symbol.map(str::to_string),
+            rev: None,
         }
     }
 
@@ -316,7 +377,34 @@ mod tests {
         let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
         assert_eq!(
             names,
-            vec!["read", "read_many", "search", "edit", "peek"]
+            vec![
+                "read",
+                "read_many",
+                "search",
+                "edit",
+                "write",
+                "write_many",
+                "move",
+                "patch",
+                "exec",
+                "test_many",
+                "shell",
+                "map",
+                "assert",
+                "impact_check",
+                "context_graph",
+                "trace",
+                "diff",
+                "why",
+                "fetch",
+                "websearch",
+                "research",
+                "ledger",
+                "state",
+                "env",
+                "peek",
+                "setup",
+            ]
         );
     }
 
@@ -327,5 +415,47 @@ mod tests {
         let spec = tool.spec();
         assert_eq!(spec.name, "read_many");
         assert_eq!(spec.schema["required"][0], "reads");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_rev_item_reads_the_commit_not_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "x",
+            ],
+        );
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {\n    2\n}\n").unwrap();
+
+        let mut params = batch(vec![item("src/a.rs", Some("a"))]);
+        params.reads[0].rev = Some("HEAD".to_string());
+        let out = tool_for(dir.path()).read_many(params).unwrap();
+        assert!(out.contains("    1"));
+        assert!(!out.contains("    2"));
+        assert!(out.contains("somente leitura"));
     }
 }

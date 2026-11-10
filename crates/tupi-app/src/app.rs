@@ -75,6 +75,8 @@ pub struct App {
     next_request: AtomicU64,
     active: Arc<AtomicU64>,
     current: Arc<Mutex<Option<StreamHandle>>>,
+    prefix: String,
+    show_prompts: AtomicBool,
 }
 
 impl App {
@@ -101,6 +103,7 @@ impl App {
             events,
             store,
             ToolRegistry::new(),
+            String::new(),
         )
     }
 
@@ -111,7 +114,19 @@ impl App {
         events: EventBus,
         store: Option<Arc<Store>>,
         tools: ToolRegistry,
+        prefix: String,
     ) -> Arc<Self> {
+        let show_prompts = store
+            .as_ref()
+            .and_then(|store| match store.setting(crate::debug::SHOW_PROMPTS_KEY) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "falha ao ler a configuração de debug");
+                    None
+                }
+            })
+            .is_some_and(|value| crate::debug::enabled(Some(value.as_str())));
+
         Arc::new(Self {
             session: Arc::new(SessionStore::new(SESSION_ID)),
             registry,
@@ -124,6 +139,8 @@ impl App {
             store,
             tools,
             pending: Arc::new(Mutex::new(Vec::new())),
+            prefix,
+            show_prompts: AtomicBool::new(show_prompts),
         })
     }
 
@@ -170,6 +187,8 @@ impl App {
         let model = self.model.lock().unwrap().clone();
         let specs = self.tools.specs();
         let tools = self.tools.clone();
+        let prefix = self.prefix.clone();
+        let show_prompts = self.show_prompts.load(Ordering::SeqCst);
 
         let partial = Arc::new(Mutex::new(String::new()));
         let events = self.events.clone();
@@ -189,8 +208,20 @@ impl App {
                 step += 1;
                 task_partial.lock().unwrap().clear();
 
-                let request =
-                    ChatRequest::new(model.clone(), session.messages()).with_tools(specs.clone());
+                let mut messages = Vec::new();
+                if !prefix.is_empty() {
+                    messages.push(Message::new(Role::System, prefix.clone()));
+                }
+                messages.extend(session.messages());
+                let request = ChatRequest::new(model.clone(), messages).with_tools(specs.clone());
+
+                if show_prompts {
+                    events.publish(Event::PromptMessages {
+                        request_id,
+                        body: crate::debug::render_prompt(&request),
+                    });
+                }
+
                 let mut streamed_text = String::new();
                 let mut calls = Vec::new();
                 let mut stream_failed = false;
@@ -374,6 +405,23 @@ impl CommandHandler for App {
             Command::SendMessage { text } => self.send_message(text),
             Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
             Command::SetModel { model } => self.set_model(model),
+            Command::ToggleShowPrompts => {
+                let enabled = !self.show_prompts.load(Ordering::SeqCst);
+
+                if let Some(store) = self.store.as_ref()
+                    && let Err(error) = store.save_setting(
+                        crate::debug::SHOW_PROMPTS_KEY,
+                        crate::debug::value(enabled),
+                    )
+                {
+                    return Err(CommandError::Internal(format!(
+                        "falha ao gravar configuração: {error}"
+                    )));
+                }
+
+                self.show_prompts.store(enabled, Ordering::SeqCst);
+                Ok(CommandOutcome::ShowPrompts { enabled })
+            }
             Command::RefreshModels => {
                 // A TUI só reage a eventos: banco e provedor rodam fora do loop.
                 let provider = self.provider()?;
@@ -470,6 +518,114 @@ impl QueryHandler for App {
     }
 }
 
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use tupi_kernel::{ChatRequest, Provider, ProviderError, ProviderEvent, ProviderStream};
+
+    struct Scripted {
+        scripts: Mutex<Vec<Vec<Result<ProviderEvent, ProviderError>>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for Scripted {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let next = self.scripts.lock().unwrap().remove(0);
+            Ok(Box::pin(futures_util::stream::iter(next)))
+        }
+    }
+
+    fn registry(provider: Arc<dyn Provider>) -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        registry
+    }
+
+    fn text(text: &str) -> Vec<Result<ProviderEvent, ProviderError>> {
+        vec![Ok(ProviderEvent::Text(text.to_string()))]
+    }
+
+    fn app_with_prefix(provider: Arc<dyn Provider>, bus: EventBus, prefix: &str) -> Arc<App> {
+        App::with_tools(
+            registry(provider),
+            "scripted",
+            "modelo".into(),
+            bus,
+            None,
+            ToolRegistry::new(),
+            prefix.to_string(),
+        )
+    }
+
+    async fn wait_for_finished(rx: &mut tokio::sync::broadcast::Receiver<Event>) {
+        while let Ok(event) = rx.recv().await {
+            if matches!(event, Event::StreamFinished { .. }) {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn system_prefix_is_the_first_message_of_every_request() {
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(Scripted {
+            scripts: Mutex::new(vec![text("um"), text("dois")]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = app_with_prefix(provider.clone(), bus, "PREFIXO");
+
+        app.handle(Command::SendMessage { text: "a".into() })
+            .await
+            .unwrap();
+        wait_for_finished(&mut rx).await;
+        app.handle(Command::SendMessage { text: "b".into() })
+            .await
+            .unwrap();
+        wait_for_finished(&mut rx).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[0].messages[0].role, Role::System);
+        assert_eq!(requests[0].messages[0].content, "PREFIXO");
+        assert_eq!(requests[1].messages[0], requests[0].messages[0]);
+    }
+
+    #[tokio::test]
+    async fn empty_prefix_sends_no_system_message() {
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(Scripted {
+            scripts: Mutex::new(vec![text("ok")]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = app_with_prefix(provider.clone(), bus, "");
+
+        app.handle(Command::SendMessage { text: "a".into() })
+            .await
+            .unwrap();
+        wait_for_finished(&mut rx).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .all(|message| message.role != Role::System)
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +1003,7 @@ mod tests {
             bus,
             None,
             tools,
+            String::new(),
         )
     }
 
@@ -1043,6 +1200,7 @@ mod tests {
             bus,
             None,
             tools,
+            String::new(),
         );
 
         app.handle(Command::SendMessage {
@@ -1091,6 +1249,7 @@ mod tests {
             bus,
             None,
             tools,
+            String::new(),
         );
 
         app.handle(Command::SendMessage {
@@ -1135,8 +1294,7 @@ mod tests {
     async fn app_runs_edit_then_read_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.rs");
-        let content =
-            "pub fn verify_token(raw: &str) -> bool {\n    !raw.is_empty()\n}\n";
+        let content = "pub fn verify_token(raw: &str) -> bool {\n    !raw.is_empty()\n}\n";
         std::fs::write(&path, content).unwrap();
         let hash = blake3::hash(content.as_bytes()).to_hex()[..12].to_string();
 
@@ -1170,11 +1328,14 @@ mod tests {
             bus,
             None,
             tools,
+            String::new(),
         );
 
-        app.handle(Command::SendMessage { text: "edite".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "edite".into(),
+        })
+        .await
+        .unwrap();
 
         let mut summaries = Vec::new();
         loop {
@@ -1365,6 +1526,7 @@ mod tests {
             bus,
             None,
             tools,
+            String::new(),
         );
 
         let CommandOutcome::Started { request_id } = app

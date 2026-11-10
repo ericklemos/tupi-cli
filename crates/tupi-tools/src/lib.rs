@@ -33,7 +33,32 @@ use tupi_kernel::ToolRegistry;
 
 use crate::ledger::DeliveryLedger;
 
+mod assert;
+mod context_graph;
+mod diff;
+mod env;
 /// Registra `read`, `read_many`, `search` e `peek`, compartilhando store e ledger.
+mod exec;
+mod facts;
+mod fetch;
+mod graph;
+mod impact;
+mod map;
+mod patch;
+mod paths;
+mod proc;
+mod relocate;
+mod research;
+mod setup;
+mod shell;
+mod state;
+mod test_many;
+mod trace;
+mod web;
+mod websearch;
+mod why;
+mod write;
+mod write_many;
 pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
     let store = Arc::new(ResponseStore::new(
         Duration::from_secs(600),
@@ -59,9 +84,115 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         DEFAULT_BUDGET_TOKENS,
     )));
     registry.register(Arc::new(EditTool::new(
-        root_dir,
+        root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(PeekTool::new(store, DEFAULT_BUDGET_TOKENS)));
+    registry.register(Arc::new(crate::write::WriteTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::write_many::WriteManyTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::relocate::MoveTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::patch::PatchTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::exec::ExecTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::test_many::TestManyTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::shell::ShellTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::map::MapTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::assert::AssertTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::impact::ImpactTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::context_graph::ContextTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::trace::TraceTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::diff::DiffTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::why::WhyTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::fetch::FetchTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::websearch::WebSearchTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::research::ResearchTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::facts::FactsTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::state::StateTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::env::EnvTool::new()));
+    registry.register(Arc::new(PeekTool::new(
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    let specs = registry.specs();
+    registry.register(Arc::new(crate::setup::SetupTool::new(
+        root_dir,
+        store,
+        specs,
+        DEFAULT_BUDGET_TOKENS,
+    )));
 }

@@ -103,6 +103,10 @@ pub enum Event {
         request_id: RequestId,
         message: String,
     },
+    PromptMessages {
+        request_id: RequestId,
+        body: String,
+    },
     ModelsLoaded {
         models: Vec<String>,
     },

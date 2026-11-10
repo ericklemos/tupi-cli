@@ -1,4 +1,7 @@
-pub const COMMANDS: &[&str] = &["/models"];
+pub const COMMANDS: &[&str] = &[
+    "/models",
+    "/enable-show-prompts-messages",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -28,6 +31,9 @@ pub enum ChatEntry {
         summary: String,
         ok: Option<bool>,
     },
+    Prompt {
+        content: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -41,7 +47,7 @@ pub struct ChatState {
     pub suggestions: Option<Vec<String>>,
     pub suggestion_index: usize,
     pub selection: Option<crate::selection::Selection>,
-    pub(crate) view: std::cell::Cell<Option<TranscriptView>>,
+    pub(crate) view: std::cell::Cell<Option<crate::selection::TranscriptView>>,
     pub(crate) render_cache: std::cell::RefCell<crate::markdown::Cache>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
@@ -287,24 +293,6 @@ impl ChatState {
         }
         self.refresh_suggestions();
     }
-
-    pub fn hovered_entry(&self) -> Option<usize> {
-        self.hovered.get()
-    }
-
-    pub fn hovered_text(&self) -> Option<String> {
-        self.hovered
-            .get()
-            .and_then(|index| self.lines.get(index))
-            .map(entry_text)
-    }
-}
-
-fn entry_text(entry: &ChatEntry) -> String {
-    match entry {
-        ChatEntry::Message { content, .. } => content.clone(),
-        ChatEntry::Tool { name, summary, .. } => format!("{name} · {summary}"),
-    }
 }
 
 fn compact_summary(summary: &str) -> String {
@@ -319,8 +307,6 @@ fn compact_summary(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tupi_domain::Role;
-
     fn content(entry: &ChatEntry) -> &str {
         match entry {
             ChatEntry::Message { content, .. } => content,
@@ -555,53 +541,5 @@ mod tests {
             panic!("esperava métricas");
         };
         assert!(metrics.finished.is_some());
-    }
-
-    fn message(role: Role, text: &str) -> ChatEntry {
-        ChatEntry::Message {
-            role,
-            content: text.to_string(),
-            metrics: None,
-        }
-    }
-
-    #[test]
-    fn entry_text_keeps_markdown_verbatim() {
-        let entry = message(Role::Assistant, "**forte** e `código`");
-        assert_eq!(entry_text(&entry), "**forte** e `código`");
-    }
-
-    #[test]
-    fn entry_text_formats_tool_as_name_and_summary() {
-        let entry = ChatEntry::Tool {
-            call_id: "c1".into(),
-            name: "read".into(),
-            summary: "src/lib.rs".into(),
-            ok: Some(true),
-        };
-        assert_eq!(entry_text(&entry), "read · src/lib.rs");
-    }
-
-    #[test]
-    fn hovered_text_is_none_without_hover() {
-        let state = ChatState::default();
-        assert_eq!(state.hovered_entry(), None);
-        assert_eq!(state.hovered_text(), None);
-    }
-
-    #[test]
-    fn hovered_text_returns_the_hovered_entry() {
-        let mut state = ChatState::default();
-        state.lines.push(message(Role::Assistant, "resposta"));
-        state.hovered.set(Some(0));
-        assert_eq!(state.hovered_entry(), Some(0));
-        assert_eq!(state.hovered_text().as_deref(), Some("resposta"));
-    }
-
-    #[test]
-    fn hovered_entry_out_of_range_is_ignored() {
-        let state = ChatState::default();
-        state.hovered.set(Some(3));
-        assert_eq!(state.hovered_text(), None);
     }
 }

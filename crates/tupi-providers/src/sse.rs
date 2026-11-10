@@ -65,6 +65,8 @@ pub struct StreamChunk {
     pub tool_calls: Vec<ToolCallDelta>,
     pub finish_reason: Option<String>,
     pub usage: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
 }
 
 pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
@@ -83,6 +85,14 @@ pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
 
     let usage = value
         .pointer("/usage/completion_tokens")
+        .and_then(|tokens| tokens.as_u64());
+
+    let prompt_tokens = value
+        .pointer("/usage/prompt_tokens")
+        .and_then(|tokens| tokens.as_u64());
+
+    let cached_tokens = value
+        .pointer("/usage/prompt_cache_hit_tokens")
         .and_then(|tokens| tokens.as_u64());
 
     let mut tool_calls = Vec::new();
@@ -117,6 +127,8 @@ pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
         tool_calls,
         finish_reason,
         usage,
+        prompt_tokens,
+        cached_tokens,
     })
 }
 
@@ -128,6 +140,26 @@ pub fn is_done(payload: &str) -> bool {
     payload.trim() == "[DONE]"
 }
 
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_reads_prompt_and_cached_tokens() {
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":1200,"prompt_cache_hit_tokens":900,"completion_tokens":12}}"#;
+        let chunk = extract_chunk(payload).unwrap();
+        assert_eq!(chunk.prompt_tokens, Some(1200));
+        assert_eq!(chunk.cached_tokens, Some(900));
+    }
+
+    #[test]
+    fn chunk_without_usage_leaves_prompt_tokens_empty() {
+        let payload = r#"{"choices":[{"delta":{"content":"oi"},"finish_reason":null}]}"#;
+        let chunk = extract_chunk(payload).unwrap();
+        assert_eq!(chunk.prompt_tokens, None);
+        assert_eq!(chunk.cached_tokens, None);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

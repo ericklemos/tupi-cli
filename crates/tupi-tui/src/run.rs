@@ -47,7 +47,10 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match key.code {
                                 KeyCode::Char('c') => {
-                                    if let Some(text) = state.hovered_text() {
+                                    if let Some(text) = state
+                                        .selection
+                                        .and_then(|selection| selected_text(&state, selection))
+                                    {
                                         terminal.copy(&text)?;
                                         state.notice = Some("copiado".to_string());
                                         continue;
@@ -126,6 +129,9 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                 }
                             }
                             KeyCode::Esc => {
+                                if state.selection.take().is_some() {
+                                    continue;
+                                }
                                 if let Some(request_id) = request {
                                     let cancelled = matches!(
                                         buses
@@ -159,14 +165,41 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                             _ => {}
                         }
                     }
-                    CrosstermEvent::Mouse(mouse) => {
-                        state.pointer = Some((mouse.column, mouse.row));
-
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => scroll_up(&mut state, SCROLL_WHEEL),
-                            MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
-                            _ => {}
+                    CrosstermEvent::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            if let Some((row, column)) =
+                                transcript_position(&state, mouse.column, mouse.row)
+                            {
+                                state.selection =
+                                    Some(crate::selection::Selection::new(row, column));
+                            } else {
+                                state.selection = None;
+                            }
                         }
+                        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                            let position =
+                                clamped_transcript_position(&mut state, mouse.column, mouse.row);
+                            if let (Some((row, column)), Some(selection)) =
+                                (position, state.selection.as_mut())
+                            {
+                                selection.cursor = (row, column);
+                            }
+                        }
+                        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                            if state
+                                .selection
+                                .map(|selection| selection.is_empty())
+                                .unwrap_or(false)
+                            {
+                                state.selection = None;
+                            }
+                        }
+                        MouseEventKind::ScrollUp => scroll_up(&mut state, SCROLL_WHEEL),
+                        MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
+                        _ => {}
+                    },
+                    CrosstermEvent::Resize(_, _) => {
+                        state.selection = None;
                     }
                     _ => {}
                 }
@@ -254,18 +287,59 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ChatState, model: &str, provider
     draw_overlay(frame, state);
 }
 
-const HOVER_BG: Color = Color::Indexed(236);
+fn selected_text(state: &ChatState, selection: crate::selection::Selection) -> Option<String> {
+    let view = state.view.get()?;
+    let mut cache = state.render_cache.borrow_mut();
+    let rows = transcript_rows(&state.lines, view.width, state.processing(), &mut cache);
+    drop(cache);
+    Some(crate::selection::selection_text(&rows, &selection))
+}
 
-fn highlight_row(mut line: Line<'static>, width: u16) -> Line<'static> {
-    line.style = line.style.bg(HOVER_BG);
-    let missing = (width as usize).saturating_sub(line.width());
-    if missing > 0 {
-        line.spans.push(Span::styled(
-            " ".repeat(missing),
-            Style::default().bg(HOVER_BG),
-        ));
+fn transcript_position(state: &ChatState, column: u16, row: u16) -> Option<(usize, u16)> {
+    let view = state.view.get()?;
+    let area = view.area;
+    if area.width == 0 || area.height == 0 {
+        return None;
     }
-    line
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    if column < area.x || column >= right || row < area.y || row >= bottom {
+        return None;
+    }
+    let index = view.start + (row - area.y) as usize;
+    if index >= view.rows {
+        return None;
+    }
+    Some((index, column - area.x))
+}
+
+fn clamped_transcript_position(
+    state: &mut ChatState,
+    column: u16,
+    row: u16,
+) -> Option<(usize, u16)> {
+    let view = state.view.get()?;
+    let area = view.area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if row < area.y {
+        scroll_up(state, 1);
+    } else if row >= area.y.saturating_add(area.height) {
+        scroll_down(state, 1);
+    }
+    let (start, _) = visible_range(view.rows, area.height as usize, state.scroll);
+    let top = area.y;
+    let bottom = area.y.saturating_add(area.height - 1);
+    let left = area.x;
+    let right = area.x.saturating_add(area.width - 1);
+    let local_row = row.clamp(top, bottom) - area.y;
+    let local_column = column.clamp(left, right) - area.x;
+    let index = start + local_row as usize;
+    if index >= view.rows {
+        return None;
+    }
+    Some((index, local_column))
 }
 
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect) {
@@ -274,29 +348,42 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
         ..area
     };
 
-    let Transcript { mut rows, owners } = {
+    let rows = {
         let mut cache = state.render_cache.borrow_mut();
-        transcript_layout(
+        transcript_layout_at(
             &state.lines,
             content_area.width,
             state.processing(),
             &mut cache,
+            std::time::Instant::now(),
         )
+        .rows
     };
     let visible = area.height as usize;
     let (start, end) = visible_range(rows.len(), visible, state.scroll);
-    let hovered = hovered_from(
-        &owners,
-        start,
-        content_area,
-        state.pointer,
-        state.overlay_open(),
-    );
-    state.hovered.set(hovered);
 
-    for (index, row) in rows.iter_mut().enumerate().take(end).skip(start) {
-        if hovered.is_some() && owners.get(index).copied().flatten() == hovered {
-            *row = highlight_row(std::mem::replace(row, Line::from("")), content_area.width);
+    state.view.set(Some(crate::selection::TranscriptView {
+        rows: rows.len(),
+        start,
+        width: content_area.width,
+        area: content_area,
+    }));
+
+    let mut rows = rows;
+    if let Some(selection) = state.selection {
+        let ((start_row, start_column), (end_row, end_column)) = selection.normalized();
+        for (index, row) in rows.iter_mut().enumerate().take(end).skip(start) {
+            if index < start_row || index > end_row {
+                continue;
+            }
+            let from = if index == start_row { start_column } else { 0 };
+            let to = if index == end_row {
+                end_column
+            } else {
+                u16::MAX
+            };
+            *row =
+                crate::selection::apply_selection(std::mem::replace(row, Line::from("")), from, to);
         }
     }
 
@@ -450,11 +537,7 @@ fn draw_details(
         ),
     ]);
 
-    let hints = if state.hovered_entry().is_some() {
-        "ctrl+c copia esta mensagem · ctrl+q sai"
-    } else {
-        "↑↓ rolar · /modelos · hover+ctrl+c copia · ctrl+q sai"
-    };
+    let hints = "arraste para selecionar · ctrl+c copia · ctrl+q sai";
     let hint_width = hints.width() as u16 + 1;
 
     if area.width > hint_width + 20 {
@@ -577,7 +660,6 @@ fn status_label(status: Status) -> &'static str {
 }
 
 #[allow(dead_code)]
-#[cfg(test)]
 fn transcript_rows(
     lines: &[ChatEntry],
     width: u16,
@@ -588,7 +670,6 @@ fn transcript_rows(
 }
 
 #[allow(dead_code)]
-#[cfg(test)]
 fn transcript_rows_at(
     lines: &[ChatEntry],
     width: u16,
@@ -596,7 +677,109 @@ fn transcript_rows_at(
     cache: &mut crate::markdown::Cache,
     now: std::time::Instant,
 ) -> Vec<Line<'static>> {
-    transcript_layout_at(lines, width, processing, cache, now).rows
+    let area_width = width as usize;
+    if area_width < 8 {
+        return Vec::new();
+    }
+
+    let indent = 2usize;
+    let content_width = area_width.saturating_sub(indent).max(1);
+    let compact = area_width < 60;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    rows.push(Line::from(""));
+
+    for (index, entry) in lines.iter().enumerate() {
+        if index > 0 {
+            rows.push(Line::from(""));
+        }
+
+        let (role, text, metrics) = match entry {
+            ChatEntry::Message {
+                role,
+                content,
+                metrics,
+            } => (*role, content.as_str(), metrics.as_ref()),
+            ChatEntry::Tool {
+                name, summary, ok, ..
+            } => {
+                let (mark, color) = match ok {
+                    Some(true) => ("✓", Color::Green),
+                    Some(false) => ("✗", Color::Red),
+                    None => ("…", Color::DarkGray),
+                };
+                let label = format!("{name} · {summary}");
+                let line = wrap_text(&label, content_width)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        "  ⚙ ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line),
+                    Span::raw(" "),
+                    Span::styled(mark.to_string(), Style::default().fg(color)),
+                ]));
+                continue;
+            }
+        };
+
+        let (marker, label, color) = match role {
+            Role::User => ("❯", "você", Color::Cyan),
+            Role::Assistant => ("●", "tupi", Color::Green),
+            Role::System => ("◆", "sistema", Color::Yellow),
+            Role::Tool => ("⚙", "tool", Color::DarkGray),
+        };
+
+        let mut header = vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                label.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if role == Role::Assistant
+            && let Some(metrics) = metrics
+        {
+            header.push(Span::styled(
+                format!("  {}", metrics.header(now, compact)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        rows.push(Line::from(header));
+
+        let body = match role {
+            Role::User | Role::Assistant => cache.rows(index, text, content_width).to_vec(),
+            Role::System => markdown_rows(text, content_width),
+            Role::Tool => plain_rows(text, content_width),
+        };
+
+        for line in body {
+            rows.push(indent_line(line, indent));
+        }
+    }
+
+    if processing {
+        if !rows.last().map(|row| row.width() == 0).unwrap_or(true) {
+            rows.push(Line::from(""));
+        }
+        rows.push(Line::from(Span::styled(
+            "  processando...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        )));
+    }
+
+    rows.push(Line::from(""));
+    rows
 }
 
 pub(crate) struct Transcript {
@@ -606,15 +789,6 @@ pub(crate) struct Transcript {
 }
 
 #[allow(dead_code)]
-fn transcript_layout(
-    lines: &[ChatEntry],
-    width: u16,
-    processing: bool,
-    cache: &mut crate::markdown::Cache,
-) -> Transcript {
-    transcript_layout_at(lines, width, processing, cache, std::time::Instant::now())
-}
-
 fn transcript_layout_at(
     lines: &[ChatEntry],
     width: u16,
@@ -764,20 +938,6 @@ fn hit_test(
 }
 
 #[allow(dead_code)]
-fn hovered_from(
-    owners: &[Option<usize>],
-    start: usize,
-    area: Rect,
-    pointer: Option<(u16, u16)>,
-    overlay_open: bool,
-) -> Option<usize> {
-    if overlay_open {
-        None
-    } else {
-        hit_test(owners, start, area, pointer)
-    }
-}
-
 fn indent_line(mut line: Line<'static>, indent: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ".repeat(indent))];
     spans.append(&mut line.spans);
@@ -1410,69 +1570,15 @@ mod tests {
     }
 
     #[test]
-    fn transcript_layout_marks_header_body_and_gaps() {
-        let lines = vec![message(Role::User, "um"), message(Role::Assistant, "dois")];
-        let mut cache = crate::markdown::Cache::default();
-        let transcript = transcript_layout(&lines, 40, false, &mut cache);
-        assert_eq!(transcript.rows.len(), transcript.owners.len());
-        assert_eq!(transcript.owners[0], None);
-        assert_eq!(transcript.owners[1], Some(0));
-        let last_message_row = transcript
-            .rows
-            .iter()
-            .rposition(|row| row.width() > 0)
-            .unwrap();
-        assert_eq!(transcript.owners[last_message_row], Some(1));
-    }
+    fn prompt_entries_render_as_a_debug_block() {
+        let lines = vec![ChatEntry::Prompt {
+            content: "modelo: m\n\n[user]\noi".into(),
+        }];
+        let rows = transcript_rows(&lines, 60, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
 
-    #[test]
-    fn hit_test_uses_the_visible_start() {
-        let owners = vec![Some(0), None, Some(1)];
-        let area = Rect::new(0, 5, 20, 3);
-        assert_eq!(hit_test(&owners, 0, area, Some((3, 6))), None);
-        assert_eq!(hit_test(&owners, 0, area, Some((3, 7))), Some(1));
-        assert_eq!(hit_test(&owners, 1, area, Some((3, 5))), None);
-        assert_eq!(hit_test(&owners, 1, area, Some((3, 6))), Some(1));
-    }
-
-    #[test]
-    fn hit_test_ignores_pointer_outside_the_area() {
-        let owners = vec![Some(0)];
-        let area = Rect::new(2, 5, 10, 2);
-        assert_eq!(hit_test(&owners, 0, area, Some((1, 5))), None);
-        assert_eq!(hit_test(&owners, 0, area, Some((2, 7))), None);
-        assert_eq!(
-            hit_test(&owners, 0, Rect::new(0, 0, 0, 0), Some((0, 0))),
-            None
-        );
-        assert_eq!(hit_test(&owners, 0, area, None), None);
-    }
-
-    #[test]
-    fn hovered_from_clears_with_overlay_open() {
-        let owners = vec![Some(0)];
-        let area = Rect::new(0, 0, 10, 2);
-        assert_eq!(hovered_from(&owners, 0, area, Some((1, 0)), true), None);
-        assert_eq!(hovered_from(&owners, 0, area, Some((1, 0)), false), Some(0));
-    }
-    #[test]
-    fn highlight_row_pads_to_full_width_and_keeps_text() {
-        let row = Line::from("✓ ok");
-        let padded = highlight_row(row, 10);
-        assert_eq!(row_text(&padded).trim_end(), "✓ ok");
-        assert_eq!(padded.width(), 10);
-        assert!(
-            padded
-                .spans
-                .iter()
-                .any(|span| span.style.bg == Some(HOVER_BG))
-        );
-    }
-
-    #[test]
-    fn highlight_row_never_shrinks_a_wide_row() {
-        let row = Line::from("texto maior que a largura");
-        let padded = highlight_row(row, 4);
-        assert_eq!(padded.width(), "texto maior que a largura".len());
+        assert!(text.contains("prompt enviado"), "{text}");
+        assert!(text.contains("modelo: m"), "{text}");
+        assert!(text.contains("[user]"), "{text}");
     }
 }

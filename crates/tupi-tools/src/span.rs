@@ -55,7 +55,9 @@ impl SpanResolver {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .map_err(|error| ToolError::Other(format!("falha ao carregar gramática Rust: {error}")))?;
+            .map_err(|error| {
+                ToolError::Other(format!("falha ao carregar gramática Rust: {error}"))
+            })?;
         let tree = parser
             .parse(content, None)
             .ok_or_else(|| ToolError::Other("falha ao parsear o arquivo".to_string()))?;
@@ -165,7 +167,12 @@ fn container_matches(actual: Option<&str>, requested: Option<&str>) -> bool {
     actual == requested || format!("impl {actual}") == requested
 }
 
-fn collect_children(node: Node<'_>, content: &str, table: &mut SymbolTable, container: Option<String>) {
+fn collect_children(
+    node: Node<'_>,
+    content: &str,
+    table: &mut SymbolTable,
+    container: Option<String>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind = child.kind();
@@ -308,7 +315,10 @@ pub fn hash_matches(content: &[u8], expected: &str) -> bool {
     if expected.len() < 8 || expected.len() > 64 {
         return false;
     }
-    blake3::hash(content).to_hex().to_string().starts_with(&expected)
+    blake3::hash(content)
+        .to_hex()
+        .to_string()
+        .starts_with(&expected)
 }
 
 #[cfg(test)]

@@ -1,35 +1,46 @@
 # Tupi
 
-Chat de terminal em Rust, com TUI (ratatui), streaming e tool-call de leitura.
-O modelo pode pedir para ler arquivos do projeto sem receber o projeto inteiro;
-edição de arquivos ainda não existe.
+Chat de terminal em Rust, com TUI (ratatui), streaming e tools de leitura,
+busca, edição, escrita, execução e grafo de chamadas. O modelo trabalha no
+projeto sem receber o projeto inteiro.
 
-## Ferramentas de leitura, busca e edição
+## Ferramentas
 
-O Tupi expõe cinco tools ao modelo, inspiradas no `brain_tools`:
+- **Leitura e busca** — `read` (esqueleto do arquivo ou corpo de um símbolo,
+  com blake3 e leitura de `rev:path`), `read_many` (lote atômico com orçamento
+  compartilhado), `search` (descrição natural ou nome, com filtro de caminho),
+  `map` (arquivos/símbolos por centralidade ou resumo por diretório) e
+  `peek` (recupera por handle o que não coube no orçamento).
+- **Edição** — `edit` troca o corpo `{ … }` de um símbolo Rust com
+  `expected_hash`; `write` e `write_many` gravam arquivos inteiros (com hash,
+  `create_only` e rollback no lote); `move` move ou copia arquivo/diretório e
+  lista quem importava o nome antigo; `patch` aplica diff unificado validado
+  com `git apply --check`. Caminho que escapa do root é recusado.
+- **Execução** — `exec` roda `cargo check/build/test/clippy/xtask` com
+  `package`, `target` e `filter`, agrupa erros de compilação, guarda resultado
+  em cache e respeita timeout; `test_many` roda testes específicos em lote;
+  `shell` aceita apenas formatador (`cargo fmt`, `rustfmt`), sem composição.
+- **Grafo** — `assert` (existe/é público/é usado fora), `impact_check`
+  (chamadores reversos), `context_graph` (chamadores e consumidores com
+  profundidade), `trace` (caminho A → … → B), `diff` (símbolos alterados,
+  chamadores e testes afetados) e `why` (commits que tocaram um símbolo).
+  `diff` e `why` precisam de um repositório git.
+- **Web** — `fetch` (baixa uma URL e devolve os blocos relevantes com âncoras),
+  `websearch` (busca sem provedor pago) e `research` (busca, baixa as melhores
+  fontes e devolve a evidência com URL).
+- **Sessão** — `ledger` (fatos duráveis por repositório), `state` (notas,
+  tarefas e retomada), `env` (allowlist estrita) e `setup` (gera a documentação
+  das tools em `AGENTS.md` e na skill).
 
-- **`read`** — devolve o esqueleto de um arquivo (assinaturas, sem corpos) ou o
-  corpo de um símbolo. Segunda leitura do mesmo símbolo, sem mudança, vira um
-  ponteiro; se o símbolo mudou, devolve só o diff.
-- **`read_many`** — lê vários arquivos/símbolos em um lote atômico, com um
-  orçamento de tokens compartilhado.
-- **`search`** — busca por descrição natural ("onde o token é validado") ou por
-  nome. `keywords` é opcional e reforça termos exatos; a varredura respeita
-  `.gitignore` e ignora diretórios de build. Devolve corpo dos primeiros
-  resultados e assinatura do resto, dentro do orçamento.
-- **`edit`** — troca o corpo `{ … }` de um símbolo Rust, com `expected_hash` do
-  `read` como guarda de leitura. Recusa hash velho, símbolo ambíguo ou sintaxe
-  inválida; a escrita é atômica e verificada relendo o disco.
-- **`peek`** — recupera, por handle, o trecho que não coube no orçamento.
-
-O root das leituras é o diretório onde o Tupi foi aberto. Caminho que escapa
-dele é recusado. A v1 entende AST de Rust; arquivos de outras linguagens caem no
-fallback de conteúdo inteiro, limitado pelo mesmo orçamento.
+O root das leituras é o diretório onde o Tupi foi aberto. A v1 entende AST de
+Rust; arquivos de outras linguagens caem no fallback de conteúdo inteiro,
+limitado pelo mesmo orçamento.
 
 ## Requisitos
 
 - Rust 1.99+
 - Uma chave da plataforma DeepSeek
+- `git` para `diff`, `why` e `patch`; `curl` para as tools de web
 
 ## Configuração
 
@@ -76,7 +87,7 @@ Workspace microkernel + CQRS:
 tupi-domain       tipos puros (Session, Message, Event)
 tupi-kernel       contratos (Provider, buses, registry)
 tupi-providers    um módulo por provedor (deepseek.rs)
-tupi-tools        AST, orçamento, store/peek, ledger e read/read_many
+tupi-tools        AST, orçamento, store/peek, ledger, grafo e as tools
 tupi-app          handlers de comando/query, loop de tools + eventos
 tupi-tui          ratatui: envia comandos, reage a eventos
 tupi              composição: env, registry, tools, app, TUI

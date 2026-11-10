@@ -18,6 +18,7 @@ pub enum CommandOutcome {
     Started { request_id: RequestId },
     Cancelled,
     ModelChanged { model: String },
+    ShowPrompts { enabled: bool },
     Noop,
 }
 

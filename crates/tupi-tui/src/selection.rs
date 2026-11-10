@@ -1,6 +1,15 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Viewport do último desenho do transcript, usado para mapear o mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptView {
+    pub rows: usize,
+    pub start: usize,
+    pub width: u16,
+    pub area: ratatui::layout::Rect,
+}
 
 /// Seleção em coordenadas absolutas do transcript: linha e coluna em células.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,8 +140,6 @@ pub fn apply_selection(line: Line<'static>, from: u16, to: u16) -> Line<'static>
     highlighted.style = line_style;
     highlighted
 }
-
-use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 mod tests {
     use super::*;

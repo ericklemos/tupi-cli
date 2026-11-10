@@ -2936,6 +2936,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenvy",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2998,6 +2999,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "tupi-domain",
  "tupi-kernel",
 ]
@@ -3020,6 +3022,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ignore",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

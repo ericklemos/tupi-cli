@@ -781,6 +781,7 @@ mod tests {
             symbol: Some("verify_token".to_string()),
             budget_tokens: None,
             repeat: None,
+            rev: None,
         })
         .unwrap();
 
