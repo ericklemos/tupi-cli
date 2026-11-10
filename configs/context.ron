@@ -1,0 +1,11 @@
+// Teto de tokens estimados do contexto enviado ao modelo.
+// Ao passar do teto, a poda encurta resultados de tool antigos e descarta
+// turnos antigos até o alvo, preservando o prefixo cacheado do provedor.
+// budget: 0 desliga a poda e mantém o histórico inteiro.
+(
+    budget: 120000,
+    // Alvo do corte amortizado. Omitido ou 0 equivale a 2/5 do teto.
+    target: 60000,
+    // Quantos resultados de tool recentes ficam inteiros antes de encurtar.
+    recent_results: 3,
+)

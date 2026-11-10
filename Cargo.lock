@@ -2976,6 +2976,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures-util",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -3001,6 +3002,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-core",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

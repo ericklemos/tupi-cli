@@ -20,7 +20,10 @@ pub const DEFAULT_BUDGET_TOKENS: usize = 2000;
 pub const PEEK_TOOL_NAME: &str = "peek";
 
 pub fn estimate_tokens(text: &str) -> usize {
-    ((text.chars().count() as f64) / CHARS_PER_TOKEN).ceil() as usize
+    // Fonte única: o modelo word-piece de `tupi_domain::tokens`. Manter uma
+    // segunda regra aqui (chars/3.3) fazia o orçamento de tools discordar do
+    // planejador de contexto para o mesmo texto.
+    tupi_domain::tokens::estimate_tokens(text)
 }
 
 fn section_tokens(section: &Section) -> usize {
@@ -338,10 +341,13 @@ mod tests {
 
     #[test]
     fn omitted_body_concatenates_headings_and_bodies() {
+        // Cada corpo de 700 chars custa ~175 tokens no estimador compartilhado
+        // (tupi_domain::tokens): `kept` sozinho já quase esgota o orçamento e
+        // não sobra espaço para nenhuma das duas seções de baixa prioridade.
         let sections = vec![
-            section("kept", 350, 255),
-            section("drop-a", 350, 10),
-            section("drop-b", 350, 20),
+            section("kept", 700, 255),
+            section("drop-a", 700, 10),
+            section("drop-b", 700, 20),
         ];
         let selected = select(&sections, 200);
         let body = selected.omitted_body();
@@ -353,7 +359,13 @@ mod tests {
 
     #[test]
     fn estimate_uses_three_point_three_chars_per_token() {
-        assert_eq!(estimate_tokens(&"x".repeat(33)), 10);
+        // O contador de tools delega ao modelo canônico do domain: mesmo texto,
+        // mesmo número em qualquer crate.
+        let sample = "fn main() { let x = 1; }";
+        assert_eq!(
+            estimate_tokens(sample),
+            tupi_domain::tokens::estimate_tokens(sample)
+        );
         assert_eq!(CHARS_PER_TOKEN, 3.3);
         assert_eq!(DEFAULT_BUDGET_TOKENS, 2000);
     }

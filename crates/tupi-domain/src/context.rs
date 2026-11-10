@@ -65,7 +65,13 @@ impl Plan {
 }
 
 /// Planeja o contexto a enviar. `budget == 0` desliga a poda.
+pub const DEFAULT_RECENT_RESULTS_KEPT: usize = RECENT_RESULTS_KEPT;
+
 pub fn plan(messages: &[Message], budget: usize) -> Plan {
+    plan_with(messages, budget, DEFAULT_RECENT_RESULTS_KEPT)
+}
+
+pub fn plan_with(messages: &[Message], budget: usize, recent_results: usize) -> Plan {
     let untouched = |messages: &[Message]| Plan {
         messages: messages.to_vec(),
         estimate: total(messages),
@@ -83,7 +89,7 @@ pub fn plan(messages: &[Message], budget: usize) -> Plan {
         return untouched(messages);
     }
 
-    let mut kept = shrink_old_results(messages);
+    let mut kept = shrink_old_results(messages, recent_results);
     let shrunk_results = kept
         .iter()
         .filter(|message| is_pointer(&message.content))
@@ -113,12 +119,21 @@ pub fn plan(messages: &[Message], budget: usize) -> Plan {
 /// invalidariam o prefixo que o provedor mantém em cache; cortes fundos e raros
 /// preservam mais cache por token gasto.
 pub fn plan_amortized(messages: &[Message], ceiling: usize, target: usize) -> Plan {
-    let planned = plan(messages, ceiling);
+    plan_amortized_with(messages, ceiling, target, DEFAULT_RECENT_RESULTS_KEPT)
+}
+
+pub fn plan_amortized_with(
+    messages: &[Message],
+    ceiling: usize,
+    target: usize,
+    recent_results: usize,
+) -> Plan {
+    let planned = plan_with(messages, ceiling, recent_results);
     if !planned.trimmed() || target >= ceiling {
         return planned;
     }
 
-    let mut deeper = plan(&planned.messages, target);
+    let mut deeper = plan_with(&planned.messages, target, recent_results);
     // A segunda passada não vê o que a primeira já cortou: soma para o resumo
     // refletir o total, e fica com a contagem de ponteiros mais alta.
     deeper.omitted_units += planned.omitted_units;
@@ -135,7 +150,7 @@ fn is_pointer(content: &str) -> bool {
 }
 
 /// Substitui o conteúdo de resultados antigos por um ponteiro barato.
-fn shrink_old_results(messages: &[Message]) -> Vec<Message> {
+fn shrink_old_results(messages: &[Message], recent_results: usize) -> Vec<Message> {
     let tool_indices: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -143,7 +158,7 @@ fn shrink_old_results(messages: &[Message]) -> Vec<Message> {
         .map(|(index, _)| index)
         .collect();
 
-    let shrinkable = tool_indices.len().saturating_sub(RECENT_RESULTS_KEPT);
+    let shrinkable = tool_indices.len().saturating_sub(recent_results);
     let mut kept = messages.to_vec();
 
     for index in tool_indices.into_iter().take(shrinkable) {
@@ -246,6 +261,27 @@ mod tests {
                 <= planned.shrunk_results
         );
         assert!(planned.estimate < total(&messages));
+    }
+
+    #[test]
+    fn recent_results_kept_is_configurable() {
+        let messages = vec![
+            user("leia"),
+            Message::assistant_with_calls("", vec![call("c1")]),
+            big_result("c1", 2_000),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            big_result("c2", 2_000),
+        ];
+
+        let planned = plan_with(&messages, 1_000, 0);
+        let tools: Vec<_> = planned
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .collect();
+
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|message| is_pointer(&message.content)));
     }
 
     #[test]

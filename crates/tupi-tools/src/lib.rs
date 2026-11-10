@@ -91,6 +91,7 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
+    registry.register(Arc::new(crate::pipeline::PipelineTool));
     registry.register(Arc::new(crate::graph::InvalidatingTool::new(
         Arc::new(EditTool::new(
             root_dir.clone(),
@@ -222,3 +223,4 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         DEFAULT_BUDGET_TOKENS,
     )));
 }
+mod pipeline;

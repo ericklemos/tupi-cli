@@ -261,6 +261,10 @@ impl tupi_kernel::Tool for InvalidatingTool {
     fn describe_call(&self, arguments: &serde_json::Value) -> String {
         self.inner.describe_call(arguments)
     }
+
+    fn mutates(&self) -> bool {
+        true
+    }
 }
 
 fn has_test_attribute(content: &str, start_line: usize) -> bool {

@@ -467,6 +467,7 @@ mod tests {
                 "read_many",
                 "search",
                 "workflow",
+                "pipeline",
                 "edit",
                 "write",
                 "write_many",

@@ -163,7 +163,7 @@ fn split_front_matter(text: &str) -> (Option<String>, String) {
     let head = &rest[..end];
     let body = rest[end..]
         .trim_start_matches("\n---")
-        .trim_start_matches(|c| c == '\r' || c == '\n')
+        .trim_start_matches(['\r', '\n'])
         .to_string();
     let description = head.lines().find_map(|line| {
         let value = line.trim().strip_prefix("description:")?.trim();

@@ -17,7 +17,7 @@ const SESSION_ID: u64 = 1;
 
 pub const MAX_TOOL_STEPS: usize = 30;
 
-async fn run_tool(tools: &ToolRegistry, call: &ToolCall) -> Result<String, String> {
+pub(crate) async fn run_tool(tools: &ToolRegistry, call: &ToolCall) -> Result<String, String> {
     let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
         .map_err(|error| format!("argumento inválido: {error}"))?;
     let tool = tools
@@ -30,7 +30,7 @@ async fn run_tool(tools: &ToolRegistry, call: &ToolCall) -> Result<String, Strin
         .map_err(|error| error.to_string())
 }
 
-fn describe_call(tools: &ToolRegistry, call: &ToolCall) -> String {
+pub(crate) fn describe_call(tools: &ToolRegistry, call: &ToolCall) -> String {
     serde_json::from_str::<serde_json::Value>(&call.arguments)
         .ok()
         .and_then(|arguments| {
@@ -48,7 +48,7 @@ fn close_unanswered(session: &SessionStore, pending: &Mutex<Vec<ToolCall>>, reas
     }
 }
 
-fn summarize(text: &str) -> String {
+pub(crate) fn summarize(text: &str) -> String {
     let line = text.lines().next().unwrap_or("").trim();
     let mut summary: String = line.chars().take(80).collect();
     if line.chars().count() > 80 {
@@ -91,9 +91,15 @@ pub struct App {
     /// Teto de tokens estimados do contexto enviado ao modelo. Zero desliga a
     /// poda e volta ao comportamento antigo (histórico inteiro, sempre).
     context_budget: AtomicUsize,
-    /// Workflows que `/workflows/<nome>` pode invocar. Vazio por padrão para
+    /// Alvo da poda amortizada. Zero pede o padrão de 2/5 do teto.
+    context_target: AtomicUsize,
+    /// Quantos resultados de tool recentes ficam inteiros na poda.
+    context_recent_results: AtomicUsize,
+    /// Workflows que /workflows/<nome> pode invocar. Vazio por padrão para
     /// que os construtores existentes não dependam do disco.
     workflows: Arc<dyn WorkflowIndex>,
+    /// Telemetria estruturada. Desligada por padrão; main liga explicitamente.
+    telemetry: crate::telemetry::Telemetry,
 }
 
 impl App {
@@ -162,7 +168,12 @@ impl App {
             show_prompts: AtomicBool::new(show_prompts),
             max_tool_steps: MAX_TOOL_STEPS,
             context_budget: AtomicUsize::new(tupi_domain::context::DEFAULT_CONTEXT_TOKENS),
+            context_target: AtomicUsize::new(0),
+            context_recent_results: AtomicUsize::new(
+                tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
+            ),
             workflows: Arc::new(crate::workflow::EmptyIndex),
+            telemetry: crate::telemetry::Telemetry::disabled(),
         })
     }
 
@@ -220,6 +231,32 @@ impl App {
         self
     }
 
+    pub fn with_telemetry(
+        mut self: Arc<Self>,
+        telemetry: crate::telemetry::Telemetry,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .telemetry = telemetry;
+        self
+    }
+
+    /// Teto alvo depois do corte amortizado. Zero usa 2/5 do teto.
+    pub fn with_context_target(mut self: Arc<Self>, context_target: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .context_target = AtomicUsize::new(context_target);
+        self
+    }
+
+    /// Quantos resultados de tool recentes a poda mantém inteiros.
+    pub fn with_context_recent_results(mut self: Arc<Self>, recent: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .context_recent_results = AtomicUsize::new(recent);
+        self
+    }
+
     pub fn session(&self) -> Session {
         self.session.snapshot()
     }
@@ -267,6 +304,8 @@ impl App {
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
         let max_tool_steps = self.max_tool_steps;
         let context_budget = self.context_budget.load(Ordering::SeqCst);
+        let context_target = self.context_target.load(Ordering::SeqCst);
+        let context_recent_results = self.context_recent_results.load(Ordering::SeqCst);
 
         let partial = Arc::new(Mutex::new(String::new()));
         let events = self.events.clone();
@@ -293,10 +332,16 @@ impl App {
                 }
                 // Poda amortizada: corta fundo quando estoura o teto, para que o
                 // prefixo cacheado do provedor sobreviva aos próximos passos.
-                let planned = tupi_domain::context::plan_amortized(
+                let target = if context_target == 0 {
+                    context_budget.saturating_mul(2) / 5
+                } else {
+                    context_target
+                };
+                let planned = tupi_domain::context::plan_amortized_with(
                     &session.messages(),
                     context_budget,
-                    context_budget.saturating_mul(2) / 5,
+                    target,
+                    context_recent_results,
                 );
                 if planned.trimmed() {
                     events.publish(Event::ContextTrimmed {
@@ -395,7 +440,11 @@ impl App {
                         summary: describe_call(&tools, &call),
                     });
 
-                    let (content, ok) = match run_tool(&tools, &call).await {
+                    let (content, ok) = match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
+                        crate::pipeline::execute(&tools, &events, request_id, &call).await
+                    } else {
+                        run_tool(&tools, &call).await
+                    } {
                         Ok(result) => (result, true),
                         Err(error) => (error, false),
                     };
@@ -867,6 +916,94 @@ mod tests {
             models,
             vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
         );
+    }
+
+    /// Catálogo fixo de workflows para os testes de `/workflows/<nome>`.
+    fn fixed_workflows(names: &[&str]) -> Arc<crate::workflow::FixedIndex> {
+        Arc::new(crate::workflow::FixedIndex {
+            workflows: names
+                .iter()
+                .map(|name| tupi_domain::Workflow {
+                    name: (*name).to_string(),
+                    description: String::new(),
+                    source: tupi_domain::WorkflowSource::LocalTupi,
+                    path: None,
+                    body: format!("# {name}\n\n1. enquadre\n"),
+                    shadowed: Vec::new(),
+                })
+                .collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_workflow_turn_sends_the_steps_to_the_model() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(FakeProvider { tokens: vec!["ok"] });
+        let app = App::new(registry(provider), "fake", "modelo".into(), bus)
+            .with_workflows(fixed_workflows(&["feature"]));
+
+        let outcome = app
+            .handle(Command::RunWorkflow {
+                name: "feature".into(),
+                extra: "no parser".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CommandOutcome::Started { .. }));
+        wait_for_end(&mut rx).await;
+
+        let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
+            panic!("esperava History");
+        };
+        assert_eq!(history[0].role, Role::User);
+        assert!(history[0].content.contains("Siga o workflow `feature`"));
+        assert!(history[0].content.contains("1. enquadre"));
+        assert!(history[0].content.contains("Pedido do usuário: no parser"));
+        assert_eq!(history[1].content, "ok");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workflow_never_reaches_the_model() {
+        let bus = EventBus::new(16);
+        let provider = Arc::new(FakeProvider { tokens: vec!["ok"] });
+        let app = App::new(registry(provider), "fake", "modelo".into(), bus)
+            .with_workflows(fixed_workflows(&["feature"]));
+
+        let error = app
+            .handle(Command::RunWorkflow {
+                name: "deploy".into(),
+                extra: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deploy"));
+        assert!(error.to_string().contains("feature"));
+
+        let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
+            panic!("esperava History");
+        };
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_workflow_without_a_name_explains_the_usage() {
+        let bus = EventBus::new(8);
+        let app = App::new(
+            registry(Arc::new(FakeProvider { tokens: vec!["ok"] })),
+            "fake",
+            "modelo".into(),
+            bus,
+        );
+
+        let error = app
+            .handle(Command::RunWorkflow {
+                name: "  ".into(),
+                extra: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("/workflows/"));
     }
 
     #[tokio::test]

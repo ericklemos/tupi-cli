@@ -620,7 +620,9 @@ mod tests {
         else {
             panic!("esperava métricas");
         };
-        assert_eq!(metrics.estimated_tokens, 3);
+        // Estimador compartilhado (tupi_domain::tokens): 1 peça para "olá",
+        // 1 para a vírgula e 2 para "mundo".
+        assert_eq!(metrics.estimated_tokens, 4);
         assert!(metrics.first_token.is_some());
         assert!(metrics.finished.is_some());
     }

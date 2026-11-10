@@ -46,6 +46,12 @@ pub trait Tool: Send + Sync {
         }
         out
     }
+
+    /// A call altera o workspace (ou o estado durável): o runner não a
+    /// executa em paralelo com outra call da mesma step.
+    fn mutates(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone)]

@@ -191,6 +191,10 @@ impl Tool for SetupTool {
             .unwrap_or("preview");
         format!("setup: {action}")
     }
+
+    fn mutates(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

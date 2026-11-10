@@ -319,6 +319,10 @@ impl Tool for StateTool {
             .unwrap_or("?");
         format!("state: {action}")
     }
+
+    fn mutates(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

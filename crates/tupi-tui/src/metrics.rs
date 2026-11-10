@@ -105,12 +105,10 @@ fn rate(tokens: u64, from: Duration, to: Duration) -> Option<u64> {
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
-    text.split_whitespace()
-        .map(|word| {
-            let chars = word.chars().count() as u64;
-            chars.div_ceil(4).max(1)
-        })
-        .sum()
+    // Fonte única: `tupi_domain::tokens`. A cópia local usava
+    // `chars.div_ceil(4).max(1)` por palavra e divergia do orçamento de
+    // tools/contexto para o mesmo texto.
+    tupi_domain::tokens::estimate_tokens(text) as u64
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -128,8 +126,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn estimate_counts_words_in_quarter_chunks() {
-        assert_eq!(estimate_tokens("olá, mundo"), 3);
+    fn estimate_delegates_to_domain_model() {
+        assert_eq!(
+            estimate_tokens("olá, mundo"),
+            tupi_domain::tokens::estimate_tokens("olá, mundo") as u64
+        );
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("a"), 1);
     }

@@ -4,7 +4,9 @@
 //! é o `App`. Aqui ficam a chamada do comando e a lista que a TUI sugere.
 
 use tupi_domain::WORKFLOWS_PREFIX;
-use tupi_kernel::{Command, CommandBus, CommandError, CommandOutcome, Query, QueryBus, QueryResult};
+use tupi_kernel::{
+    Command, CommandBus, CommandError, CommandOutcome, Query, QueryBus, QueryResult,
+};
 
 use crate::state::ChatState;
 use tupi_domain::RequestId;

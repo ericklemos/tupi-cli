@@ -46,6 +46,14 @@ async fn main() -> anyhow::Result<()> {
         path = %tool_config::tools_path(&root).display(),
         "limite de passos de tool call por turno"
     );
+    let context_limits = config::load_context(&root);
+    tracing::debug!(
+        budget = context_limits.budget,
+        target = context_limits.target,
+        recent_results = context_limits.recent_results,
+        path = %config::context_path(&root).display(),
+        "configuração de compactação de contexto"
+    );
     let prompt = prompt_config::load_prompt(&root);
     tracing::debug!(
         path = %prompt_config::prompt_path(&root).display(),
@@ -68,7 +76,10 @@ async fn main() -> anyhow::Result<()> {
         tools,
         prefix,
     )
-    .with_max_tool_steps(tool_limits.max_tool_steps);
+    .with_max_tool_steps(tool_limits.max_tool_steps)
+    .with_context_budget(context_limits.budget)
+    .with_context_target(context_limits.target)
+    .with_context_recent_results(context_limits.recent_results);
     let app = app.with_workflows(workflows);
 
     let buses = BusSet {
