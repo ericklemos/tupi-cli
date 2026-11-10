@@ -8,6 +8,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-providers/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-store/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-store/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-tools/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-tui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi/src" isTestSource="false" />

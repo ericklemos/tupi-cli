@@ -21,18 +21,7 @@ impl AstChunker {
     }
 
     pub fn snippets(&self, path: &Path, content: &str) -> Vec<AstSnippet> {
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            return Vec::new();
-        }
-
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .is_err()
-        {
-            return Vec::new();
-        }
-        let Some(tree) = parser.parse(content, None) else {
+        let Some(tree) = parse_rust(path, content) else {
             return Vec::new();
         };
 
@@ -41,6 +30,124 @@ impl AstChunker {
         collect_snippets(tree.root_node(), bytes, &mut snippets);
         disambiguate(&mut snippets);
         snippets
+    }
+
+    /// Expande linhas casadas para o escopo que as contém. Um `use`/`const`
+    /// dentro de um módulo não vale o módulo inteiro: vira uma janela de ±2
+    /// linhas. A linha da declaração `mod x {` vale o módulo.
+    pub fn snippets_at_lines(
+        &self,
+        path: &Path,
+        content: &str,
+        lines: &[usize],
+    ) -> Vec<AstSnippet> {
+        let Some(tree) = parse_rust(path, content) else {
+            return Vec::new();
+        };
+
+        let bytes = content.as_bytes();
+        let total_lines = content.lines().count();
+        let root = tree.root_node();
+        let mut snippets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for &line in lines {
+            if line == 0 || line > total_lines {
+                continue;
+            }
+            let point = tree_sitter::Point {
+                row: line - 1,
+                column: 0,
+            };
+
+            let expanded = root
+                .descendant_for_point_range(point, point)
+                .and_then(|node| enclosing_scope(node, line))
+                .and_then(|node| snippet_for_node(node, bytes));
+
+            let snippet = expanded.unwrap_or_else(|| fallback_snippet(path, content, line));
+            if seen.insert((snippet.start_line, snippet.end_line)) {
+                snippets.push(snippet);
+            }
+        }
+
+        snippets.sort_by_key(|snippet| snippet.start_line);
+        disambiguate(&mut snippets);
+        snippets
+    }
+}
+
+fn parse_rust(path: &Path, content: &str) -> Option<tree_sitter::Tree> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return None;
+    }
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    parser.parse(content, None)
+}
+
+fn is_expandable(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+    )
+}
+
+fn enclosing_scope(mut node: Node<'_>, line: usize) -> Option<Node<'_>> {
+    loop {
+        if is_expandable(node.kind()) {
+            return Some(node);
+        }
+        if node.kind() == "mod_item" && node.start_position().row + 1 == line {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn snippet_for_node(node: Node<'_>, source: &[u8]) -> Option<AstSnippet> {
+    let code = node.utf8_text(source).ok()?.to_string();
+    if code.is_empty() {
+        return None;
+    }
+
+    let symbol_name = symbol_name(node, source);
+    let qualified_name = qualified_name(node, source, &symbol_name);
+    let start_line = node.start_position().row + 1;
+    let end_line = start_line + code.lines().count().saturating_sub(1);
+
+    Some(AstSnippet {
+        symbol_name,
+        qualified_name,
+        signature: compact_signature(&signature(node, source)),
+        code,
+        start_line,
+        end_line,
+    })
+}
+
+/// Recorte de ±2 linhas para uma linha que não pertence a um escopo exibível.
+fn fallback_snippet(path: &Path, content: &str, line: usize) -> AstSnippet {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = line.saturating_sub(2).max(1);
+    let end = (line + 2).min(lines.len()).max(start);
+    let code = lines[start - 1..end].join("\n");
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("arquivo");
+    let name = format!("{file}:{start}-{end}");
+
+    AstSnippet {
+        symbol_name: name.clone(),
+        qualified_name: name,
+        signature: format!("declaração / import (linhas {start}-{end})"),
+        code,
+        start_line: start,
+        end_line: end,
     }
 }
 
@@ -52,22 +159,10 @@ fn is_scope(kind: &str) -> bool {
 }
 
 fn collect_snippets(node: Node<'_>, source: &[u8], snippets: &mut Vec<AstSnippet>) {
-    if is_scope(node.kind()) {
-        let code = node.utf8_text(source).unwrap_or("").to_string();
-        if !code.is_empty() {
-            let symbol_name = symbol_name(node, source);
-            let qualified_name = qualified_name(node, source, &symbol_name);
-            let start_line = node.start_position().row + 1;
-            let end_line = start_line + code.lines().count().saturating_sub(1);
-            snippets.push(AstSnippet {
-                symbol_name,
-                qualified_name,
-                signature: compact_signature(&signature(node, source)),
-                code,
-                start_line,
-                end_line,
-            });
-        }
+    if is_scope(node.kind())
+        && let Some(snippet) = snippet_for_node(node, source)
+    {
+        snippets.push(snippet);
     }
 
     let mut cursor = node.walk();
@@ -126,12 +221,7 @@ fn disambiguate(snippets: &mut [AstSnippet]) {
     }
 
     for snippet in snippets.iter_mut() {
-        if counts
-            .get(&snippet.qualified_name)
-            .copied()
-            .unwrap_or(0)
-            > 1
-        {
+        if counts.get(&snippet.qualified_name).copied().unwrap_or(0) > 1 {
             snippet.qualified_name = format!("{}@{}", snippet.qualified_name, snippet.start_line);
         }
     }
@@ -154,7 +244,7 @@ fn signature(node: Node<'_>, source: &[u8]) -> String {
 
 /// Uma assinatura multiline em uma linha. Só quebras e indentação são colapsadas;
 /// o espaçamento dentro da linha é preservado.
-fn compact_signature(signature: &str) -> String {
+pub(crate) fn compact_signature(signature: &str) -> String {
     let mut out = String::with_capacity(signature.len());
     for line in signature.lines() {
         let line = line.trim();
@@ -185,10 +275,7 @@ mod tests {
         assert!(names.contains(&"verify"), "{names:?}");
         assert!(names.contains(&"logout"), "{names:?}");
 
-        let verify = snippets
-            .iter()
-            .find(|s| s.symbol_name == "verify")
-            .unwrap();
+        let verify = snippets.iter().find(|s| s.symbol_name == "verify").unwrap();
         assert_eq!(verify.qualified_name, "Auth::verify");
         assert_eq!(verify.start_line, 4);
         assert_eq!(verify.end_line, 6);
@@ -246,15 +333,68 @@ mod tests {
             .collect();
 
         assert_eq!(names.len(), 2);
-        assert!(names.iter().all(|name| name.starts_with("Foo::new@")), "{names:?}");
+        assert!(
+            names.iter().all(|name| name.starts_with("Foo::new@")),
+            "{names:?}"
+        );
         assert_ne!(names[0], names[1]);
+    }
+
+    const SEARCH_SOURCE: &str = "use std::fmt;\n\nmod inner {\n    use std::io;\n}\n\npub fn verify_token() -> bool {\n    true\n}\n";
+
+    #[test]
+    fn snippets_at_lines_expands_to_the_innermost_function() {
+        let snippets =
+            AstChunker::new().snippets_at_lines(Path::new("a.rs"), SEARCH_SOURCE, &[7, 8]);
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].symbol_name, "verify_token");
+        assert_eq!(snippets[0].start_line, 7);
+        assert_eq!(snippets[0].end_line, 9);
+    }
+
+    #[test]
+    fn a_top_level_use_falls_back_to_a_small_window() {
+        let snippets = AstChunker::new().snippets_at_lines(Path::new("a.rs"), SEARCH_SOURCE, &[1]);
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].symbol_name, "a.rs:1-3");
+        assert!(!snippets[0].code.contains("pub fn verify_token"));
+    }
+
+    #[test]
+    fn a_use_inside_a_module_does_not_expand_to_the_whole_module() {
+        let snippets = AstChunker::new().snippets_at_lines(Path::new("a.rs"), SEARCH_SOURCE, &[4]);
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].symbol_name, "a.rs:2-6");
+        assert!(!snippets[0].code.contains("pub fn verify_token"));
+    }
+
+    #[test]
+    fn the_module_declaration_line_expands_to_the_module() {
+        let snippets = AstChunker::new().snippets_at_lines(Path::new("a.rs"), SEARCH_SOURCE, &[3]);
+
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].symbol_name, "inner");
+        assert_eq!(snippets[0].start_line, 3);
+    }
+
+    #[test]
+    fn fallback_near_the_first_line_does_not_underflow() {
+        let snippets =
+            AstChunker::new().snippets_at_lines(Path::new("a.rs"), "use std::fmt;\n", &[1]);
+        assert_eq!(snippets[0].start_line, 1);
+        assert_eq!(snippets[0].end_line, 1);
     }
 
     #[test]
     fn unsupported_extension_has_no_snippets() {
-        assert!(AstChunker::new()
-            .snippets(Path::new("README.md"), "# tupi")
-            .is_empty());
+        assert!(
+            AstChunker::new()
+                .snippets(Path::new("README.md"), "# tupi")
+                .is_empty()
+        );
     }
 
     #[test]

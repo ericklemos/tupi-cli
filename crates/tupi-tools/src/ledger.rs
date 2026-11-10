@@ -314,7 +314,9 @@ pub fn full_note(reason: FullReason) -> &'static str {
         FullReason::PartialBefore => {
             "> O trecho entregue antes era um recorte; o arquivo mudou, então segue o corpo atual inteiro."
         }
-        FullReason::TooLargeToDiff => "> Símbolo grande demais para diff; segue o corpo atual inteiro.",
+        FullReason::TooLargeToDiff => {
+            "> Símbolo grande demais para diff; segue o corpo atual inteiro."
+        }
     }
 }
 
@@ -328,7 +330,11 @@ pub fn content_hash(content: &str) -> Hash {
 
 /// Intervalo de bytes das linhas 1-based `start_line..=end_line`.
 #[allow(dead_code)]
-pub fn line_span(content: &str, start_line: usize, end_line: usize) -> Option<std::ops::Range<usize>> {
+pub fn line_span(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<std::ops::Range<usize>> {
     if start_line == 0 || end_line < start_line {
         return None;
     }

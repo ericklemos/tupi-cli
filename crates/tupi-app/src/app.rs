@@ -225,10 +225,8 @@ impl App {
                 }
 
                 if !streamed_text.is_empty() || !calls.is_empty() {
-                    session.push_message(Message::assistant_with_calls(
-                        streamed_text,
-                        calls.clone(),
-                    ));
+                    session
+                        .push_message(Message::assistant_with_calls(streamed_text, calls.clone()));
                     *pending.lock().unwrap() = calls.clone();
                 }
 
@@ -649,7 +647,10 @@ mod tests {
         );
         assert_eq!(
             rx.recv().await.unwrap(),
-            Event::StreamFinished { request_id }
+            Event::StreamFinished {
+                request_id,
+                completion_tokens: None,
+            }
         );
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -714,7 +715,10 @@ mod tests {
         assert_eq!(outcome, CommandOutcome::Cancelled);
         assert_eq!(
             rx.recv().await.unwrap(),
-            Event::StreamFinished { request_id }
+            Event::StreamFinished {
+                request_id,
+                completion_tokens: None,
+            }
         );
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -799,17 +803,9 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn stream_chat(
-            &self,
-            request: ChatRequest,
-        ) -> Result<ProviderStream, ProviderError> {
+        async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
             self.requests.lock().unwrap().push(request);
-            let items = self
-                .scripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("script");
+            let items = self.scripts.lock().unwrap().pop_front().expect("script");
             Ok(Box::pin(futures_util::stream::iter(items)))
         }
     }
@@ -841,11 +837,7 @@ mod tests {
         }
     }
 
-    fn app_with_tools(
-        provider: Arc<dyn Provider>,
-        bus: EventBus,
-        tool: Arc<dyn Tool>,
-    ) -> Arc<App> {
+    fn app_with_tools(provider: Arc<dyn Provider>, bus: EventBus, tool: Arc<dyn Tool>) -> Arc<App> {
         let mut tools = ToolRegistry::new();
         tools.register(tool);
         App::with_tools(
@@ -866,9 +858,7 @@ mod tests {
         Ok(ProviderEvent::ToolCalls(calls))
     }
 
-    async fn wait_for_end(
-        rx: &mut tokio::sync::broadcast::Receiver<Event>,
-    ) {
+    async fn wait_for_end(rx: &mut tokio::sync::broadcast::Receiver<Event>) {
         loop {
             match rx.recv().await.unwrap() {
                 Event::StreamFinished { .. } | Event::StreamFailed { .. } => return,
@@ -881,16 +871,16 @@ mod tests {
     async fn tool_call_is_executed_and_the_model_is_called_again() {
         let bus = EventBus::new(32);
         let mut rx = bus.subscribe();
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![
-                vec![calls_event(vec![tool_call("c1", "echo", "{\"n\":1}")])],
-                vec![text_event("fim")],
-            ],
-        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call("c1", "echo", "{\"n\":1}")])],
+            vec![text_event("fim")],
+        ]));
         let app = app_with_tools(provider.clone(), bus, Arc::new(EchoTool::new()));
 
         let CommandOutcome::Started { request_id } = app
-            .handle(Command::SendMessage { text: "leia".into() })
+            .handle(Command::SendMessage {
+                text: "leia".into(),
+            })
             .await
             .unwrap()
         else {
@@ -923,7 +913,10 @@ mod tests {
         );
         assert_eq!(
             rx.recv().await.unwrap(),
-            Event::StreamFinished { request_id }
+            Event::StreamFinished {
+                request_id,
+                completion_tokens: None,
+            }
         );
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -939,27 +932,32 @@ mod tests {
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].messages.iter().any(|message| message.role == Role::Tool));
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Tool)
+        );
     }
 
     #[tokio::test]
     async fn multiple_tool_calls_run_in_order() {
         let bus = EventBus::new(32);
         let mut rx = bus.subscribe();
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![
-                vec![calls_event(vec![
-                    tool_call("c1", "echo", "{\"n\":1}"),
-                    tool_call("c2", "echo", "{\"n\":2}"),
-                ])],
-                vec![text_event("fim")],
-            ],
-        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![
+                tool_call("c1", "echo", "{\"n\":1}"),
+                tool_call("c2", "echo", "{\"n\":2}"),
+            ])],
+            vec![text_event("fim")],
+        ]));
         let app = app_with_tools(provider, bus, Arc::new(EchoTool::new()));
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
         wait_for_end(&mut rx).await;
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -973,18 +971,18 @@ mod tests {
     async fn malformed_arguments_do_not_invoke_the_tool() {
         let bus = EventBus::new(32);
         let mut rx = bus.subscribe();
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![
-                vec![calls_event(vec![tool_call("c1", "echo", "{")])],
-                vec![text_event("fim")],
-            ],
-        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call("c1", "echo", "{")])],
+            vec![text_event("fim")],
+        ]));
         let tool = Arc::new(EchoTool::new());
         let app = app_with_tools(provider, bus, tool.clone());
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
 
         wait_for_end(&mut rx).await;
         assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
@@ -998,17 +996,17 @@ mod tests {
     async fn unknown_tool_returns_an_explicit_tool_message() {
         let bus = EventBus::new(32);
         let mut rx = bus.subscribe();
-        let provider = Arc::new(ScriptedProvider::new(
-            vec![
-                vec![calls_event(vec![tool_call("c1", "nope", "{}")])],
-                vec![text_event("fim")],
-            ],
-        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call("c1", "nope", "{}")])],
+            vec![text_event("fim")],
+        ]));
         let app = app_with_tools(provider, bus, Arc::new(EchoTool::new()));
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
 
         wait_for_end(&mut rx).await;
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -1047,16 +1045,170 @@ mod tests {
             tools,
         );
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
         wait_for_end(&mut rx).await;
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
             panic!("esperava History");
         };
         assert_eq!(history[2].role, Role::Tool);
-        assert!(history[2].content.contains("!raw.is_empty()"), "{:?}", history[2]);
+        assert!(
+            history[2].content.contains("!raw.is_empty()"),
+            "{:?}",
+            history[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn app_runs_the_real_search_tool_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("auth.rs"),
+            "pub fn verify_token(raw: &str) -> bool {\n    !raw.is_empty()\n}\n",
+        )
+        .unwrap();
+
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call(
+                "c1",
+                "search",
+                "{\"query\":\"onde o token é validado\"}",
+            )])],
+            vec![text_event("li")],
+        ]));
+        let mut tools = ToolRegistry::new();
+        tupi_tools::register(dir.path().to_path_buf(), &mut tools);
+        let app = App::with_tools(
+            registry(provider),
+            "scripted",
+            "modelo".into(),
+            bus,
+            None,
+            tools,
+        );
+
+        app.handle(Command::SendMessage {
+            text: "procure".into(),
+        })
+        .await
+        .unwrap();
+
+        let mut summary = None;
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::ToolStarted { summary: value, .. } => summary = Some(value),
+                Event::StreamFinished { .. } => break,
+                Event::StreamFailed { message, .. } => panic!("stream falhou: {message}"),
+                _ => {}
+            }
+        }
+
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|value| value.contains("query=")),
+            "{summary:?}"
+        );
+        let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
+            panic!("esperava History");
+        };
+        assert_eq!(history[2].role, Role::Tool);
+        assert!(
+            history[2].content.contains("verify_token"),
+            "{:?}",
+            history[2]
+        );
+        assert!(
+            history[2].content.contains("!raw.is_empty()"),
+            "{:?}",
+            history[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn app_runs_edit_then_read_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.rs");
+        let content =
+            "pub fn verify_token(raw: &str) -> bool {\n    !raw.is_empty()\n}\n";
+        std::fs::write(&path, content).unwrap();
+        let hash = blake3::hash(content.as_bytes()).to_hex()[..12].to_string();
+
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call(
+                "c1",
+                "edit",
+                &serde_json::json!({
+                    "path": "auth.rs",
+                    "symbol": "verify_token",
+                    "expected_hash": hash,
+                    "new_body": "{\n    raw.len() > 3\n}"
+                })
+                .to_string(),
+            )])],
+            vec![calls_event(vec![tool_call(
+                "c2",
+                "read",
+                "{\"path\":\"auth.rs\",\"symbol\":\"verify_token\"}",
+            )])],
+            vec![text_event("ok")],
+        ]));
+        let mut tools = ToolRegistry::new();
+        tupi_tools::register(dir.path().to_path_buf(), &mut tools);
+        let app = App::with_tools(
+            registry(provider),
+            "scripted",
+            "modelo".into(),
+            bus,
+            None,
+            tools,
+        );
+
+        app.handle(Command::SendMessage { text: "edite".into() })
+            .await
+            .unwrap();
+
+        let mut summaries = Vec::new();
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::ToolStarted { summary, .. } => summaries.push(summary),
+                Event::StreamFinished { .. } => break,
+                Event::StreamFailed { message, .. } => panic!("stream falhou: {message}"),
+                _ => {}
+            }
+        }
+
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| summary.contains("symbol=verify_token")),
+            "{summaries:?}"
+        );
+
+        let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
+            panic!("esperava History");
+        };
+        assert_eq!(history[2].role, Role::Tool);
+        assert!(history[2].content.contains("editado"), "{:?}", history[2]);
+        assert_eq!(history[4].role, Role::Tool);
+        assert!(
+            history[4].content.contains("raw.len() > 3"),
+            "{:?}",
+            history[4]
+        );
+        assert!(
+            !history[4].content.contains("!raw.is_empty()"),
+            "{:?}",
+            history[4]
+        );
     }
 
     struct SlowTool;
@@ -1086,9 +1238,11 @@ mod tests {
         ]]));
         let app = app_with_tools(provider, bus, Arc::new(EchoTool::new()));
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
         wait_for_end(&mut rx).await;
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -1115,7 +1269,9 @@ mod tests {
         let app = app_with_tools(provider, bus, Arc::new(SlowTool));
 
         let CommandOutcome::Started { request_id } = app
-            .handle(Command::SendMessage { text: "leia".into() })
+            .handle(Command::SendMessage {
+                text: "leia".into(),
+            })
             .await
             .unwrap()
         else {
@@ -1153,7 +1309,9 @@ mod tests {
 
         // O histórico está consistente: um novo turno é aceito e completa.
         let CommandOutcome::Started { .. } = app
-            .handle(Command::SendMessage { text: "de novo".into() })
+            .handle(Command::SendMessage {
+                text: "de novo".into(),
+            })
             .await
             .unwrap()
         else {
@@ -1186,11 +1344,7 @@ mod tests {
             _request: ChatRequest,
         ) -> Result<ProviderStream, ProviderError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let items = vec![calls_event(vec![tool_call(
-                &format!("c{n}"),
-                "echo",
-                "{}",
-            )])];
+            let items = vec![calls_event(vec![tool_call(&format!("c{n}"), "echo", "{}")])];
             Ok(Box::pin(futures_util::stream::iter(items)))
         }
     }
@@ -1214,7 +1368,9 @@ mod tests {
         );
 
         let CommandOutcome::Started { request_id } = app
-            .handle(Command::SendMessage { text: "leia".into() })
+            .handle(Command::SendMessage {
+                text: "leia".into(),
+            })
             .await
             .unwrap()
         else {
@@ -1242,7 +1398,9 @@ mod tests {
     }
 
     fn usage_event(tokens: u64) -> Result<ProviderEvent, ProviderError> {
-        Ok(ProviderEvent::Usage { completion_tokens: tokens })
+        Ok(ProviderEvent::Usage {
+            completion_tokens: tokens,
+        })
     }
 
     #[tokio::test]
@@ -1259,9 +1417,11 @@ mod tests {
         ]));
         let app = app_with_tools(provider, bus, Arc::new(EchoTool::new()));
 
-        app.handle(Command::SendMessage { text: "leia".into() })
-            .await
-            .unwrap();
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
 
         let mut total = None;
         for _ in 0..32 {

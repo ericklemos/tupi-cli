@@ -9,7 +9,7 @@ use tupi_kernel::{
     ChatRequest, Provider, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
 };
 
-use crate::sse::{extract_chunk, is_done, SseParser, ToolCallDelta};
+use crate::sse::{SseParser, ToolCallDelta, extract_chunk, is_done};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -374,8 +374,8 @@ mod tests {
 
     #[test]
     fn body_includes_tools_when_present() {
-        let request =
-            ChatRequest::new("deepseek-flash", vec![Message::user("oi")]).with_tools(vec![read_spec()]);
+        let request = ChatRequest::new("deepseek-flash", vec![Message::user("oi")])
+            .with_tools(vec![read_spec()]);
         let body = build_body(&request);
 
         assert_eq!(body["tools"][0]["type"], "function");
@@ -405,7 +405,10 @@ mod tests {
 
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "c1");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
         assert_eq!(
             body["messages"][0]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
@@ -414,10 +417,7 @@ mod tests {
 
     #[test]
     fn tool_message_serializes_call_id() {
-        let request = ChatRequest::new(
-            "deepseek-flash",
-            vec![Message::tool("c1", "resultado")],
-        );
+        let request = ChatRequest::new("deepseek-flash", vec![Message::tool("c1", "resultado")]);
         let body = build_body(&request);
 
         assert_eq!(body["messages"][0]["role"], "tool");

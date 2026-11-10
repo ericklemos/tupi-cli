@@ -4,12 +4,16 @@ use redb::ReadableTable;
 
 use serde::{Deserialize, Serialize};
 
+mod index;
+
 pub const SCHEMA_VERSION: u64 = 1;
 pub const MODELS_TTL_SECS: u64 = 24 * 60 * 60;
 
 const META: redb::TableDefinition<&'static str, &'static [u8]> = redb::TableDefinition::new("meta");
 const MODELS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("models");
+const INDEX: redb::TableDefinition<&'static str, &'static [u8]> =
+    redb::TableDefinition::new("index");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -154,6 +158,8 @@ impl Store {
             }
 
             tx.open_table(MODELS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+            tx.open_table(INDEX)
                 .map_err(|error| StoreError::Table(error.to_string()))?;
         }
 

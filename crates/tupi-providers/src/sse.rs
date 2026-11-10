@@ -92,8 +92,14 @@ pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
     {
         for call in calls {
             tool_calls.push(ToolCallDelta {
-                index: call.get("index").and_then(|index| index.as_u64()).unwrap_or(0) as usize,
-                id: call.get("id").and_then(|id| id.as_str()).map(str::to_string),
+                index: call
+                    .get("index")
+                    .and_then(|index| index.as_u64())
+                    .unwrap_or(0) as usize,
+                id: call
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string),
                 name: call
                     .pointer("/function/name")
                     .and_then(|name| name.as_str())
@@ -197,8 +203,7 @@ mod tests {
 
     #[test]
     fn chunk_reads_usage_when_present() {
-        let payload =
-            r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":12,"total_tokens":19}}"#;
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":12,"total_tokens":19}}"#;
         let chunk = extract_chunk(payload).unwrap();
 
         assert_eq!(chunk.usage, Some(12));

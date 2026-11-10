@@ -49,6 +49,14 @@ impl TerminalGuard {
     {
         self.terminal.draw(render).map(|_| ())
     }
+
+    pub fn copy(&mut self, text: &str) -> io::Result<()> {
+        use std::io::Write;
+
+        let sequence = crate::clipboard::osc52(text);
+        self.terminal.backend_mut().write_all(sequence.as_bytes())?;
+        self.terminal.backend_mut().flush()
+    }
 }
 
 impl Drop for TerminalGuard {

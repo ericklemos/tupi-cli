@@ -57,11 +57,7 @@ impl ReadManyTool {
             let (path, content, relative) = match self.inner.prepare(&request) {
                 Ok(read) => read,
                 Err(error) => {
-                    errors.push(format!(
-                        "- item {} (`{}`): {error}",
-                        index + 1,
-                        item.path
-                    ));
+                    errors.push(format!("- item {} (`{}`): {error}", index + 1, item.path));
                     continue;
                 }
             };
@@ -156,7 +152,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tupi_kernel::{Tool, ToolError, ToolRegistry};
 
     use crate::budget::DEFAULT_BUDGET_TOKENS;
@@ -282,7 +278,9 @@ mod tests {
     #[test]
     fn an_empty_batch_is_an_explicit_error() {
         let dir = fixture();
-        let error = tool_for(dir.path()).read_many(batch(Vec::new())).unwrap_err();
+        let error = tool_for(dir.path())
+            .read_many(batch(Vec::new()))
+            .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
 
@@ -316,7 +314,10 @@ mod tests {
         crate::register(dir.path().to_path_buf(), &mut registry);
 
         let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
-        assert_eq!(names, vec!["read", "read_many", "peek"]);
+        assert_eq!(
+            names,
+            vec!["read", "read_many", "search", "edit", "peek"]
+        );
     }
 
     #[test]

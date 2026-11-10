@@ -4,7 +4,7 @@ use anyhow::Context;
 use tupi_app::App;
 use tupi_kernel::{CommandBus, EventBus, ProviderRegistry, QueryBus, ToolRegistry};
 use tupi_providers::deepseek;
-use tupi_tui::{BusSet, run};
+use tupi_tui::run::{BusSet, run};
 
 mod config;
 

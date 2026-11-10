@@ -6,12 +6,14 @@ license.workspace = true
 
 [dependencies]
 tupi-kernel.workspace = true
+tupi-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
+ignore.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

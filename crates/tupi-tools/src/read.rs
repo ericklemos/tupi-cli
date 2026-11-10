@@ -85,9 +85,9 @@ impl ReadTool {
             self.root_dir.join(candidate)
         };
 
-        let canonical = joined.canonicalize().map_err(|_| {
-            ToolError::NotFound(params.path.clone())
-        })?;
+        let canonical = joined
+            .canonicalize()
+            .map_err(|_| ToolError::NotFound(params.path.clone()))?;
         let root = self
             .root_dir
             .canonicalize()
@@ -196,9 +196,7 @@ impl ReadTool {
 
         Ok(snippets
             .into_iter()
-            .filter(|snippet| {
-                snippet.symbol_name == symbol || snippet.qualified_name == symbol
-            })
+            .filter(|snippet| snippet.symbol_name == symbol || snippet.qualified_name == symbol)
             .map(|snippet| {
                 let display = snippet.qualified_name.clone();
                 let heading = format!(
@@ -439,7 +437,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tupi_kernel::{Tool, ToolError};
 
     use crate::budget::DEFAULT_BUDGET_TOKENS;

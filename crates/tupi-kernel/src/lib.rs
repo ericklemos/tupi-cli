@@ -30,8 +30,14 @@ mod tests {
     async fn lagged_subscriber_reports_lag() {
         let bus = EventBus::new(1);
         let mut rx = bus.subscribe();
-        bus.publish(Event::StreamFinished { request_id: 1 });
-        bus.publish(Event::StreamFinished { request_id: 2 });
+        bus.publish(Event::StreamFinished {
+            request_id: 1,
+            completion_tokens: None,
+        });
+        bus.publish(Event::StreamFinished {
+            request_id: 2,
+            completion_tokens: None,
+        });
         assert!(matches!(
             rx.recv().await,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_))

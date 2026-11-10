@@ -24,4 +24,5 @@ tupi-domain.workspace = true
 tupi-kernel.workspace = true
 tupi-tools.workspace = true
 tupi-providers.workspace = true
+blake3.workspace = true
 tempfile.workspace = true

@@ -21,6 +21,12 @@ pub enum ToolError {
     SymbolNotFound(String),
     #[error("handle desconhecido ou expirado: {0}")]
     UnknownHandle(String),
+    #[error("símbolo ambíguo: {0}")]
+    Ambiguous(String),
+    #[error("arquivo mudou desde a leitura: {0}")]
+    StaleHash(String),
+    #[error("sintaxe inválida após a edição: {0}")]
+    InvalidSyntax(String),
     #[error("{0}")]
     Other(String),
 }

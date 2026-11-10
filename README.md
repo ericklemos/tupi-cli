@@ -4,15 +4,22 @@ Chat de terminal em Rust, com TUI (ratatui), streaming e tool-call de leitura.
 O modelo pode pedir para ler arquivos do projeto sem receber o projeto inteiro;
 edição de arquivos ainda não existe.
 
-## Ferramentas de leitura
+## Ferramentas de leitura, busca e edição
 
-O Tupi expõe três tools ao modelo, inspiradas no `brain_tools`:
+O Tupi expõe cinco tools ao modelo, inspiradas no `brain_tools`:
 
 - **`read`** — devolve o esqueleto de um arquivo (assinaturas, sem corpos) ou o
   corpo de um símbolo. Segunda leitura do mesmo símbolo, sem mudança, vira um
   ponteiro; se o símbolo mudou, devolve só o diff.
 - **`read_many`** — lê vários arquivos/símbolos em um lote atômico, com um
   orçamento de tokens compartilhado.
+- **`search`** — busca por descrição natural ("onde o token é validado") ou por
+  nome. `keywords` é opcional e reforça termos exatos; a varredura respeita
+  `.gitignore` e ignora diretórios de build. Devolve corpo dos primeiros
+  resultados e assinatura do resto, dentro do orçamento.
+- **`edit`** — troca o corpo `{ … }` de um símbolo Rust, com `expected_hash` do
+  `read` como guarda de leitura. Recusa hash velho, símbolo ambíguo ou sintaxe
+  inválida; a escrita é atômica e verificada relendo o disco.
 - **`peek`** — recupera, por handle, o trecho que não coube no orçamento.
 
 O root das leituras é o diretório onde o Tupi foi aberto. Caminho que escapa

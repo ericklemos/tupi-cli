@@ -1,3 +1,5 @@
+pub mod index;
+
 pub type SessionId = u64;
 pub type RequestId = u64;
 

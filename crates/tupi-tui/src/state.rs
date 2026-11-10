@@ -20,6 +20,7 @@ pub enum ChatEntry {
     Message {
         role: tupi_domain::Role,
         content: String,
+        metrics: Option<crate::metrics::ReplyMetrics>,
     },
     Tool {
         call_id: String,
@@ -39,8 +40,11 @@ pub struct ChatState {
     pub overlay: Option<Overlay>,
     pub suggestions: Option<Vec<String>>,
     pub suggestion_index: usize,
+    pub selection: Option<crate::selection::Selection>,
+    pub(crate) view: std::cell::Cell<Option<TranscriptView>>,
     pub(crate) render_cache: std::cell::RefCell<crate::markdown::Cache>,
     streaming_index: Option<usize>,
+    streaming_metrics: Option<crate::metrics::ReplyMetrics>,
 }
 
 impl ChatState {
@@ -48,12 +52,16 @@ impl ChatState {
         self.lines.push(ChatEntry::Message {
             role: tupi_domain::Role::User,
             content: text.to_string(),
+            metrics: None,
         });
         self.notice = None;
     }
 
     pub fn begin_assistant(&mut self) {
         self.streaming_index = None;
+        self.streaming_metrics = Some(crate::metrics::ReplyMetrics::start(
+            std::time::Instant::now(),
+        ));
         self.status = Status::Streaming;
         self.notice = None;
     }
@@ -65,6 +73,7 @@ impl ChatState {
                 self.lines.push(ChatEntry::Message {
                     role: tupi_domain::Role::Assistant,
                     content: String::new(),
+                    metrics: self.streaming_metrics.take(),
                 });
                 let index = self.lines.len() - 1;
                 self.streaming_index = Some(index);
@@ -72,14 +81,29 @@ impl ChatState {
             }
         };
 
-        if let Some(ChatEntry::Message { content, .. }) = self.lines.get_mut(index) {
+        if let Some(ChatEntry::Message {
+            content, metrics, ..
+        }) = self.lines.get_mut(index)
+        {
             content.push_str(token);
+            if let Some(metrics) = metrics {
+                metrics.mark_first_token(std::time::Instant::now());
+                metrics.add_estimated(crate::metrics::estimate_tokens(token));
+            }
         }
     }
 
     /// Uma tool começa: a bolha em stream termina e a chamada vira uma linha.
     /// `summary` já vem descrito pela tool (ex.: `path=a.rs · symbol=new`).
     pub fn push_tool_started(&mut self, call_id: &str, name: &str, summary: &str) {
+        // Um turno com tools tem vários balões: as métricas migram para o
+        // balão final, e a janela da taxa inclui o tempo de execução das tools.
+        if let Some(index) = self.streaming_index
+            && let Some(ChatEntry::Message { metrics, .. }) = self.lines.get_mut(index)
+        {
+            self.streaming_metrics = metrics.take();
+        }
+
         self.streaming_index = None;
         self.lines.push(ChatEntry::Tool {
             call_id: call_id.to_string(),
@@ -104,12 +128,45 @@ impl ChatState {
         self.status == Status::Streaming && self.streaming_index.is_none()
     }
 
+    pub fn set_usage(&mut self, completion_tokens: u64) {
+        if let Some(index) = self.streaming_index
+            && let Some(ChatEntry::Message {
+                metrics: Some(metrics),
+                ..
+            }) = self.lines.get_mut(index)
+        {
+            metrics.set_remote(completion_tokens);
+            return;
+        }
+
+        if let Some(metrics) = self.streaming_metrics.as_mut() {
+            metrics.set_remote(completion_tokens);
+        }
+    }
+
+    fn finish_metrics(&mut self, now: std::time::Instant) {
+        if let Some(index) = self.streaming_index
+            && let Some(ChatEntry::Message {
+                metrics: Some(metrics),
+                ..
+            }) = self.lines.get_mut(index)
+        {
+            metrics.finish(now);
+        }
+
+        if let Some(metrics) = self.streaming_metrics.as_mut() {
+            metrics.finish(now);
+        }
+    }
+
     pub fn finish_assistant(&mut self) {
+        self.finish_metrics(std::time::Instant::now());
         self.streaming_index = None;
         self.status = Status::Idle;
     }
 
     pub fn fail(&mut self, message: &str) {
+        self.finish_metrics(std::time::Instant::now());
         self.streaming_index = None;
         self.status = Status::Idle;
         self.notice = Some(message.to_string());
@@ -230,6 +287,24 @@ impl ChatState {
         }
         self.refresh_suggestions();
     }
+
+    pub fn hovered_entry(&self) -> Option<usize> {
+        self.hovered.get()
+    }
+
+    pub fn hovered_text(&self) -> Option<String> {
+        self.hovered
+            .get()
+            .and_then(|index| self.lines.get(index))
+            .map(entry_text)
+    }
+}
+
+fn entry_text(entry: &ChatEntry) -> String {
+    match entry {
+        ChatEntry::Message { content, .. } => content.clone(),
+        ChatEntry::Tool { name, summary, .. } => format!("{name} · {summary}"),
+    }
 }
 
 fn compact_summary(summary: &str) -> String {
@@ -244,6 +319,7 @@ fn compact_summary(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tupi_domain::Role;
 
     fn content(entry: &ChatEntry) -> &str {
         match entry {
@@ -338,10 +414,7 @@ mod tests {
             }
             other => panic!("esperava tool, veio {other:?}"),
         }
-        assert!(matches!(
-            &state.lines[1],
-            ChatEntry::Tool { ok: None, .. }
-        ));
+        assert!(matches!(&state.lines[1], ChatEntry::Tool { ok: None, .. }));
     }
 
     #[test]
@@ -406,5 +479,129 @@ mod tests {
         state.refresh_suggestions();
 
         assert!(!state.suggestions_visible());
+    }
+    #[test]
+    fn assistant_metrics_track_first_token_and_estimate() {
+        let mut state = ChatState::default();
+        state.begin_assistant();
+        state.append_token("olá, mundo");
+        state.finish_assistant();
+
+        let ChatEntry::Message {
+            metrics: Some(metrics),
+            ..
+        } = &state.lines[0]
+        else {
+            panic!("esperava métricas");
+        };
+        assert_eq!(metrics.estimated_tokens, 3);
+        assert!(metrics.first_token.is_some());
+        assert!(metrics.finished.is_some());
+    }
+
+    #[test]
+    fn metrics_follow_the_answer_across_tool_steps() {
+        let mut state = ChatState::default();
+        state.begin_assistant();
+        state.append_token("vou ler");
+        state.push_tool_started("c1", "read", "path=a.rs");
+        state.append_token("pronto");
+
+        let ChatEntry::Message { metrics: None, .. } = &state.lines[0] else {
+            panic!("o balão intermediário não deve ficar com métricas");
+        };
+        let ChatEntry::Message {
+            metrics: Some(metrics),
+            ..
+        } = &state.lines[2]
+        else {
+            panic!("a resposta final deve herdar as métricas");
+        };
+        assert_eq!(
+            metrics.estimated_tokens,
+            crate::metrics::estimate_tokens("vou ler") + crate::metrics::estimate_tokens("pronto")
+        );
+    }
+
+    #[test]
+    fn set_usage_records_remote_tokens() {
+        let mut state = ChatState::default();
+        state.begin_assistant();
+        state.append_token("oi");
+        state.set_usage(12);
+
+        let ChatEntry::Message {
+            metrics: Some(metrics),
+            ..
+        } = &state.lines[0]
+        else {
+            panic!("esperava métricas");
+        };
+        assert_eq!(metrics.remote_tokens, Some(12));
+    }
+
+    #[test]
+    fn fail_closes_metrics() {
+        let mut state = ChatState::default();
+        state.begin_assistant();
+        state.append_token("parcial");
+        state.fail("caiu");
+
+        let ChatEntry::Message {
+            metrics: Some(metrics),
+            ..
+        } = &state.lines[0]
+        else {
+            panic!("esperava métricas");
+        };
+        assert!(metrics.finished.is_some());
+    }
+
+    fn message(role: Role, text: &str) -> ChatEntry {
+        ChatEntry::Message {
+            role,
+            content: text.to_string(),
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn entry_text_keeps_markdown_verbatim() {
+        let entry = message(Role::Assistant, "**forte** e `código`");
+        assert_eq!(entry_text(&entry), "**forte** e `código`");
+    }
+
+    #[test]
+    fn entry_text_formats_tool_as_name_and_summary() {
+        let entry = ChatEntry::Tool {
+            call_id: "c1".into(),
+            name: "read".into(),
+            summary: "src/lib.rs".into(),
+            ok: Some(true),
+        };
+        assert_eq!(entry_text(&entry), "read · src/lib.rs");
+    }
+
+    #[test]
+    fn hovered_text_is_none_without_hover() {
+        let state = ChatState::default();
+        assert_eq!(state.hovered_entry(), None);
+        assert_eq!(state.hovered_text(), None);
+    }
+
+    #[test]
+    fn hovered_text_returns_the_hovered_entry() {
+        let mut state = ChatState::default();
+        state.lines.push(message(Role::Assistant, "resposta"));
+        state.hovered.set(Some(0));
+        assert_eq!(state.hovered_entry(), Some(0));
+        assert_eq!(state.hovered_text().as_deref(), Some("resposta"));
+    }
+
+    #[test]
+    fn hovered_entry_out_of_range_is_ignored() {
+        let state = ChatState::default();
+        state.hovered.set(Some(3));
+        assert_eq!(state.hovered_text(), None);
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tupi_kernel::{Tool, ToolError, ToolSpec};
 
-use crate::budget::{estimate_tokens, CHARS_PER_TOKEN};
+use crate::budget::{CHARS_PER_TOKEN, estimate_tokens};
 use crate::store::ResponseStore;
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +85,9 @@ impl Tool for PeekTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "peek".to_string(),
-            description: "Recupera o trecho de uma resposta truncada anteriormente, paginando por offset.".to_string(),
+            description:
+                "Recupera o trecho de uma resposta truncada anteriormente, paginando por offset."
+                    .to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -150,7 +152,9 @@ mod tests {
 
     #[test]
     fn unknown_handle_is_an_explicit_error() {
-        let error = tool().peek("h_missing", 0, DEFAULT_BUDGET_TOKENS).unwrap_err();
+        let error = tool()
+            .peek("h_missing", 0, DEFAULT_BUDGET_TOKENS)
+            .unwrap_err();
         assert!(matches!(error, ToolError::UnknownHandle(_)));
     }
 
@@ -187,10 +191,7 @@ mod tests {
             rebuilt.push_str(text);
             match page.split("Próximo offset: ").nth(1) {
                 Some(next) => {
-                    offset = next
-                        .trim_end_matches('.')
-                        .parse()
-                        .expect("offset numérico");
+                    offset = next.trim_end_matches('.').parse().expect("offset numérico");
                 }
                 None => break,
             }

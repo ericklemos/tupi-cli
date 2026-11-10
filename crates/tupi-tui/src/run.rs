@@ -44,8 +44,19 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                             continue;
                         }
 
-                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            break;
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Char('c') => {
+                                    if let Some(text) = state.hovered_text() {
+                                        terminal.copy(&text)?;
+                                        state.notice = Some("copiado".to_string());
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                KeyCode::Char('q') => break,
+                                _ => {}
+                            }
                         }
 
                         if state.overlay_open() {
@@ -148,11 +159,15 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                             _ => {}
                         }
                     }
-                    CrosstermEvent::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp => scroll_up(&mut state, SCROLL_WHEEL),
-                        MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
-                        _ => {}
-                    },
+                    CrosstermEvent::Mouse(mouse) => {
+                        state.pointer = Some((mouse.column, mouse.row));
+
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => scroll_up(&mut state, SCROLL_WHEEL),
+                            MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -161,7 +176,13 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                     Ok(Event::Token { request_id, text }) if Some(request_id) == request => {
                         state.append_token(&text);
                     }
-                    Ok(Event::StreamFinished { request_id }) if Some(request_id) == request => {
+                    Ok(Event::StreamFinished {
+                        request_id,
+                        completion_tokens,
+                    }) if Some(request_id) == request => {
+                        if let Some(tokens) = completion_tokens {
+                            state.set_usage(tokens);
+                        }
                         state.finish_assistant();
                         request = None;
                     }
@@ -233,15 +254,29 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ChatState, model: &str, provider
     draw_overlay(frame, state);
 }
 
+const HOVER_BG: Color = Color::Indexed(236);
+
+fn highlight_row(mut line: Line<'static>, width: u16) -> Line<'static> {
+    line.style = line.style.bg(HOVER_BG);
+    let missing = (width as usize).saturating_sub(line.width());
+    if missing > 0 {
+        line.spans.push(Span::styled(
+            " ".repeat(missing),
+            Style::default().bg(HOVER_BG),
+        ));
+    }
+    line
+}
+
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect) {
     let content_area = Rect {
         width: area.width.saturating_sub(1),
         ..area
     };
 
-    let rows = {
+    let Transcript { mut rows, owners } = {
         let mut cache = state.render_cache.borrow_mut();
-        transcript_rows(
+        transcript_layout(
             &state.lines,
             content_area.width,
             state.processing(),
@@ -250,6 +285,20 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
     };
     let visible = area.height as usize;
     let (start, end) = visible_range(rows.len(), visible, state.scroll);
+    let hovered = hovered_from(
+        &owners,
+        start,
+        content_area,
+        state.pointer,
+        state.overlay_open(),
+    );
+    state.hovered.set(hovered);
+
+    for (index, row) in rows.iter_mut().enumerate().take(end).skip(start) {
+        if hovered.is_some() && owners.get(index).copied().flatten() == hovered {
+            *row = highlight_row(std::mem::replace(row, Line::from("")), content_area.width);
+        }
+    }
 
     frame.render_widget(Paragraph::new(rows[start..end].to_vec()), content_area);
 
@@ -401,7 +450,11 @@ fn draw_details(
         ),
     ]);
 
-    let hints = "↑↓ rolar · pgup/pgdn · /modelos · ctrl+c sair";
+    let hints = if state.hovered_entry().is_some() {
+        "ctrl+c copia esta mensagem · ctrl+q sai"
+    } else {
+        "↑↓ rolar · /modelos · hover+ctrl+c copia · ctrl+q sai"
+    };
     let hint_width = hints.width() as u16 + 1;
 
     if area.width > hint_width + 20 {
@@ -523,34 +576,82 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
+#[cfg(test)]
 fn transcript_rows(
     lines: &[ChatEntry],
     width: u16,
     processing: bool,
     cache: &mut crate::markdown::Cache,
 ) -> Vec<Line<'static>> {
+    transcript_rows_at(lines, width, processing, cache, std::time::Instant::now())
+}
+
+#[allow(dead_code)]
+#[cfg(test)]
+fn transcript_rows_at(
+    lines: &[ChatEntry],
+    width: u16,
+    processing: bool,
+    cache: &mut crate::markdown::Cache,
+    now: std::time::Instant,
+) -> Vec<Line<'static>> {
+    transcript_layout_at(lines, width, processing, cache, now).rows
+}
+
+pub(crate) struct Transcript {
+    pub rows: Vec<Line<'static>>,
+    #[allow(dead_code)]
+    pub owners: Vec<Option<usize>>,
+}
+
+#[allow(dead_code)]
+fn transcript_layout(
+    lines: &[ChatEntry],
+    width: u16,
+    processing: bool,
+    cache: &mut crate::markdown::Cache,
+) -> Transcript {
+    transcript_layout_at(lines, width, processing, cache, std::time::Instant::now())
+}
+
+fn transcript_layout_at(
+    lines: &[ChatEntry],
+    width: u16,
+    processing: bool,
+    cache: &mut crate::markdown::Cache,
+    now: std::time::Instant,
+) -> Transcript {
     let area_width = width as usize;
     if area_width < 8 {
-        return Vec::new();
+        return Transcript {
+            rows: Vec::new(),
+            owners: Vec::new(),
+        };
     }
 
     let indent = 2usize;
     let content_width = area_width.saturating_sub(indent).max(1);
+    let compact = area_width < 60;
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut owners: Vec<Option<usize>> = Vec::new();
     rows.push(Line::from(""));
+    owners.push(None);
 
     for (index, entry) in lines.iter().enumerate() {
         if index > 0 {
             rows.push(Line::from(""));
+            owners.push(None);
         }
 
-        let (role, text) = match entry {
-            ChatEntry::Message { role, content } => (*role, content.as_str()),
+        let (role, text, metrics) = match entry {
+            ChatEntry::Message {
+                role,
+                content,
+                metrics,
+            } => (*role, content.as_str(), metrics.as_ref()),
             ChatEntry::Tool {
-                name,
-                summary,
-                ok,
-                ..
+                name, summary, ok, ..
             } => {
                 let (mark, color) = match ok {
                     Some(true) => ("✓", Color::Green),
@@ -573,6 +674,7 @@ fn transcript_rows(
                     Span::raw(" "),
                     Span::styled(mark.to_string(), Style::default().fg(color)),
                 ]));
+                owners.push(Some(index));
                 continue;
             }
         };
@@ -584,7 +686,7 @@ fn transcript_rows(
             Role::Tool => ("⚙", "tool", Color::DarkGray),
         };
 
-        rows.push(Line::from(vec![
+        let mut header = vec![
             Span::styled(
                 marker.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -594,7 +696,17 @@ fn transcript_rows(
                 label.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-        ]));
+        ];
+        if role == Role::Assistant
+            && let Some(metrics) = metrics
+        {
+            header.push(Span::styled(
+                format!("  {}", metrics.header(now, compact)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        rows.push(Line::from(header));
+        owners.push(Some(index));
 
         let body = match role {
             Role::User | Role::Assistant => cache.rows(index, text, content_width).to_vec(),
@@ -604,12 +716,14 @@ fn transcript_rows(
 
         for line in body {
             rows.push(indent_line(line, indent));
+            owners.push(Some(index));
         }
     }
 
     if processing {
         if !rows.last().map(|row| row.width() == 0).unwrap_or(true) {
             rows.push(Line::from(""));
+            owners.push(None);
         }
         rows.push(Line::from(Span::styled(
             "  processando...",
@@ -617,10 +731,51 @@ fn transcript_rows(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::DIM),
         )));
+        owners.push(None);
     }
 
     rows.push(Line::from(""));
-    rows
+    owners.push(None);
+
+    Transcript { rows, owners }
+}
+
+#[allow(dead_code)]
+fn hit_test(
+    owners: &[Option<usize>],
+    start: usize,
+    area: Rect,
+    pointer: Option<(u16, u16)>,
+) -> Option<usize> {
+    let (x, y) = pointer?;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if x < area.x
+        || x >= area.x.saturating_add(area.width)
+        || y < area.y
+        || y >= area.y.saturating_add(area.height)
+    {
+        return None;
+    }
+
+    let index = start + (y - area.y) as usize;
+    owners.get(index).copied().flatten()
+}
+
+#[allow(dead_code)]
+fn hovered_from(
+    owners: &[Option<usize>],
+    start: usize,
+    area: Rect,
+    pointer: Option<(u16, u16)>,
+    overlay_open: bool,
+) -> Option<usize> {
+    if overlay_open {
+        None
+    } else {
+        hit_test(owners, start, area, pointer)
+    }
 }
 
 fn indent_line(mut line: Line<'static>, indent: usize) -> Line<'static> {
@@ -1066,6 +1221,7 @@ mod tests {
         ChatEntry::Message {
             role,
             content: text.to_string(),
+            metrics: None,
         }
     }
 
@@ -1182,5 +1338,141 @@ mod tests {
         assert_eq!(visible_range(100, 10, 5), (85, 95));
         assert_eq!(visible_range(100, 10, 1000), (0, 10));
         assert_eq!(visible_range(3, 10, 0), (0, 3));
+    }
+
+    fn assistant_with_metrics(text: &str, t0: std::time::Instant) -> ChatEntry {
+        let mut metrics = crate::metrics::ReplyMetrics::start(t0);
+        metrics.add_estimated(340);
+        metrics.mark_first_token(t0 + std::time::Duration::from_secs(1));
+        metrics.finish(t0 + std::time::Duration::from_secs(11));
+        metrics.set_remote(320);
+        ChatEntry::Message {
+            role: Role::Assistant,
+            content: text.to_string(),
+            metrics: Some(metrics),
+        }
+    }
+
+    #[test]
+    fn assistant_header_shows_elapsed_and_rates() {
+        let t0 = std::time::Instant::now();
+        let lines = vec![assistant_with_metrics("oi", t0)];
+        let rows = transcript_rows_at(
+            &lines,
+            80,
+            false,
+            &mut crate::markdown::Cache::default(),
+            t0,
+        );
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("11,0s · 1º 1,0s · ≈34 → 32 tok/s"), "{text}");
+    }
+
+    #[test]
+    fn assistant_header_is_compact_on_narrow_width() {
+        let t0 = std::time::Instant::now();
+        let lines = vec![assistant_with_metrics("oi", t0)];
+        let rows = transcript_rows_at(
+            &lines,
+            40,
+            false,
+            &mut crate::markdown::Cache::default(),
+            t0,
+        );
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("≈34→32 t/s"), "{text}");
+    }
+
+    #[test]
+    fn header_without_usage_uses_estimate() {
+        let t0 = std::time::Instant::now();
+        let mut metrics = crate::metrics::ReplyMetrics::start(t0);
+        metrics.add_estimated(340);
+        metrics.mark_first_token(t0 + std::time::Duration::from_secs(1));
+        metrics.finish(t0 + std::time::Duration::from_secs(11));
+        let lines = vec![ChatEntry::Message {
+            role: Role::Assistant,
+            content: "oi".into(),
+            metrics: Some(metrics),
+        }];
+        let rows = transcript_rows_at(
+            &lines,
+            80,
+            false,
+            &mut crate::markdown::Cache::default(),
+            t0,
+        );
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("≈34 tok/s (est.)"), "{text}");
+    }
+
+    #[test]
+    fn transcript_layout_marks_header_body_and_gaps() {
+        let lines = vec![message(Role::User, "um"), message(Role::Assistant, "dois")];
+        let mut cache = crate::markdown::Cache::default();
+        let transcript = transcript_layout(&lines, 40, false, &mut cache);
+        assert_eq!(transcript.rows.len(), transcript.owners.len());
+        assert_eq!(transcript.owners[0], None);
+        assert_eq!(transcript.owners[1], Some(0));
+        let last_message_row = transcript
+            .rows
+            .iter()
+            .rposition(|row| row.width() > 0)
+            .unwrap();
+        assert_eq!(transcript.owners[last_message_row], Some(1));
+    }
+
+    #[test]
+    fn hit_test_uses_the_visible_start() {
+        let owners = vec![Some(0), None, Some(1)];
+        let area = Rect::new(0, 5, 20, 3);
+        assert_eq!(hit_test(&owners, 0, area, Some((3, 6))), None);
+        assert_eq!(hit_test(&owners, 0, area, Some((3, 7))), Some(1));
+        assert_eq!(hit_test(&owners, 1, area, Some((3, 5))), None);
+        assert_eq!(hit_test(&owners, 1, area, Some((3, 6))), Some(1));
+    }
+
+    #[test]
+    fn hit_test_ignores_pointer_outside_the_area() {
+        let owners = vec![Some(0)];
+        let area = Rect::new(2, 5, 10, 2);
+        assert_eq!(hit_test(&owners, 0, area, Some((1, 5))), None);
+        assert_eq!(hit_test(&owners, 0, area, Some((2, 7))), None);
+        assert_eq!(
+            hit_test(&owners, 0, Rect::new(0, 0, 0, 0), Some((0, 0))),
+            None
+        );
+        assert_eq!(hit_test(&owners, 0, area, None), None);
+    }
+
+    #[test]
+    fn hovered_from_clears_with_overlay_open() {
+        let owners = vec![Some(0)];
+        let area = Rect::new(0, 0, 10, 2);
+        assert_eq!(hovered_from(&owners, 0, area, Some((1, 0)), true), None);
+        assert_eq!(hovered_from(&owners, 0, area, Some((1, 0)), false), Some(0));
+    }
+    #[test]
+    fn highlight_row_pads_to_full_width_and_keeps_text() {
+        let row = Line::from("✓ ok");
+        let padded = highlight_row(row, 10);
+        assert_eq!(row_text(&padded).trim_end(), "✓ ok");
+        assert_eq!(padded.width(), 10);
+        assert!(
+            padded
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(HOVER_BG))
+        );
+    }
+
+    #[test]
+    fn highlight_row_never_shrinks_a_wide_row() {
+        let row = Line::from("texto maior que a largura");
+        let padded = highlight_row(row, 4);
+        assert_eq!(padded.width(), "texto maior que a largura".len());
     }
 }
