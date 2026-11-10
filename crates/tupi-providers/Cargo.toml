@@ -1,0 +1,15 @@
+[package]
+name = "tupi-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-domain.workspace = true
+tupi-kernel.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

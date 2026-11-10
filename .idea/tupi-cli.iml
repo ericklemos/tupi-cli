@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-app/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-app/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-domain/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-kernel/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-providers/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-store/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-tui/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

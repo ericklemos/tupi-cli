@@ -1,0 +1,15 @@
+[package]
+name = "tupi-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-domain.workspace = true
+tupi-kernel.workspace = true
+anyhow.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
+tokio.workspace = true

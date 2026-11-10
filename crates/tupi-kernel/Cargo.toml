@@ -1,0 +1,12 @@
+[package]
+name = "tupi-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-domain.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

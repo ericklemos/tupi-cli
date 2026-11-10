@@ -1,0 +1,22 @@
+[package]
+name = "tupi-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-domain.workspace = true
+tupi-kernel.workspace = true
+tupi-store.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tupi-domain.workspace = true
+tupi-kernel.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "tupi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tupi"
+path = "src/main.rs"
+
+[dependencies]
+tupi-app.workspace = true
+tupi-domain.workspace = true
+tupi-kernel.workspace = true
+tupi-providers.workspace = true
+tupi-tui.workspace = true
+tupi-store.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
