@@ -90,6 +90,13 @@ Falha mesmo se funcionar tecnicamente:
 8. `Esc` cancela o stream atual. Resultados de tools já gravados permanecem no
    histórico; nenhuma execução nova começa depois do cancelamento.
 
+Invariante de protocolo: toda `tool_call` do assistant precisa de exatamente
+uma mensagem `Role::Tool` correspondente antes da próxima requisição ao
+provider. Se o turno for cancelado ou o limite de passos for atingido com calls
+sem resposta, o `App` sintetiza uma mensagem `tool` para cada `call_id` pendente
+(`cancelado pelo usuário` / `limite de passos atingido: chamada não executada`).
+Sem isso, a próxima mensagem do usuário pode ser recusada pelo provider.
+
 Limite de passos: 8 idas ao provider por mensagem do usuário. Ao estourar, o
 turno termina com `StreamFailed` explicando o limite, sem loop silencioso.
 
@@ -154,8 +161,9 @@ Dependências novas: `tree-sitter`, `tree-sitter-rust`, `blake3`, `serde`,
   `index` (`id`, `function.name`, `function.arguments`), e `finish_reason`.
 - Texto e tool calls podem vir no mesmo turno; o texto é emitido incremental e
   as calls completas ao final.
-- Argumentos inválidos não são erro de protocolo: viram string crua e a tool
-  responde com erro explícito.
+- Argumentos inválidos não são erro de protocolo: a string crua chega ao `App`,
+  que tenta o parse. Falha de parse vira mensagem `tool` de erro explícito, sem
+  invocar a tool.
 
 ### `tupi-app`
 
@@ -201,6 +209,14 @@ Arquivo sem gramática suportada (ou Rust sem símbolos): uma seção de arquivo
 inteiro, sujeita ao mesmo orçamento e ao mesmo split/peek. É a exceção
 explícita, limitada pelo orçamento.
 
+Semântica de símbolo: o esqueleto lista os escopos encontrados no arquivo —
+`impl Foo` aparece como `impl Foo`, e seus métodos aparecem como itens próprios
+com a assinatura. `symbol` é o nome simples; se houver mais de um escopo com o
+mesmo nome (dois `new`, por exemplo), todos os corpos correspondentes são
+devolvidos, cada um com seu cabeçalho. Não há erro de ambiguidade. A identidade
+usada no ledger é qualificada pelo container quando existe (`Foo::new`), para
+que dois métodos de mesmo nome não colidam.
+
 Segunda leitura do mesmo símbolo, arquivo inalterado: ponteiro
 `Já entregue nesta sessão` com handle vivo. Arquivo alterado dentro do símbolo:
 só o diff. `repeat: "allow"` força o corpo e registra a entrega de novo.
@@ -235,6 +251,15 @@ Handle desconhecido ou expirado é erro explícito. O fim do corpo responde
   fica para depois.
 - **A TUI não mostra o corpo lido.** O consumidor do corpo é o modelo; o
   usuário vê qual leitura aconteceu.
+- **Toda `tool_call` pendente recebe uma resposta sintética no cancelamento ou
+  no limite de passos.** O protocolo OpenAI exige o par call/result; sintetizar
+  a mensagem é mais simples e mais seguro que adiar o commit do assistant.
+- **O parse dos argumentos é do `App`, não da tool.** O trait recebe
+  `serde_json::Value`; JSON inválido vira erro de tool sem execução, com o
+  mesmo caminho para todas as tools.
+- **Nome simples, todos os corpos em caso de repetição.** É o que o modelo
+  escreve naturalmente; qualificar o ledger evita colisão sem exigir que o
+  modelo saiba o container.
 
 ## O que fica para o builder
 
@@ -253,7 +278,9 @@ Handle desconhecido ou expirado é erro explícito. O fim do corpo responde
 - Teste de integração com provider falso: pedido de `read` → tool executa →
   segunda chamada recebe a mensagem `tool` → resposta final.
 - Teste do loop: várias tool calls no mesmo turno; limite de passos; cancelamento
-  no meio.
+  no meio; toda call pendente recebe uma mensagem `tool` sintética.
+- Teste de argumento malformado: nenhuma tool é invocada e o erro volta como
+  mensagem `tool`.
 - Testes de barreira: caminho fora do root, símbolo inexistente, arquivo ausente,
   handle expirado, segunda leitura vira ponteiro, arquivo alterado vira diff,
   lote com um item inválido não devolve nada.
