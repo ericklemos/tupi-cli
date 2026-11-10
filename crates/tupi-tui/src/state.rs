@@ -1,7 +1,5 @@
-pub const COMMANDS: &[&str] = &[
-    "/models",
-    "/enable-show-prompts-messages",
-];
+pub use tupi_domain::WORKFLOWS_PREFIX;
+pub const COMMANDS: &[&str] = &["/models", "/enable-show-prompts-messages", WORKFLOWS_PREFIX];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -34,6 +32,9 @@ pub enum ChatEntry {
     Prompt {
         content: String,
     },
+    Queued {
+        content: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +50,9 @@ pub struct ChatState {
     pub selection: Option<crate::selection::Selection>,
     pub(crate) view: std::cell::Cell<Option<crate::selection::TranscriptView>>,
     pub(crate) render_cache: std::cell::RefCell<crate::markdown::Cache>,
+    /// Nomes dos workflows disponíveis. Só viram sugestão depois de
+    /// `/workflows/`; antes disso o namespace não existe.
+    pub workflows: Vec<String>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
 }
@@ -59,6 +63,14 @@ impl ChatState {
             role: tupi_domain::Role::User,
             content: text.to_string(),
             metrics: None,
+        });
+        self.notice = None;
+    }
+
+    /// Registra o pacote enviado ao provedor quando o debug está ligado.
+    pub fn push_prompt(&mut self, content: &str) {
+        self.lines.push(ChatEntry::Prompt {
+            content: content.to_string(),
         });
         self.notice = None;
     }
@@ -134,19 +146,79 @@ impl ChatState {
         self.status == Status::Streaming && self.streaming_index.is_none()
     }
 
-    pub fn set_usage(&mut self, completion_tokens: u64) {
+    /// Enfileira uma mensagem para o próximo turno, deixando-a visível no
+    /// transcript enquanto espera.
+    pub fn enqueue(&mut self, text: &str) {
+        self.lines.push(ChatEntry::Queued {
+            content: text.to_string(),
+        });
+        self.notice = None;
+    }
+
+    /// Remove e devolve a próxima mensagem pendente, na ordem de envio.
+    pub fn dequeue(&mut self) -> Option<String> {
+        let index = self
+            .lines
+            .iter()
+            .position(|entry| matches!(entry, ChatEntry::Queued { .. }))?;
+        match self.lines.remove(index) {
+            ChatEntry::Queued { content } => Some(content),
+            _ => unreachable!("o índice veio de uma entrada pendente"),
+        }
+    }
+
+    /// Tempo decorrido do turno em aberto, mesmo antes do primeiro token.
+    ///
+    /// As métricas migram para o balão a cada tool, então o fallback olha o
+    /// último balão cuja resposta ainda não fechou.
+    pub fn turn_elapsed(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if self.status != Status::Streaming {
+            return None;
+        }
+
+        if let Some(metrics) = self.streaming_metrics.as_ref() {
+            return Some(metrics.elapsed(now));
+        }
+
+        self.lines.iter().rev().find_map(|entry| match entry {
+            ChatEntry::Message {
+                metrics: Some(metrics),
+                ..
+            } if metrics.finished.is_none() => Some(metrics.elapsed(now)),
+            _ => None,
+        })
+    }
+
+    /// Espera a anunciar na linha "processando…": só antes do primeiro token.
+    pub fn waiting(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.processing() {
+            return None;
+        }
+
+        self.turn_elapsed(now)
+    }
+
+    pub fn set_usage(&mut self, prompt: Option<u64>, cached: Option<u64>, completion: Option<u64>) {
         if let Some(index) = self.streaming_index
             && let Some(ChatEntry::Message {
                 metrics: Some(metrics),
                 ..
             }) = self.lines.get_mut(index)
         {
-            metrics.set_remote(completion_tokens);
+            metrics.prompt_tokens = prompt;
+            metrics.cached_tokens = cached;
+            if let Some(tokens) = completion {
+                metrics.set_remote(tokens);
+            }
             return;
         }
 
         if let Some(metrics) = self.streaming_metrics.as_mut() {
-            metrics.set_remote(completion_tokens);
+            metrics.prompt_tokens = prompt;
+            metrics.cached_tokens = cached;
+            if let Some(tokens) = completion {
+                metrics.set_remote(tokens);
+            }
         }
     }
 
@@ -231,7 +303,19 @@ impl ChatState {
         let input = self.input.trim_start();
         let eligible = input.starts_with('/') && !input.contains(' ');
 
-        let items: Vec<String> = if eligible {
+        // O namespace dos workflows só abre depois da barra final: até lá,
+        // `/w` completa para `/workflows/` e nada mais. Antes disso nenhum nome
+        // de workflow polui a lista de comandos.
+        let items: Vec<String> = if let Some(prefix) = input.strip_prefix(WORKFLOWS_PREFIX) {
+            self.workflows
+                .iter()
+                .map(|name| format!("{WORKFLOWS_PREFIX}{name}"))
+                .filter(|command| {
+                    command[WORKFLOWS_PREFIX.len()..].starts_with(prefix)
+                        && command.as_str() != input
+                })
+                .collect()
+        } else if eligible {
             COMMANDS
                 .iter()
                 .filter(|command| command.starts_with(input) && **command != input)
@@ -310,6 +394,8 @@ mod tests {
     fn content(entry: &ChatEntry) -> &str {
         match entry {
             ChatEntry::Message { content, .. } => content,
+            ChatEntry::Queued { content } => content,
+            ChatEntry::Prompt { .. } => panic!("esperava mensagem"),
             ChatEntry::Tool { .. } => panic!("esperava mensagem"),
         }
     }
@@ -457,6 +543,60 @@ mod tests {
     }
 
     #[test]
+    fn workflow_names_only_appear_after_the_trailing_slash() {
+        let mut state = ChatState {
+            workflows: vec!["feature".into(), "fix-bug".into()],
+            input: "/workflows/".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/workflows/feature"));
+
+        state.input = "/workflows/fix".into();
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/workflows/fix-bug"));
+
+        // Um prefixo que não casa nenhum nome fecha a lista.
+        state.input = "/workflows/zzz".into();
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn no_workflow_name_shows_up_before_the_barra() {
+        for input in ["/", "/w", "/workflow", "/workflows"] {
+            let mut state = ChatState {
+                workflows: vec!["feature".into()],
+                input: input.into(),
+                ..ChatState::default()
+            };
+            state.refresh_suggestions();
+            let listed = state.suggestions.clone().unwrap_or_default();
+            assert!(
+                listed.iter().all(|command| !command.contains("feature")),
+                "{input} listou um workflow: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_completes_the_namespace_then_the_name() {
+        let mut state = ChatState {
+            workflows: vec!["review".into()],
+            input: "/work".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+        state.accept_suggestion();
+        assert_eq!(state.input, "/workflows/");
+
+        state.refresh_suggestions();
+        state.accept_suggestion();
+        assert_eq!(state.input, "/workflows/review");
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
     fn suggestions_hide_for_regular_text() {
         let mut state = ChatState {
             input: "oi".into(),
@@ -514,7 +654,7 @@ mod tests {
         let mut state = ChatState::default();
         state.begin_assistant();
         state.append_token("oi");
-        state.set_usage(12);
+        state.set_usage(Some(120), Some(60), Some(12));
 
         let ChatEntry::Message {
             metrics: Some(metrics),
@@ -541,5 +681,30 @@ mod tests {
             panic!("esperava métricas");
         };
         assert!(metrics.finished.is_some());
+    }
+
+    #[test]
+    fn queued_messages_wait_in_order_and_leave_the_transcript() {
+        let mut state = ChatState::default();
+        state.push_user("primeira");
+        state.begin_assistant();
+        state.append_token("ok");
+        state.finish_assistant();
+
+        state.enqueue("segunda");
+        state.enqueue("terceira");
+        assert!(matches!(
+            state.lines.last(),
+            Some(ChatEntry::Queued { content }) if content == "terceira"
+        ));
+
+        assert_eq!(state.dequeue().as_deref(), Some("segunda"));
+        assert_eq!(state.dequeue().as_deref(), Some("terceira"));
+        assert_eq!(state.dequeue(), None);
+        assert_eq!(
+            state.lines.len(),
+            2,
+            "pendentes saem do transcript ao disparar"
+        );
     }
 }

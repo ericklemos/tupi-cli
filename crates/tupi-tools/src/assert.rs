@@ -8,7 +8,6 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::graph::CallGraph;
 use crate::store::ResponseStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -100,7 +99,7 @@ impl Tool for AssertTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let matching = graph.matching(symbol);
 
         let answer = match params.kind {

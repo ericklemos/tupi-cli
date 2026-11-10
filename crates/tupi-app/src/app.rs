@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use tupi_domain::{Event, Message, RequestId, Role, Session, ToolCall};
 use tupi_kernel::{
     ChatRequest, Command, CommandError, CommandHandler, CommandOutcome, EventBus, ProviderEvent,
-    ProviderRegistry, Query, QueryError, QueryHandler, QueryResult, ToolRegistry,
+    ProviderRegistry, Query, QueryError, QueryHandler, QueryResult, ToolRegistry, WorkflowIndex,
 };
 use tupi_store::{MODELS_TTL_SECS, Store};
 
@@ -15,7 +15,7 @@ use crate::store::SessionStore;
 
 const SESSION_ID: u64 = 1;
 
-pub const MAX_TOOL_STEPS: usize = 8;
+pub const MAX_TOOL_STEPS: usize = 30;
 
 async fn run_tool(tools: &ToolRegistry, call: &ToolCall) -> Result<String, String> {
     let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
@@ -57,6 +57,16 @@ fn summarize(text: &str) -> String {
     summary
 }
 
+/// Soma tokens reportados pelo provedor preservando `None` como "não
+/// reportado": o primeiro valor visto abre o total, os seguintes acumulam.
+fn add_tokens(total: Option<u64>, value: Option<u64>) -> Option<u64> {
+    match (total, value) {
+        (Some(total), Some(value)) => Some(total + value),
+        (None, value) => value,
+        (total, None) => total,
+    }
+}
+
 struct StreamHandle {
     request_id: RequestId,
     task: tokio::task::JoinHandle<()>,
@@ -77,6 +87,13 @@ pub struct App {
     current: Arc<Mutex<Option<StreamHandle>>>,
     prefix: String,
     show_prompts: AtomicBool,
+    max_tool_steps: usize,
+    /// Teto de tokens estimados do contexto enviado ao modelo. Zero desliga a
+    /// poda e volta ao comportamento antigo (histórico inteiro, sempre).
+    context_budget: AtomicUsize,
+    /// Workflows que `/workflows/<nome>` pode invocar. Vazio por padrão para
+    /// que os construtores existentes não dependam do disco.
+    workflows: Arc<dyn WorkflowIndex>,
 }
 
 impl App {
@@ -118,13 +135,15 @@ impl App {
     ) -> Arc<Self> {
         let show_prompts = store
             .as_ref()
-            .and_then(|store| match store.setting(crate::debug::SHOW_PROMPTS_KEY) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(%error, "falha ao ler a configuração de debug");
-                    None
-                }
-            })
+            .and_then(
+                |store| match store.setting(crate::debug::SHOW_PROMPTS_KEY) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(%error, "falha ao ler a configuração de debug");
+                        None
+                    }
+                },
+            )
             .is_some_and(|value| crate::debug::enabled(Some(value.as_str())));
 
         Arc::new(Self {
@@ -141,7 +160,64 @@ impl App {
             pending: Arc::new(Mutex::new(Vec::new())),
             prefix,
             show_prompts: AtomicBool::new(show_prompts),
+            max_tool_steps: MAX_TOOL_STEPS,
+            context_budget: AtomicUsize::new(tupi_domain::context::DEFAULT_CONTEXT_TOKENS),
+            workflows: Arc::new(crate::workflow::EmptyIndex),
         })
+    }
+
+    /// Liga o catálogo de workflows lido do projeto, em `tupi-tools`.
+    pub fn with_workflows(mut self: Arc<Self>, workflows: Arc<dyn WorkflowIndex>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("App recém-criado").workflows = workflows;
+        self
+    }
+
+    /// `/workflows/<nome> [pedido]`: injeta os passos como turno do usuário.
+    ///
+    /// Nome desconhecido não vira chamada ao modelo: devolve o erro com a lista
+    /// do que existe, que a TUI mostra sem gastar tokens.
+    fn run_workflow(&self, name: &str, extra: &str) -> Result<CommandOutcome, CommandError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CommandError::Internal(
+                "uso: /workflows/<nome> [pedido]".to_string(),
+            ));
+        }
+        let Some(workflow) = self.workflows.find(name) else {
+            let names: Vec<String> = self
+                .workflows
+                .list()
+                .iter()
+                .map(|workflow| workflow.name.clone())
+                .collect();
+            return Err(CommandError::Internal(if names.is_empty() {
+                format!("workflow `{name}` não existe e nenhum está disponível")
+            } else {
+                format!(
+                    "workflow `{name}` não existe. Disponíveis: {}",
+                    names.join(", ")
+                )
+            }));
+        };
+
+        self.send_message(workflow.invocation(extra))
+    }
+
+    /// Ajusta o limite de passos de tool call por turno.
+    pub fn with_max_tool_steps(mut self: Arc<Self>, max_tool_steps: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .max_tool_steps = max_tool_steps;
+        self
+    }
+
+    /// Teto de tokens estimados do contexto enviado ao modelo. Zero desliga a
+    /// poda e volta a mandar o histórico inteiro.
+    pub fn with_context_budget(mut self: Arc<Self>, context_budget: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .context_budget = AtomicUsize::new(context_budget);
+        self
     }
 
     pub fn session(&self) -> Session {
@@ -189,6 +265,8 @@ impl App {
         let tools = self.tools.clone();
         let prefix = self.prefix.clone();
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
+        let max_tool_steps = self.max_tool_steps;
+        let context_budget = self.context_budget.load(Ordering::SeqCst);
 
         let partial = Arc::new(Mutex::new(String::new()));
         let events = self.events.clone();
@@ -201,10 +279,11 @@ impl App {
         let task = tokio::spawn(async move {
             let mut failure = None;
             let mut step = 0;
-            let mut completion_tokens = 0u64;
-            let mut has_usage = false;
+            let mut prompt_tokens = None;
+            let mut cached_tokens = None;
+            let mut completion_tokens = None;
 
-            while step < MAX_TOOL_STEPS {
+            while step < max_tool_steps {
                 step += 1;
                 task_partial.lock().unwrap().clear();
 
@@ -212,7 +291,22 @@ impl App {
                 if !prefix.is_empty() {
                     messages.push(Message::new(Role::System, prefix.clone()));
                 }
-                messages.extend(session.messages());
+                // Poda amortizada: corta fundo quando estoura o teto, para que o
+                // prefixo cacheado do provedor sobreviva aos próximos passos.
+                let planned = tupi_domain::context::plan_amortized(
+                    &session.messages(),
+                    context_budget,
+                    context_budget.saturating_mul(2) / 5,
+                );
+                if planned.trimmed() {
+                    events.publish(Event::ContextTrimmed {
+                        request_id,
+                        estimate: planned.estimate,
+                        omitted_units: planned.omitted_units,
+                        shrunk_results: planned.shrunk_results,
+                    });
+                }
+                messages.extend(planned.messages);
                 let request = ChatRequest::new(model.clone(), messages).with_tools(specs.clone());
 
                 if show_prompts {
@@ -240,10 +334,13 @@ impl App {
                                     calls = tool_calls;
                                 }
                                 Ok(ProviderEvent::Usage {
-                                    completion_tokens: tokens,
+                                    prompt_tokens: prompt,
+                                    cached_tokens: cached,
+                                    completion_tokens: completion,
                                 }) => {
-                                    completion_tokens += tokens;
-                                    has_usage = true;
+                                    prompt_tokens = add_tokens(prompt_tokens, prompt);
+                                    cached_tokens = add_tokens(cached_tokens, cached);
+                                    completion_tokens = add_tokens(completion_tokens, completion);
                                 }
                                 Err(error) => {
                                     failure = Some(error.to_string());
@@ -273,14 +370,14 @@ impl App {
                     break;
                 }
 
-                if step >= MAX_TOOL_STEPS {
+                if step >= max_tool_steps {
                     close_unanswered(
                         &session,
                         &pending,
                         "limite de passos atingido: chamada não executada",
                     );
                     failure = Some(format!(
-                        "limite de {MAX_TOOL_STEPS} passos de tools atingido"
+                        "limite de {max_tool_steps} passos de tools atingido"
                     ));
                     break;
                 }
@@ -327,6 +424,10 @@ impl App {
             }
             drop(slot);
 
+            // A TUI pode enfileirar e disparar o próximo turno assim que vê
+            // o evento: liberar antes do publish evita um Busy espúrio.
+            active.store(0, Ordering::SeqCst);
+
             match failure {
                 Some(message) => {
                     events.publish(Event::StreamFailed {
@@ -337,12 +438,12 @@ impl App {
                 None => {
                     events.publish(Event::StreamFinished {
                         request_id,
-                        completion_tokens: has_usage.then_some(completion_tokens),
+                        prompt_tokens,
+                        cached_tokens,
+                        completion_tokens,
                     });
                 }
             }
-
-            active.store(0, Ordering::SeqCst);
         });
 
         *self.current.lock().unwrap() = Some(StreamHandle {
@@ -392,6 +493,8 @@ impl App {
 
         self.events.publish(Event::StreamFinished {
             request_id,
+            prompt_tokens: None,
+            cached_tokens: None,
             completion_tokens: None,
         });
         CommandOutcome::Cancelled
@@ -403,16 +506,15 @@ impl CommandHandler for App {
     async fn handle(&self, command: Command) -> Result<CommandOutcome, CommandError> {
         match command {
             Command::SendMessage { text } => self.send_message(text),
+            Command::RunWorkflow { name, extra } => self.run_workflow(&name, &extra),
             Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
             Command::SetModel { model } => self.set_model(model),
             Command::ToggleShowPrompts => {
                 let enabled = !self.show_prompts.load(Ordering::SeqCst);
 
                 if let Some(store) = self.store.as_ref()
-                    && let Err(error) = store.save_setting(
-                        crate::debug::SHOW_PROMPTS_KEY,
-                        crate::debug::value(enabled),
-                    )
+                    && let Err(error) = store
+                        .save_setting(crate::debug::SHOW_PROMPTS_KEY, crate::debug::value(enabled))
                 {
                     return Err(CommandError::Internal(format!(
                         "falha ao gravar configuração: {error}"
@@ -514,6 +616,7 @@ impl QueryHandler for App {
                 })?;
                 Ok(QueryResult::Models(provider.list_models().await?))
             }
+            Query::ListWorkflows => Ok(QueryResult::Workflows(self.workflows.list())),
         }
     }
 }
@@ -805,6 +908,8 @@ mod tests {
             rx.recv().await.unwrap(),
             Event::StreamFinished {
                 request_id,
+                prompt_tokens: None,
+                cached_tokens: None,
                 completion_tokens: None,
             }
         );
@@ -873,6 +978,8 @@ mod tests {
             rx.recv().await.unwrap(),
             Event::StreamFinished {
                 request_id,
+                prompt_tokens: None,
+                cached_tokens: None,
                 completion_tokens: None,
             }
         );
@@ -1072,6 +1179,8 @@ mod tests {
             rx.recv().await.unwrap(),
             Event::StreamFinished {
                 request_id,
+                prompt_tokens: None,
+                cached_tokens: None,
                 completion_tokens: None,
             }
         );
@@ -1540,7 +1649,7 @@ mod tests {
         };
 
         let mut failed = None;
-        for _ in 0..40 {
+        for _ in 0..(MAX_TOOL_STEPS * 2 + 4) {
             let event = rx.recv().await.unwrap();
             if let Event::StreamFailed { message, .. } = event {
                 failed = Some(message);
@@ -1561,7 +1670,9 @@ mod tests {
 
     fn usage_event(tokens: u64) -> Result<ProviderEvent, ProviderError> {
         Ok(ProviderEvent::Usage {
-            completion_tokens: tokens,
+            prompt_tokens: None,
+            cached_tokens: None,
+            completion_tokens: Some(tokens),
         })
     }
 
@@ -1597,5 +1708,89 @@ mod tests {
         }
 
         assert_eq!(total, Some(15));
+    }
+
+    fn prompt_usage(prompt: u64, cached: u64) -> Result<ProviderEvent, ProviderError> {
+        Ok(ProviderEvent::Usage {
+            prompt_tokens: Some(prompt),
+            cached_tokens: Some(cached),
+            completion_tokens: Some(1),
+        })
+    }
+
+    #[tokio::test]
+    async fn prompt_and_cached_tokens_are_summed_across_steps() {
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                text_event("vou ler"),
+                prompt_usage(1_000, 800),
+                calls_event(vec![tool_call("c1", "echo", "{\"n\":1}")]),
+            ],
+            vec![text_event("fim"), prompt_usage(1_200, 900)],
+        ]));
+        let app = app_with_tools(provider, bus, Arc::new(EchoTool::new()));
+
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
+
+        let mut usage = None;
+        for _ in 0..32 {
+            if let Event::StreamFinished {
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                ..
+            } = rx.recv().await.unwrap()
+            {
+                usage = Some((prompt_tokens, cached_tokens, completion_tokens));
+                break;
+            }
+        }
+
+        assert_eq!(usage, Some((Some(2_200), Some(1_700), Some(2))));
+    }
+
+    #[tokio::test]
+    async fn a_tight_context_budget_trims_the_history_and_reports_it() {
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![text_event("ok")],
+            vec![text_event("ok")],
+        ]));
+        let app =
+            app_with_tools(provider, bus, Arc::new(EchoTool::new())).with_context_budget(1_000);
+
+        app.handle(Command::SendMessage {
+            text: "a ".repeat(3_000),
+        })
+        .await
+        .unwrap();
+        wait_for_end(&mut rx).await;
+
+        app.handle(Command::SendMessage {
+            text: "b ".repeat(3_000),
+        })
+        .await
+        .unwrap();
+
+        let mut omitted = None;
+        for _ in 0..64 {
+            match rx.recv().await.unwrap() {
+                Event::ContextTrimmed { omitted_units, .. } => {
+                    omitted = Some(omitted_units);
+                    break;
+                }
+                Event::StreamFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(omitted.unwrap_or(0) >= 1, "esperava o histórico podado");
     }
 }

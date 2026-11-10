@@ -49,7 +49,7 @@ pub fn default_state_dir() -> PathBuf {
 }
 
 pub(crate) fn facts_path(state_dir: &Path, root: &Path) -> PathBuf {
-    state_dir.join(format!("facts-{}.jsonl", crate::index::repo_key(root)))
+    state_dir.join(format!("facts-{}.jsonl", crate::paths::repo_key(root)))
 }
 
 pub(crate) fn read_facts(state_dir: &Path, root: &Path) -> Vec<Value> {

@@ -1,13 +1,11 @@
-use tupi_tui::state::{ChatState, COMMANDS};
+use tupi_tui::state::{COMMANDS, ChatState};
 
 #[test]
 fn the_prompt_debug_command_is_offered_in_autocomplete() {
     assert!(COMMANDS.contains(&"/enable-show-prompts-messages"));
 
-    let mut state = ChatState {
-        input: "/enable".into(),
-        ..ChatState::default()
-    };
+    let mut state = ChatState::default();
+    state.input = "/enable".into();
     state.refresh_suggestions();
 
     assert_eq!(

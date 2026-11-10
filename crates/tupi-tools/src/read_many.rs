@@ -1,5 +1,7 @@
-//! Leitura em lote: uma chamada valida todos os itens antes de responder, e o
-//! lote inteiro divide um único orçamento de tokens.
+//! Leitura em lote: o lote inteiro divide um único orçamento de tokens entre os
+//! itens. Caminho inexistente, leitura repetida ou rev desconhecido abortam o
+//! lote inteiro; símbolo não encontrado vira aviso no topo e os demais itens
+//! continuam sendo entregues.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -46,6 +48,7 @@ impl ReadManyTool {
 
         let mut rendered: Vec<Rendered> = Vec::new();
         let mut errors = Vec::new();
+        let mut missing = Vec::new();
         let mut seen: HashSet<(PathBuf, Option<String>, Option<String>)> = HashSet::new();
 
         for (index, item) in params.reads.into_iter().enumerate() {
@@ -129,7 +132,7 @@ impl ReadManyTool {
 
             match self.inner.render(&request, &path, &content, &relative) {
                 Ok(sections) if !sections.is_empty() => rendered.extend(sections),
-                Ok(_) => errors.push(format!(
+                Ok(_) => missing.push(format!(
                     "- item {} (\u{0060}{}\u{0060}): símbolo \u{0060}{}\u{0060} não encontrado em \u{0060}{relative}\u{0060}.",
                     index + 1,
                     item.path,
@@ -148,7 +151,33 @@ impl ReadManyTool {
             )));
         }
 
-        Ok(self.inner.finish(rendered, params.budget_tokens))
+        if missing.is_empty() {
+            return Ok(self.inner.finish(rendered, params.budget_tokens));
+        }
+
+        if rendered.is_empty() {
+            return Err(ToolError::Other(format!(
+                "### `read_many` — nada foi lido\n\n{}\n",
+                missing.join("\n")
+            )));
+        }
+
+        let heading = if missing.len() == 1 {
+            "#### leitura não encontrada"
+        } else {
+            "#### leituras não encontradas"
+        };
+        let mut with_notice = vec![Rendered {
+            section: crate::budget::Section {
+                heading: heading.to_string(),
+                body: missing.join("\n"),
+                priority: 255,
+            },
+            pending: None,
+        }];
+        with_notice.extend(rendered);
+
+        Ok(self.inner.finish(with_notice, params.budget_tokens))
     }
 }
 
@@ -156,7 +185,7 @@ impl Tool for ReadManyTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_many".to_string(),
-            description: "Lê vários arquivos ou símbolos como um lote: valida todas as leituras antes de responder, recusa o lote inteiro se uma for inválida e divide um único orçamento de tokens entre os itens.".to_string(),
+            description: "Lê vários arquivos ou símbolos como um lote, com um único orçamento de tokens entre os itens. Caminho inexistente, leitura repetida ou rev desconhecido recusam o lote inteiro; símbolo não encontrado vira aviso no topo e não derruba os demais itens.".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -203,6 +232,51 @@ impl Tool for ReadManyTool {
         let params: ReadManyParams = serde_json::from_value(arguments)
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
         self.read_many(params)
+    }
+
+    fn describe_call(&self, arguments: &serde_json::Value) -> String {
+        let Some(reads) = arguments.get("reads").and_then(|value| value.as_array()) else {
+            return "read_many".to_string();
+        };
+        if reads.is_empty() {
+            return "read_many".to_string();
+        }
+
+        let labels: Vec<String> = reads
+            .iter()
+            .take(3)
+            .map(|item| {
+                let path = item
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let label = match item.get("symbol").and_then(|value| value.as_str()) {
+                    Some(symbol) => format!("{path}#{symbol}"),
+                    None => path.to_string(),
+                };
+                match item
+                    .get("rev")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|rev| !rev.is_empty())
+                {
+                    Some(rev) => format!("{rev}:{label}"),
+                    None => label,
+                }
+            })
+            .collect();
+
+        let noun = if reads.len() == 1 {
+            "leitura"
+        } else {
+            "leituras"
+        };
+        let mut out = format!("read_many: {} {noun} · {}", reads.len(), labels.join(" · "));
+        let rest = reads.len().saturating_sub(labels.len());
+        if rest > 0 {
+            out.push_str(&format!(" · +{rest}"));
+        }
+        out
     }
 }
 
@@ -324,16 +398,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_symbol_aborts_the_whole_batch() {
+    fn an_unknown_symbol_is_reported_without_dropping_the_rest() {
         let dir = fixture();
-        let error = tool_for(dir.path())
+        let out = tool_for(dir.path())
             .read_many(batch(vec![
                 item("auth.rs", Some("verify_token")),
                 item("session.rs", Some("does_not_exist")),
             ]))
-            .unwrap_err();
+            .unwrap();
 
-        assert!(error.to_string().contains("não encontrado"), "{error}");
+        assert!(out.contains("leitura não encontrada"), "{out}");
+        assert!(out.contains("does_not_exist"), "{out}");
+        assert!(out.contains("session.rs"), "{out}");
+        assert!(out.contains("!raw.is_empty()"), "{out}");
+
+        // Quando nenhum item é encontrado não sobra conteúdo: continua sendo erro.
+        let error = tool_for(dir.path())
+            .read_many(batch(vec![item("auth.rs", Some("does_not_exist"))]))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("nada foi lido"), "{message}");
+        assert!(message.contains("does_not_exist"), "{message}");
     }
 
     #[test]
@@ -381,6 +466,7 @@ mod tests {
                 "read",
                 "read_many",
                 "search",
+                "workflow",
                 "edit",
                 "write",
                 "write_many",
@@ -415,6 +501,39 @@ mod tests {
         let spec = tool.spec();
         assert_eq!(spec.name, "read_many");
         assert_eq!(spec.schema["required"][0], "reads");
+    }
+
+    #[test]
+    fn describe_call_summarizes_the_batch() {
+        let dir = fixture();
+        let tool = tool_for(dir.path());
+
+        assert_eq!(
+            tool.describe_call(&serde_json::json!({
+                "reads": [{ "path": "auth.rs", "symbol": "verify_token" }]
+            })),
+            "read_many: 1 leitura · auth.rs#verify_token"
+        );
+        assert_eq!(
+            tool.describe_call(&serde_json::json!({
+                "reads": [
+                    { "path": "auth.rs", "symbol": "verify_token" },
+                    { "path": "lib.rs" },
+                    { "path": "src/main.rs", "rev": "HEAD" }
+                ]
+            })),
+            "read_many: 3 leituras · auth.rs#verify_token · lib.rs · HEAD:src/main.rs"
+        );
+        assert_eq!(
+            tool.describe_call(&serde_json::json!({
+                "reads": [
+                    { "path": "a.rs" }, { "path": "b.rs" },
+                    { "path": "c.rs" }, { "path": "d.rs" }
+                ]
+            })),
+            "read_many: 4 leituras · a.rs · b.rs · c.rs · +1"
+        );
+        assert_eq!(tool.describe_call(&serde_json::json!({})), "read_many");
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

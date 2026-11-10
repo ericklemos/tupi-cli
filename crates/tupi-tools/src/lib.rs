@@ -1,5 +1,3 @@
-pub mod index;
-
 mod ast;
 mod budget;
 mod edit;
@@ -25,6 +23,9 @@ pub use read::{ReadParams, ReadTool};
 pub use read_many::{ReadItem, ReadManyParams, ReadManyTool};
 pub use search::{SearchDetail, SearchParams, SearchTool};
 pub use store::ResponseStore;
+pub use workflow::{
+    Catalog, WorkflowTool, catalog, global_agents_dir, local_agents_dir, prompt_section,
+};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +58,7 @@ mod trace;
 mod web;
 mod websearch;
 mod why;
+mod workflow;
 mod write;
 mod write_many;
 pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
@@ -68,6 +70,7 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         crate::ledger::DEFAULT_ENTRIES,
         crate::ledger::DEFAULT_MAX_BYTES,
     ));
+    let graph = crate::graph::GraphCache::shared(&root_dir);
     let read = Arc::new(ReadTool::new(
         root_dir.clone(),
         store.clone(),
@@ -83,30 +86,50 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         ledger,
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(EditTool::new(
+    registry.register(Arc::new(WorkflowTool::new(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::write::WriteTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(EditTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
-    registry.register(Arc::new(crate::write_many::WriteManyTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(crate::write::WriteTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
-    registry.register(Arc::new(crate::relocate::MoveTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(crate::write_many::WriteManyTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
-    registry.register(Arc::new(crate::patch::PatchTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(crate::relocate::MoveTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
+    )));
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(crate::patch::PatchTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
     registry.register(Arc::new(crate::exec::ExecTool::new(
         root_dir.clone(),
@@ -118,10 +141,13 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::shell::ShellTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+        Arc::new(crate::shell::ShellTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
     registry.register(Arc::new(crate::map::MapTool::new(
         root_dir.clone(),

@@ -108,6 +108,13 @@ pub fn relative(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+pub fn repo_key(root: &Path) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    blake3::hash(canonical.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 pub fn hash_prefix(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()[..12].to_string()
 }

@@ -187,7 +187,7 @@ impl Tool for MapTool {
             return Err(ToolError::OutsideRoot(prefix.to_string()));
         }
 
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let incoming = incoming(&graph);
         let defs = filtered(&graph, prefix, params.include_tests);
         let tests = graph
@@ -285,5 +285,89 @@ mod tests {
         let out = Tool::call(&tool(dir.path()), serde_json::json!({})).unwrap();
         assert!(out.contains("1 teste(s) omitido(s)"));
         assert!(!out.contains("it_works"));
+    }
+
+    #[test]
+    fn map_reuses_the_shared_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn alpha() {}\n");
+        let map = tool(dir.path());
+
+        let first = Tool::call(&map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(first.contains("alpha"));
+
+        write(dir.path(), "src/b.rs", "pub fn beta() {}\n");
+        let second = Tool::call(&map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(!second.contains("beta"));
+
+        crate::graph::GraphCache::invalidate_root(dir.path());
+        let third = Tool::call(&map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(third.contains("beta"));
+    }
+
+    #[test]
+    fn map_on_an_empty_root_is_well_formed() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Tool::call(&tool(dir.path()), serde_json::json!({"depth": "dirs"})).unwrap();
+        assert!(out.contains("0 arquivo(s)"));
+        assert!(out.contains("0 símbolo(s)"));
+    }
+
+    #[test]
+    fn map_rejects_a_path_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            Tool::call(&tool(dir.path()), serde_json::json!({"path": "../fora"})).unwrap_err();
+        assert!(matches!(error, ToolError::OutsideRoot(_)));
+    }
+
+    #[test]
+    fn an_edit_invalidates_the_shared_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn caller() {}\n");
+        write(dir.path(), "src/b.rs", "pub fn helper() {}\n");
+        let mut registry = tupi_kernel::ToolRegistry::new();
+        crate::register(dir.path().to_path_buf(), &mut registry);
+        let map = registry.get("map").unwrap();
+        let edit = registry.get("edit").unwrap();
+
+        let before = Tool::call(&*map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(before.contains("src/b.rs — 1 símbolo(s) · 0 chamada(s)"));
+
+        let content = std::fs::read(dir.path().join("src/a.rs")).unwrap();
+        Tool::call(
+            &*edit,
+            serde_json::json!({
+                "path": "src/a.rs",
+                "symbol": "caller",
+                "expected_hash": crate::span::hash_prefix(&content),
+                "new_body": "{\n    helper();\n}"
+            }),
+        )
+        .unwrap();
+
+        let after = Tool::call(&*map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(after.contains("src/b.rs — 1 símbolo(s) · 1 chamada(s)"));
+    }
+
+    #[test]
+    fn a_write_invalidates_the_shared_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = tupi_kernel::ToolRegistry::new();
+        crate::register(dir.path().to_path_buf(), &mut registry);
+        let map = registry.get("map").unwrap();
+        let write = registry.get("write").unwrap();
+
+        let before = Tool::call(&*map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(!before.contains("gamma"));
+
+        Tool::call(
+            &*write,
+            serde_json::json!({"path": "src/gamma.rs", "content": "pub fn gamma() {}\n"}),
+        )
+        .unwrap();
+
+        let after = Tool::call(&*map, serde_json::json!({"depth": "files"})).unwrap();
+        assert!(after.contains("gamma"));
     }
 }

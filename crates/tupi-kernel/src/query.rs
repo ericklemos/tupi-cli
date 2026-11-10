@@ -10,6 +10,7 @@ pub enum Query {
     History,
     ListProviders,
     ListModels,
+    ListWorkflows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum QueryResult {
     History(Vec<Message>),
     Providers(Vec<String>),
     Models(Vec<String>),
+    Workflows(Vec<tupi_domain::Workflow>),
 }
 
 #[async_trait]

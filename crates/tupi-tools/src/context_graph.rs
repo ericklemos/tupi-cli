@@ -10,7 +10,7 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 use crate::ast::compact_signature;
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::graph::{CallGraph, Def};
+use crate::graph::Def;
 use crate::store::ResponseStore;
 
 #[derive(Debug, Deserialize)]
@@ -107,7 +107,7 @@ impl Tool for ContextTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let depth = params.depth.clamp(1, 3);
 
         let is_file = target.ends_with(".rs") || target.contains('/');

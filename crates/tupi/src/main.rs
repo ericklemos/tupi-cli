@@ -7,6 +7,8 @@ use tupi_providers::deepseek;
 use tupi_tui::run::{BusSet, run};
 
 mod config;
+mod prompt_config;
+mod tool_config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,7 +34,28 @@ async fn main() -> anyhow::Result<()> {
             }
         };
     let root = tool_root()?;
-    let prefix = prefix_for(store.as_deref(), &root);
+    let tokens = token::load_token(&root);
+    tracing::debug!(
+        max_tokens = tokens.max_tokens,
+        path = %token::token_path(&root).display(),
+        "teto de tokens por resposta do modelo"
+    );
+    let tool_limits = tool_config::load_tools(&root);
+    tracing::debug!(
+        max_tool_steps = tool_limits.max_tool_steps,
+        path = %tool_config::tools_path(&root).display(),
+        "limite de passos de tool call por turno"
+    );
+    let prompt = prompt_config::load_prompt(&root);
+    tracing::debug!(
+        path = %prompt_config::prompt_path(&root).display(),
+        "prompt do sistema"
+    );
+    let prefix = tupi_app::prompt::compose(&prompt.system);
+    let available = tupi_tools::catalog(&root);
+    tracing::debug!(count = available.len(), "workflows disponíveis");
+    let prefix = format!("{prefix}\n\n{}", tupi_tools::prompt_section(&available));
+    let workflows = std::sync::Arc::new(tupi_tools::Catalog::new(root.clone()));
     let mut tools = ToolRegistry::new();
     tupi_tools::register(root, &mut tools);
 
@@ -44,7 +67,9 @@ async fn main() -> anyhow::Result<()> {
         store,
         tools,
         prefix,
-    );
+    )
+    .with_max_tool_steps(tool_limits.max_tool_steps);
+    let app = app.with_workflows(workflows);
 
     let buses = BusSet {
         commands: CommandBus::new(app.clone()),
@@ -119,74 +144,6 @@ fn state_dir() -> PathBuf {
         .join("tupi")
 }
 
-fn prefix_for(store: Option<&tupi_store::Store>, root: &std::path::Path) -> String {
-    let key = tupi_tools::index::repo_key(root);
-    let index = match tupi_tools::index::scan(root) {
-        Ok(index) => {
-            if let Some(store) = store
-                && let Err(error) = store.save_index(&key, &index)
-            {
-                tracing::warn!(%error, "falha ao gravar o índice do repo");
-            }
-            index
-        }
-        Err(error) => {
-            tracing::warn!(%error, "varredura do repo falhou; usando índice salvo");
-            store
-                .and_then(|store| match store.load_index(&key) {
-                    Ok(index) => index,
-                    Err(error) => {
-                        tracing::warn!(%error, "falha ao ler o índice salvo");
-                        None
-                    }
-                })
-                .unwrap_or_default()
-        }
-    };
-
-    tupi_app::prompt::compose(&tupi_tools::index::render(
-        &index,
-        tupi_tools::index::DEFAULT_PREFIX_TOKENS,
-    ))
-}
-#[cfg(test)]
-mod prefix_tests {
-    use super::*;
-
-    #[test]
-    fn scans_a_real_tree_into_a_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
-        let out = prefix_for(None, dir.path());
-        assert!(out.starts_with(tupi_app::prompt::TUPI_SYSTEM));
-        assert!(out.contains("root: ."));
-        assert!(out.contains("lib.rs :: alpha"));
-    }
-
-    #[test]
-    fn falls_back_to_the_stored_index_when_scan_fails() {
-        use tupi_domain::index::{Index, IndexFile};
-        let dir = tempfile::tempdir().unwrap();
-        let store = tupi_store::Store::open(dir.path().join("tupi.redb")).unwrap();
-        let missing = dir.path().join("nao-existe");
-        let stored = Index {
-            version: 1,
-            scanned_at_unix: 0,
-            files: vec![IndexFile {
-                path: "salvo.rs".into(),
-                hash: "abc".into(),
-                language: "rust".into(),
-                symbols: vec![],
-            }],
-        };
-        store
-            .save_index(&tupi_tools::index::repo_key(&missing), &stored)
-            .unwrap();
-
-        let out = prefix_for(Some(&store), &missing);
-        assert!(out.contains("salvo.rs"));
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,3 +178,4 @@ mod tests {
         assert_eq!(dir, PathBuf::from("C:\\Users\\ana\\.tupi"));
     }
 }
+mod token;

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use ignore::WalkBuilder;
 
@@ -174,6 +175,91 @@ impl CallGraph {
             frontier = next;
         }
         None
+    }
+}
+
+pub struct GraphCache {
+    root: PathBuf,
+    graph: RwLock<Option<Arc<CallGraph>>>,
+}
+
+impl GraphCache {
+    pub fn new(root: PathBuf) -> Self {
+        let root = root.canonicalize().unwrap_or(root);
+        Self {
+            root,
+            graph: RwLock::new(None),
+        }
+    }
+
+    pub fn get(&self) -> Arc<CallGraph> {
+        if let Some(graph) = self.graph.read().unwrap().as_ref() {
+            return graph.clone();
+        }
+        let built = Arc::new(CallGraph::build(&self.root));
+        *self.graph.write().unwrap() = Some(built.clone());
+        built
+    }
+
+    pub fn invalidate(&self) {
+        *self.graph.write().unwrap() = None;
+    }
+}
+
+static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<GraphCache>>>> = OnceLock::new();
+
+impl GraphCache {
+    pub fn shared(root: &Path) -> Arc<Self> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut caches = CACHES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        caches
+            .entry(root.clone())
+            .or_insert_with(|| Arc::new(GraphCache::new(root)))
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub fn invalidate_root(root: &Path) {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let caches = CACHES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        if let Some(cache) = caches.get(&root) {
+            cache.invalidate();
+        }
+    }
+}
+
+pub(crate) struct InvalidatingTool {
+    inner: Arc<dyn tupi_kernel::Tool>,
+    cache: Arc<GraphCache>,
+}
+
+impl InvalidatingTool {
+    pub(crate) fn new(inner: Arc<dyn tupi_kernel::Tool>, cache: Arc<GraphCache>) -> Self {
+        Self { inner, cache }
+    }
+}
+
+impl tupi_kernel::Tool for InvalidatingTool {
+    fn spec(&self) -> tupi_kernel::ToolSpec {
+        self.inner.spec()
+    }
+
+    fn call(&self, arguments: serde_json::Value) -> Result<String, tupi_kernel::ToolError> {
+        let result = self.inner.call(arguments);
+        if result.is_ok() {
+            self.cache.invalidate();
+        }
+        result
+    }
+
+    fn describe_call(&self, arguments: &serde_json::Value) -> String {
+        self.inner.describe_call(arguments)
     }
 }
 
@@ -364,5 +450,20 @@ mod tests {
         write(dir.path(), "src/a.rs", "#[test]\nfn it_works() {}\n");
         let graph = CallGraph::build(dir.path());
         assert!(graph.matching("it_works").remove(0).is_test);
+    }
+
+    #[test]
+    fn cache_reuses_the_graph_until_invalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn alpha() {}\n");
+        let cache = GraphCache::new(dir.path().to_path_buf());
+
+        assert_eq!(cache.get().matching("alpha").len(), 1);
+
+        write(dir.path(), "src/b.rs", "pub fn beta() {}\n");
+        assert!(cache.get().matching("beta").is_empty());
+
+        cache.invalidate();
+        assert_eq!(cache.get().matching("beta").len(), 1);
     }
 }

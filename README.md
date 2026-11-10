@@ -4,6 +4,8 @@ Chat de terminal em Rust, com TUI (ratatui), streaming e tools de leitura,
 busca, edição, escrita, execução e grafo de chamadas. O modelo trabalha no
 projeto sem receber o projeto inteiro.
 
+A descoberta começa em `map`: o prompt não carrega o repositório.
+
 ## Ferramentas
 
 - **Leitura e busca** — `read` (esqueleto do arquivo ou corpo de um símbolo,
@@ -54,6 +56,10 @@ As variáveis podem vir do ambiente ou de um arquivo `.env` (o Tupi procura na
 raiz do projeto e nos diretórios acima). **O ambiente tem precedência** sobre o
 arquivo.
 
+O prompt que configura o agente fica em `configs/prompts.ron`, no campo
+`system`. Se o arquivo faltar ou estiver inválido, o Tupi usa o prompt padrão
+do código.
+
 ```bash
 cp .env.example .env
 # edite .env e preencha TUPI_CLI_DEEPSEEK_PLATAFORM_APIKEY
@@ -74,6 +80,8 @@ programa falha antes de abrir a TUI, citando o nome da variável.
 
 - **Enter** envia a mensagem; no modal de modelos, troca o modelo ativo
 - **/models** abre o modal com os modelos do provedor atual (consulta `GET /models`)
+- **/enable-show-prompts-messages** liga/desliga o debug que mostra no histórico
+  o pacote exato de mensagens enviado ao provedor; a escolha fica no redb
 - **Tab** completa o comando sugerido (autocomplete a partir de `/`)
 - **↑ / ↓** rolam o histórico; com sugestões ou modal abertos, navegam pela lista
 - **Esc** cancela o stream; no modal, fecha

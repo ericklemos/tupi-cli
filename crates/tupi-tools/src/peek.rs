@@ -119,6 +119,32 @@ impl Tool for PeekTool {
         let budget = params.budget_tokens.unwrap_or(self.default_budget_tokens);
         self.peek(&params.handle, params.offset_chars, budget)
     }
+
+    fn describe_call(&self, arguments: &serde_json::Value) -> String {
+        let mut parts = Vec::new();
+        if let Some(handle) = arguments.get("handle").and_then(|value| value.as_str()) {
+            parts.push(format!("handle={handle}"));
+        }
+        if let Some(offset) = arguments
+            .get("offset_chars")
+            .and_then(|value| value.as_u64())
+            .filter(|offset| *offset > 0)
+        {
+            parts.push(format!("offset={offset}"));
+        }
+        if let Some(budget) = arguments
+            .get("budget_tokens")
+            .and_then(|value| value.as_u64())
+        {
+            parts.push(format!("budget={budget}"));
+        }
+
+        if parts.is_empty() {
+            "peek".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +239,24 @@ mod tests {
     fn missing_handle_argument_is_rejected() {
         let output = tool().call(serde_json::json!({})).unwrap_err();
         assert!(matches!(output, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn peek_describes_the_handle_and_the_offset() {
+        let tool = tool();
+
+        assert_eq!(
+            tool.describe_call(&serde_json::json!({ "handle": "h_abc12345" })),
+            "handle=h_abc12345"
+        );
+        assert_eq!(
+            tool.describe_call(&serde_json::json!({
+                "handle": "h_abc12345",
+                "offset_chars": 120,
+                "budget_tokens": 500
+            })),
+            "handle=h_abc12345 · offset=120 · budget=500"
+        );
     }
 
     #[test]

@@ -4,16 +4,12 @@ use redb::ReadableTable;
 
 use serde::{Deserialize, Serialize};
 
-mod index;
-
 pub const SCHEMA_VERSION: u64 = 2;
 pub const MODELS_TTL_SECS: u64 = 24 * 60 * 60;
 
 const META: redb::TableDefinition<&'static str, &'static [u8]> = redb::TableDefinition::new("meta");
 const MODELS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("models");
-const INDEX: redb::TableDefinition<&'static str, &'static [u8]> =
-    redb::TableDefinition::new("index");
 const SETTINGS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("settings");
 
@@ -209,8 +205,6 @@ impl Store {
 
             tx.open_table(MODELS)
                 .map_err(|error| StoreError::Table(error.to_string()))?;
-            tx.open_table(INDEX)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
             tx.open_table(SETTINGS)
                 .map_err(|error| StoreError::Table(error.to_string()))?;
         }
@@ -372,17 +366,12 @@ mod tests {
             let store = Store::open(&path).unwrap();
             assert_eq!(store.setting("show_prompts_messages").unwrap(), None);
 
-            store
-                .save_setting("show_prompts_messages", "true")
-                .unwrap();
+            store.save_setting("show_prompts_messages", "true").unwrap();
         }
 
         let store = Store::open(&path).unwrap();
         assert_eq!(
-            store
-                .setting("show_prompts_messages")
-                .unwrap()
-                .as_deref(),
+            store.setting("show_prompts_messages").unwrap().as_deref(),
             Some("true")
         );
 
@@ -390,10 +379,7 @@ mod tests {
             .save_setting("show_prompts_messages", "false")
             .unwrap();
         assert_eq!(
-            store
-                .setting("show_prompts_messages")
-                .unwrap()
-                .as_deref(),
+            store.setting("show_prompts_messages").unwrap().as_deref(),
             Some("false")
         );
     }

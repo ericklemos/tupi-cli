@@ -9,7 +9,7 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 use crate::ast::compact_signature;
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::graph::{CallGraph, Def};
+use crate::graph::Def;
 use crate::store::ResponseStore;
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +87,7 @@ impl Tool for ImpactTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let definitions = graph.matching(symbol);
         let callers = graph.callers(symbol);
 

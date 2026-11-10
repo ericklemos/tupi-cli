@@ -170,16 +170,16 @@ impl Provider for DeepSeekProvider {
                             for delta in chunk.tool_calls {
                                 state.calls.merge(delta);
                             }
-                            if let Some(prompt_tokens) = chunk.prompt_tokens {
-                                tracing::info!(
-                                    prompt_tokens,
-                                    cached_tokens = chunk.cached_tokens.unwrap_or(0),
-                                    "uso do provedor"
-                                );
-                            }
-                            if let Some(completion_tokens) = chunk.usage {
+                            if chunk.prompt_tokens.is_some()
+                                || chunk.cached_tokens.is_some()
+                                || chunk.usage.is_some()
+                            {
                                 return Some((
-                                    Ok(ProviderEvent::Usage { completion_tokens }),
+                                    Ok(ProviderEvent::Usage {
+                                        prompt_tokens: chunk.prompt_tokens,
+                                        cached_tokens: chunk.cached_tokens,
+                                        completion_tokens: chunk.usage,
+                                    }),
                                     state,
                                 ));
                             }

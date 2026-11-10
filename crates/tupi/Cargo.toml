@@ -23,6 +23,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+ron.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -10,7 +10,6 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::graph::CallGraph;
 use crate::proc;
 use crate::store::ResponseStore;
 
@@ -84,7 +83,7 @@ impl Tool for WhyTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let definitions = graph.matching(symbol);
         if definitions.is_empty() {
             return Err(ToolError::SymbolNotFound(format!(

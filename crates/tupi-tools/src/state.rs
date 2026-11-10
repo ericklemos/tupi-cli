@@ -68,7 +68,7 @@ pub struct StateTool {
 }
 
 fn state_path(state_dir: &Path, root: &Path) -> PathBuf {
-    state_dir.join(format!("state-{}.jsonl", crate::index::repo_key(root)))
+    state_dir.join(format!("state-{}.jsonl", crate::paths::repo_key(root)))
 }
 
 fn read_entries(path: &Path) -> Vec<Entry> {

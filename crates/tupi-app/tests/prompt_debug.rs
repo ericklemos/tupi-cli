@@ -50,12 +50,18 @@ fn temp_store() -> (tempfile::TempDir, PathBuf, Arc<Store>) {
     (dir, path, store)
 }
 
-fn expect_prompt(
-    event: Event,
-) -> (u64, String) {
+fn expect_prompt(event: Event) -> (u64, String) {
     match event {
         Event::PromptMessages { request_id, body } => (request_id, body),
         other => panic!("esperava PromptMessages, veio {other:?}"),
+    }
+}
+
+async fn drain_until_finished(rx: &mut tokio::sync::broadcast::Receiver<Event>) {
+    while let Ok(event) = rx.recv().await {
+        if matches!(event, Event::StreamFinished { .. }) {
+            return;
+        }
     }
 }
 
@@ -69,9 +75,7 @@ async fn enabling_prompts_publishes_the_body_before_the_answer() {
     assert_eq!(outcome, CommandOutcome::ShowPrompts { enabled: true });
 
     let CommandOutcome::Started { request_id } = app
-        .handle(Command::SendMessage {
-            text: "oi".into(),
-        })
+        .handle(Command::SendMessage { text: "oi".into() })
         .await
         .unwrap()
     else {
@@ -97,15 +101,14 @@ async fn prompts_are_silent_by_default_and_toggle_back_off() {
     let mut rx = bus.subscribe();
     let app = app(Arc::new(Scripted), None, bus);
 
-    app.handle(Command::SendMessage {
-        text: "um".into(),
-    })
-    .await
-    .unwrap();
+    app.handle(Command::SendMessage { text: "um".into() })
+        .await
+        .unwrap();
     assert!(matches!(
         rx.recv().await.unwrap(),
         Event::Token { text, .. } if text == "ok"
     ));
+    drain_until_finished(&mut rx).await;
 
     app.handle(Command::ToggleShowPrompts).await.unwrap();
     let outcome = app.handle(Command::ToggleShowPrompts).await.unwrap();

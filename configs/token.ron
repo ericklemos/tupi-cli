@@ -1,0 +1,6 @@
+// Teto de tokens por resposta do modelo.
+// Vale para cada turno do assistente; respostas que estourariam o teto
+// são cortadas pelo provedor.
+(
+    max_tokens: 4096
+)

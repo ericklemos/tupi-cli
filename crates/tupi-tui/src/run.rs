@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::state::{ChatEntry, ChatState, Status};
 use crate::terminal::TerminalGuard;
 
+use crate::workflow::{parse_workflow_invocation, run_workflow, workflow_names};
 pub struct BusSet {
     pub commands: CommandBus,
     pub queries: QueryBus,
@@ -30,6 +31,7 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
     let mut events = buses.events.subscribe();
     let mut state = ChatState::default();
     let mut request: Option<RequestId> = None;
+    state.workflows = workflow_names(&buses.queries).await;
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &model, &provider))?;
@@ -93,10 +95,20 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
 
                         match key.code {
                             KeyCode::Tab => state.accept_suggestion(),
-                            KeyCode::Enter if state.status == Status::Idle && !state.input.is_empty() => {
+                            KeyCode::Enter if !state.input.trim().is_empty() => {
                                 let input = state.input.trim().to_string();
 
-                                if input.starts_with('/') {
+                                if state.status != Status::Idle {
+                                    if input.starts_with('/') {
+                                        state.notice = Some(
+                                            "comando indisponível enquanto o turno roda".to_string(),
+                                        );
+                                    } else {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        state.enqueue(&input);
+                                    }
+                                } else if input.starts_with('/') {
                                     if input == "/models" {
                                         state.input.clear();
                                         state.refresh_suggestions();
@@ -108,23 +120,44 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                             }
                                             Err(error) => state.fail(&error.to_string()),
                                         }
+                                    } else if input == "/enable-show-prompts-messages" {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        match buses
+                                            .commands
+                                            .dispatch(Command::ToggleShowPrompts)
+                                            .await
+                                        {
+                                            Ok(CommandOutcome::ShowPrompts { enabled }) => {
+                                                state.notice = Some(if enabled {
+                                                    "prompts dos providers: mostrando".to_string()
+                                                } else {
+                                                    "prompts dos providers: ocultos".to_string()
+                                                });
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => state.fail(&error.to_string()),
+                                        }
                                     } else {
-                                        state.fail(&format!("comando desconhecido: {input}"));
+                                        match parse_workflow_invocation(&input) {
+                                            Some((name, extra)) => request = run_workflow(
+                                                &buses.commands,
+                                                &mut state,
+                                                name,
+                                                extra,
+                                            )
+                                            .await,
+                                            None => state.fail(&format!("comando desconhecido: {input}")),
+                                        }
                                     }
                                 } else {
                                     let text = state.input.clone();
-                                    match buses.commands.dispatch(Command::SendMessage { text: text.clone() }).await {
-                                        Ok(CommandOutcome::Started { request_id }) => {
-                                            state.input.clear();
-                                            state.refresh_suggestions();
-                                            state.push_user(&text);
-                                            state.begin_assistant();
-                                            state.scroll = 0;
-                                            request = Some(request_id);
-                                        }
-                                        Ok(_) => {}
-                                        Err(CommandError::Busy) => state.fail("aguarde o fim do stream"),
-                                        Err(error) => state.fail(&error.to_string()),
+                                    if let Some(request_id) =
+                                        start_turn(&buses.commands, &mut state, text).await
+                                    {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        request = Some(request_id);
                                     }
                                 }
                             }
@@ -142,7 +175,7 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                     );
                                     if cancelled {
                                         state.finish_assistant();
-                                        request = None;
+                                        request = drain_queue(&buses.commands, &mut state).await;
                                     }
                                 }
                             }
@@ -211,17 +244,32 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                     }
                     Ok(Event::StreamFinished {
                         request_id,
+                        prompt_tokens,
+                        cached_tokens,
                         completion_tokens,
                     }) if Some(request_id) == request => {
-                        if let Some(tokens) = completion_tokens {
-                            state.set_usage(tokens);
-                        }
+                        state.set_usage(prompt_tokens, cached_tokens, completion_tokens);
                         state.finish_assistant();
-                        request = None;
+                        request = drain_queue(&buses.commands, &mut state).await;
+                    }
+                    Ok(Event::ContextTrimmed {
+                        request_id,
+                        estimate,
+                        omitted_units,
+                        shrunk_results,
+                    }) if Some(request_id) == request => {
+                        state.notice = Some(format!(
+                            "contexto podado: ~{estimate} tokens · -{omitted_units} turno(s) · {shrunk_results} ponteiro(s)"
+                        ));
                     }
                     Ok(Event::StreamFailed { request_id, message }) if Some(request_id) == request => {
                         state.fail(&message);
-                        request = None;
+                        request = drain_queue(&buses.commands, &mut state).await;
+                    }
+                    Ok(Event::PromptMessages { request_id, body })
+                        if Some(request_id) == request =>
+                    {
+                        state.push_prompt(&body);
                     }
                     Ok(Event::ToolStarted {
                         request_id,
@@ -260,6 +308,34 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
     Ok(())
 }
 
+async fn start_turn(bus: &CommandBus, state: &mut ChatState, text: String) -> Option<RequestId> {
+    match bus
+        .dispatch(Command::SendMessage { text: text.clone() })
+        .await
+    {
+        Ok(CommandOutcome::Started { request_id }) => {
+            state.push_user(&text);
+            state.begin_assistant();
+            state.scroll = 0;
+            Some(request_id)
+        }
+        Ok(_) => None,
+        Err(CommandError::Busy) => {
+            state.notice = Some("aguarde o fim do stream".to_string());
+            None
+        }
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            None
+        }
+    }
+}
+
+async fn drain_queue(bus: &CommandBus, state: &mut ChatState) -> Option<RequestId> {
+    let text = state.dequeue()?;
+    start_turn(bus, state, text).await
+}
+
 fn scroll_up(state: &mut ChatState, rows: u16) {
     state.scroll = state.scroll.saturating_add(rows);
 }
@@ -271,7 +347,24 @@ fn scroll_down(state: &mut ChatState, rows: u16) {
 fn draw(frame: &mut ratatui::Frame<'_>, state: &ChatState, model: &str, provider: &str) {
     let area = frame.area();
     let compact = area.height < 16 || area.width < 40;
-    let composer_height = if compact { 1 } else { 3 };
+
+    // O prompt "› " ocupa 2 colunas; o bloco com borda ocupa mais 2.
+    let inner_width = if compact {
+        area.width
+    } else {
+        area.width.saturating_sub(2)
+    };
+    let input_width = inner_width.saturating_sub(2).max(1) as usize;
+    let input_rows = wrap_text(&state.input, input_width).len() as u16;
+    // Cresce com o texto, mas deixa o transcript respirar.
+    let max_rows = (area.height / 3).clamp(1, 6);
+    let input_rows = input_rows.min(max_rows).max(1);
+    let composer_height = if compact {
+        input_rows
+    } else {
+        input_rows.saturating_add(2)
+    }
+    .min(area.height.saturating_sub(2).max(1));
 
     let [history_area, composer_area, details_area] = Layout::vertical([
         Constraint::Min(1),
@@ -462,18 +555,14 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
     let (inner, prompt_x, prompt_y) = if compact {
         (area, area.x, area.y)
     } else {
-        let block = Block::bordered()
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                " mensagem ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         (inner, inner.x, inner.y)
     };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let prompt = Span::styled(
         "› ",
@@ -481,22 +570,57 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    let text = if state.input.is_empty() {
-        Span::styled(
-            "escreva algo…  (/modelos troca o modelo)",
-            Style::default().fg(Color::DarkGray),
-        )
+
+    // Quebra o texto na largura útil; as continuações recuam 2 colunas para
+    // alinhar com o texto depois do prompt.
+    let input_width = inner.width.saturating_sub(2).max(1) as usize;
+    let wrapped = wrap_text(&state.input, input_width);
+    let start = wrapped.len().saturating_sub(inner.height as usize);
+    let visible = &wrapped[start..];
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible.len());
+    if state.input.is_empty() {
+        lines.push(Line::from(vec![
+            prompt.clone(),
+            Span::styled(
+                "escreva algo…  (/modelos troca o modelo)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
     } else {
-        Span::raw(state.input.clone())
+        for (index, chunk) in visible.iter().enumerate() {
+            let prefix = if start + index == 0 {
+                prompt.clone()
+            } else {
+                Span::raw("  ")
+            };
+            lines.push(Line::from(vec![prefix, Span::raw(chunk.clone())]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let cursor_row = if state.input.is_empty() {
+        0
+    } else {
+        wrapped.len().saturating_sub(1).saturating_sub(start) as u16
     };
-
-    frame.render_widget(Paragraph::new(Line::from(vec![prompt, text])), inner);
-
+    let cursor_column = if state.input.is_empty() {
+        0
+    } else {
+        wrapped.last().map_or(0, |line| line.width() as u16)
+    };
+    // No limite da linha o cursor cairia fora da área; encosta na última coluna.
+    let max_x = inner.x.saturating_add(inner.width.saturating_sub(1));
     let cursor_x = prompt_x
         .saturating_add(2)
-        .saturating_add(state.input.width() as u16);
-    if cursor_x < inner.x.saturating_add(inner.width) {
-        frame.set_cursor_position(Position::new(cursor_x, prompt_y));
+        .saturating_add(cursor_column)
+        .min(max_x);
+    let cursor_y = prompt_y.saturating_add(cursor_row);
+    if cursor_x < inner.x.saturating_add(inner.width)
+        && cursor_y < inner.y.saturating_add(inner.height)
+    {
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
 }
 
@@ -693,12 +817,13 @@ fn transcript_rows_at(
             rows.push(Line::from(""));
         }
 
-        let (role, text, metrics) = match entry {
+        let (role, text, metrics, pending) = match entry {
             ChatEntry::Message {
                 role,
                 content,
                 metrics,
-            } => (*role, content.as_str(), metrics.as_ref()),
+            } => (*role, content.as_str(), metrics.as_ref(), false),
+            ChatEntry::Queued { content } => (Role::User, content.as_str(), None, true),
             ChatEntry::Tool {
                 name, summary, ok, ..
             } => {
@@ -725,9 +850,30 @@ fn transcript_rows_at(
                 ]));
                 continue;
             }
+            ChatEntry::Prompt { content } => {
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        "  ◆ ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "prompt enviado",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                for line in plain_rows(content, content_width) {
+                    rows.push(indent_line(line, indent));
+                }
+                continue;
+            }
         };
 
         let (marker, label, color) = match role {
+            Role::User if pending => ("❯", "você · pendente", Color::DarkGray),
             Role::User => ("❯", "você", Color::Cyan),
             Role::Assistant => ("●", "tupi", Color::Green),
             Role::System => ("◆", "sistema", Color::Yellow),
@@ -818,12 +964,13 @@ fn transcript_layout_at(
             owners.push(None);
         }
 
-        let (role, text, metrics) = match entry {
+        let (role, text, metrics, pending) = match entry {
             ChatEntry::Message {
                 role,
                 content,
                 metrics,
-            } => (*role, content.as_str(), metrics.as_ref()),
+            } => (*role, content.as_str(), metrics.as_ref(), false),
+            ChatEntry::Queued { content } => (Role::User, content.as_str(), None, true),
             ChatEntry::Tool {
                 name, summary, ok, ..
             } => {
@@ -851,9 +998,32 @@ fn transcript_layout_at(
                 owners.push(Some(index));
                 continue;
             }
+            ChatEntry::Prompt { content } => {
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        "  ◆ ",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "prompt enviado",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                owners.push(Some(index));
+                for line in plain_rows(content, content_width) {
+                    rows.push(indent_line(line, indent));
+                    owners.push(Some(index));
+                }
+                continue;
+            }
         };
 
         let (marker, label, color) = match role {
+            Role::User if pending => ("❯", "você · pendente", Color::DarkGray),
             Role::User => ("❯", "você", Color::Cyan),
             Role::Assistant => ("●", "tupi", Color::Green),
             Role::System => ("◆", "sistema", Color::Yellow),
@@ -1580,5 +1750,79 @@ mod tests {
         assert!(text.contains("prompt enviado"), "{text}");
         assert!(text.contains("modelo: m"), "{text}");
         assert!(text.contains("[user]"), "{text}");
+    }
+
+    #[test]
+    fn long_prompt_wraps_inside_the_composer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+        let mut state = ChatState::default();
+        state.input = "uma mensagem longa que nao cabe".into();
+
+        terminal
+            .draw(|frame| draw_composer(frame, &state, Rect::new(0, 0, 24, 5), false))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..5)
+            .map(|y| (0..24).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert!(rows[1].contains("uma mensagem longa"), "{rows:?}");
+        assert!(rows[2].contains("que nao cabe"), "{rows:?}");
+        terminal.backend_mut().assert_cursor_position((15, 2));
+    }
+
+    #[test]
+    fn queued_messages_render_as_pending_user_entries() {
+        let lines = vec![ChatEntry::Queued {
+            content: "depois".into(),
+        }];
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("pendente"), "{text}");
+        assert!(text.contains("depois"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn draining_sends_the_queued_message_and_starts_the_turn() {
+        struct Recorder(std::sync::Mutex<Vec<Command>>);
+
+        #[async_trait::async_trait]
+        impl tupi_kernel::CommandHandler for Recorder {
+            async fn handle(&self, command: Command) -> Result<CommandOutcome, CommandError> {
+                self.0.lock().unwrap().push(command);
+                Ok(CommandOutcome::Started {
+                    request_id: Default::default(),
+                })
+            }
+        }
+
+        let handler = std::sync::Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        let bus = tupi_kernel::CommandBus::new(handler.clone());
+        let mut state = ChatState::default();
+        state.enqueue("próxima");
+
+        let request = drain_queue(&bus, &mut state).await;
+
+        assert!(request.is_some());
+        assert!(matches!(state.status, Status::Streaming));
+        assert!(matches!(
+            state.lines.last(),
+            Some(ChatEntry::Message { role: Role::User, content, .. }) if content == "próxima"
+        ));
+        assert!(
+            !state
+                .lines
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Queued { .. }))
+        );
+        assert!(matches!(
+            handler.0.lock().unwrap().as_slice(),
+            [Command::SendMessage { text }] if text == "próxima"
+        ));
     }
 }

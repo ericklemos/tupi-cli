@@ -7,10 +7,22 @@ use crate::CommandError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    SendMessage { text: String },
-    CancelStream { request_id: RequestId },
-    SetModel { model: String },
+    SendMessage {
+        text: String,
+    },
+    CancelStream {
+        request_id: RequestId,
+    },
+    SetModel {
+        model: String,
+    },
     RefreshModels,
+    ToggleShowPrompts,
+    /// `/workflows/<nome> [pedido]`: os passos entram na conversa como turno.
+    RunWorkflow {
+        name: String,
+        extra: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

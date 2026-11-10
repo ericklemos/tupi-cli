@@ -1,0 +1,6 @@
+// Limite de passos de tool call por turno.
+// Cada passo é uma resposta do modelo que pode conter uma ou mais chamadas;
+// ao atingir o limite, as chamadas ainda não executadas são encerradas.
+(
+    max_tool_steps: 100
+)

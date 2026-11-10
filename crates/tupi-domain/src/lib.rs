@@ -1,4 +1,12 @@
-pub mod index;
+pub mod context;
+pub mod tokens;
+mod usage;
+
+pub use usage::Usage;
+
+mod workflow;
+
+pub use workflow::{WORKFLOWS_PREFIX, Workflow, WorkflowSource, parse_workflow_invocation};
 
 pub type SessionId = u64;
 pub type RequestId = u64;
@@ -97,11 +105,20 @@ pub enum Event {
     },
     StreamFinished {
         request_id: RequestId,
+        prompt_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
         completion_tokens: Option<u64>,
     },
     StreamFailed {
         request_id: RequestId,
         message: String,
+    },
+    /// O histórico enviado ao modelo foi podado para caber no orçamento.
+    ContextTrimmed {
+        request_id: RequestId,
+        estimate: usize,
+        omitted_units: usize,
+        shrunk_results: usize,
     },
     PromptMessages {
         request_id: RequestId,

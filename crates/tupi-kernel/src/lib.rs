@@ -6,6 +6,7 @@ mod query;
 mod registry;
 mod tool;
 
+mod workflow;
 pub use command::{Command, CommandBus, CommandHandler, CommandOutcome};
 pub use error::{CommandError, ProviderError, QueryError};
 pub use event::EventBus;
@@ -13,6 +14,7 @@ pub use provider::{ChatRequest, Provider, ProviderEvent, ProviderStream};
 pub use query::{Query, QueryBus, QueryHandler, QueryResult};
 pub use registry::ProviderRegistry;
 pub use tool::{Tool, ToolError, ToolRegistry, ToolSpec};
+pub use workflow::WorkflowIndex;
 
 #[cfg(test)]
 mod tests {
@@ -32,10 +34,14 @@ mod tests {
         let mut rx = bus.subscribe();
         bus.publish(Event::StreamFinished {
             request_id: 1,
+            prompt_tokens: None,
+            cached_tokens: None,
             completion_tokens: None,
         });
         bus.publish(Event::StreamFinished {
             request_id: 2,
+            prompt_tokens: None,
+            cached_tokens: None,
             completion_tokens: None,
         });
         assert!(matches!(

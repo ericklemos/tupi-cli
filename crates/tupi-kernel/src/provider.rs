@@ -32,7 +32,13 @@ impl ChatRequest {
 pub enum ProviderEvent {
     Text(String),
     ToolCalls(Vec<ToolCall>),
-    Usage { completion_tokens: u64 },
+    /// O que o provedor reportou de consumo. Cada campo é opcional porque
+    /// nem todo provedor manda tudo, e nem sempre no mesmo chunk.
+    Usage {
+        prompt_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    },
 }
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;

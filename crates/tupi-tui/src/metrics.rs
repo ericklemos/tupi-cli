@@ -7,6 +7,10 @@ pub struct ReplyMetrics {
     pub finished: Option<Duration>,
     pub estimated_tokens: u64,
     pub remote_tokens: Option<u64>,
+    /// Tokens de entrada do turno, como o provedor reportou.
+    pub prompt_tokens: Option<u64>,
+    /// Quantos desses tokens vieram do cache do provedor.
+    pub cached_tokens: Option<u64>,
 }
 
 impl ReplyMetrics {
@@ -17,6 +21,8 @@ impl ReplyMetrics {
             finished: None,
             estimated_tokens: 0,
             remote_tokens: None,
+            prompt_tokens: None,
+            cached_tokens: None,
         }
     }
 
@@ -71,6 +77,18 @@ impl ReplyMetrics {
                 } else {
                     parts.push(format!("≈{estimated} t/s"));
                 }
+            }
+        }
+
+        if let Some(prompt) = self.prompt_tokens {
+            let cached = self.cached_tokens.unwrap_or(0);
+            let ratio = tupi_domain::Usage::new(prompt, cached, 0).cached_ratio();
+            if compact {
+                parts.push(format!("↑{prompt}"));
+            } else if cached > 0 {
+                parts.push(format!("ctx {prompt} · cache {:.0}%", ratio * 100.0));
+            } else {
+                parts.push(format!("ctx {prompt}"));
             }
         }
 
@@ -176,6 +194,25 @@ mod tests {
         assert_eq!(
             metrics.header(t0 + Duration::from_millis(3_200), false),
             "3,2s · ≈32 t/s"
+        );
+    }
+
+    #[test]
+    fn header_shows_context_and_cache_when_the_provider_reports_them() {
+        let t0 = Instant::now();
+        let mut metrics = ReplyMetrics::start(t0);
+        metrics.prompt_tokens = Some(1_000);
+        metrics.cached_tokens = Some(250);
+        metrics.finish(t0 + Duration::from_secs(1));
+
+        let header = metrics.header(t0 + Duration::from_secs(1), false);
+
+        assert!(header.contains("ctx 1000"), "{header}");
+        assert!(header.contains("cache 25%"), "{header}");
+        assert!(
+            metrics
+                .header(t0 + Duration::from_secs(1), true)
+                .contains("↑1000")
         );
     }
 

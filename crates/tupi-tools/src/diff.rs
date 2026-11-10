@@ -11,7 +11,7 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 use crate::ast::compact_signature;
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::graph::{CallGraph, Def};
+use crate::graph::Def;
 use crate::proc;
 use crate::store::ResponseStore;
 
@@ -162,7 +162,7 @@ impl Tool for DiffTool {
         files.sort();
         files.dedup();
 
-        let graph = CallGraph::build(&root);
+        let graph = crate::graph::GraphCache::shared(&root).get();
         let mut changed: Vec<&Def> = Vec::new();
         let mut seen = HashSet::new();
         for change in &changes {
