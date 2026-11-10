@@ -11,5 +11,6 @@ anyhow.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true
+tui-markdown.workspace = true
 unicode-width.workspace = true
 tokio.workspace = true

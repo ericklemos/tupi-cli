@@ -1,7 +1,23 @@
 # Tupi
 
-Chat de terminal em Rust, com TUI (ratatui) e streaming. Esta é a v1: uma
-conversa por sessão, sem agente, ferramentas ou edição de arquivos.
+Chat de terminal em Rust, com TUI (ratatui), streaming e tool-call de leitura.
+O modelo pode pedir para ler arquivos do projeto sem receber o projeto inteiro;
+edição de arquivos ainda não existe.
+
+## Ferramentas de leitura
+
+O Tupi expõe três tools ao modelo, inspiradas no `brain_tools`:
+
+- **`read`** — devolve o esqueleto de um arquivo (assinaturas, sem corpos) ou o
+  corpo de um símbolo. Segunda leitura do mesmo símbolo, sem mudança, vira um
+  ponteiro; se o símbolo mudou, devolve só o diff.
+- **`read_many`** — lê vários arquivos/símbolos em um lote atômico, com um
+  orçamento de tokens compartilhado.
+- **`peek`** — recupera, por handle, o trecho que não coube no orçamento.
+
+O root das leituras é o diretório onde o Tupi foi aberto. Caminho que escapa
+dele é recusado. A v1 entende AST de Rust; arquivos de outras linguagens caem no
+fallback de conteúdo inteiro, limitado pelo mesmo orçamento.
 
 ## Requisitos
 
@@ -53,9 +69,10 @@ Workspace microkernel + CQRS:
 tupi-domain       tipos puros (Session, Message, Event)
 tupi-kernel       contratos (Provider, buses, registry)
 tupi-providers    um módulo por provedor (deepseek.rs)
-tupi-app          handlers de comando/query + eventos de streaming
+tupi-tools        AST, orçamento, store/peek, ledger e read/read_many
+tupi-app          handlers de comando/query, loop de tools + eventos
 tupi-tui          ratatui: envia comandos, reage a eventos
-tupi              composição: env, registry, app, TUI
+tupi              composição: env, registry, tools, app, TUI
 ```
 
 A TUI não conhece o provider; o provider não conhece a TUI. Só o binário

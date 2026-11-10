@@ -15,6 +15,7 @@ tupi-kernel.workspace = true
 tupi-providers.workspace = true
 tupi-tui.workspace = true
 tupi-store.workspace = true
+tupi-tools.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
 thiserror.workspace = true

@@ -8,5 +8,6 @@ license.workspace = true
 tupi-domain.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

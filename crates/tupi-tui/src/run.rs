@@ -11,7 +11,7 @@ use tupi_domain::{Event, RequestId, Role};
 use tupi_kernel::{Command, CommandBus, CommandError, CommandOutcome, EventBus, QueryBus};
 use unicode_width::UnicodeWidthStr;
 
-use crate::state::{ChatState, Status};
+use crate::state::{ChatEntry, ChatState, Status};
 use crate::terminal::TerminalGuard;
 
 pub struct BusSet {
@@ -169,6 +169,23 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                         state.fail(&message);
                         request = None;
                     }
+                    Ok(Event::ToolStarted {
+                        request_id,
+                        call_id,
+                        name,
+                        summary,
+                        ..
+                    }) if Some(request_id) == request => {
+                        state.push_tool_started(&call_id, &name, &summary);
+                    }
+                    Ok(Event::ToolFinished {
+                        request_id,
+                        call_id,
+                        ok,
+                        ..
+                    }) if Some(request_id) == request => {
+                        state.finish_tool(&call_id, ok);
+                    }
                     Ok(Event::ModelsLoaded { models }) => {
                         state.notice = None;
                         state.open_overlay(format!(" modelos · {provider} "), models);
@@ -222,7 +239,15 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
         ..area
     };
 
-    let rows = transcript_rows(&state.lines, content_area.width, state.processing());
+    let rows = {
+        let mut cache = state.render_cache.borrow_mut();
+        transcript_rows(
+            &state.lines,
+            content_area.width,
+            state.processing(),
+            &mut cache,
+        )
+    };
     let visible = area.height as usize;
     let (start, end) = visible_range(rows.len(), visible, state.scroll);
 
@@ -498,7 +523,12 @@ fn status_label(status: Status) -> &'static str {
     }
 }
 
-fn transcript_rows(lines: &[(Role, String)], width: u16, processing: bool) -> Vec<Line<'static>> {
+fn transcript_rows(
+    lines: &[ChatEntry],
+    width: u16,
+    processing: bool,
+    cache: &mut crate::markdown::Cache,
+) -> Vec<Line<'static>> {
     let area_width = width as usize;
     if area_width < 8 {
         return Vec::new();
@@ -509,15 +539,49 @@ fn transcript_rows(lines: &[(Role, String)], width: u16, processing: bool) -> Ve
     let mut rows: Vec<Line<'static>> = Vec::new();
     rows.push(Line::from(""));
 
-    for (index, (role, text)) in lines.iter().enumerate() {
+    for (index, entry) in lines.iter().enumerate() {
         if index > 0 {
             rows.push(Line::from(""));
         }
+
+        let (role, text) = match entry {
+            ChatEntry::Message { role, content } => (*role, content.as_str()),
+            ChatEntry::Tool {
+                name,
+                summary,
+                ok,
+                ..
+            } => {
+                let (mark, color) = match ok {
+                    Some(true) => ("✓", Color::Green),
+                    Some(false) => ("✗", Color::Red),
+                    None => ("…", Color::DarkGray),
+                };
+                let label = format!("{name} · {summary}");
+                let line = wrap_text(&label, content_width)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        "  ⚙ ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line),
+                    Span::raw(" "),
+                    Span::styled(mark.to_string(), Style::default().fg(color)),
+                ]));
+                continue;
+            }
+        };
 
         let (marker, label, color) = match role {
             Role::User => ("❯", "você", Color::Cyan),
             Role::Assistant => ("●", "tupi", Color::Green),
             Role::System => ("◆", "sistema", Color::Yellow),
+            Role::Tool => ("⚙", "tool", Color::DarkGray),
         };
 
         rows.push(Line::from(vec![
@@ -533,8 +597,9 @@ fn transcript_rows(lines: &[(Role, String)], width: u16, processing: bool) -> Ve
         ]));
 
         let body = match role {
-            Role::Assistant => markdown_rows(text, content_width),
-            _ => plain_rows(text, content_width),
+            Role::User | Role::Assistant => cache.rows(index, text, content_width).to_vec(),
+            Role::System => markdown_rows(text, content_width),
+            Role::Tool => plain_rows(text, content_width),
         };
 
         for line in body {
@@ -729,10 +794,12 @@ fn list_prefix(line: &str) -> Option<(String, &str)> {
         .chars()
         .take_while(|character| character.is_ascii_digit())
         .count();
-    if digits > 0 {
-        if let Some(rest) = line[digits..].strip_prefix(". ") {
-            return Some((format!("{}. ", &line[..digits]), rest));
-        }
+    let ordered = line
+        .get(digits..)
+        .and_then(|rest| rest.strip_prefix(". "))
+        .filter(|_| digits > 0);
+    if let Some(rest) = ordered {
+        return Some((format!("{}. ", &line[..digits]), rest));
     }
 
     None
@@ -810,40 +877,50 @@ fn inline_spans(text: &str) -> Vec<Span<'static>> {
     while index < characters.len() {
         let character = characters[index];
 
-        if character == '`' {
-            if let Some(end) = find_char(&characters, index + 1, '`') {
-                push_plain(&mut spans, &mut plain);
-                let code: String = characters[index + 1..end].iter().collect();
-                spans.push(Span::styled(code, Style::default().fg(Color::Yellow)));
-                index = end + 1;
-                continue;
-            }
+        let code_end = if character == '`' {
+            find_char(&characters, index + 1, '`')
+        } else {
+            None
+        };
+        if let Some(end) = code_end {
+            push_plain(&mut spans, &mut plain);
+            let code: String = characters[index + 1..end].iter().collect();
+            spans.push(Span::styled(code, Style::default().fg(Color::Yellow)));
+            index = end + 1;
+            continue;
         }
 
-        if character == '*' && index + 1 < characters.len() && characters[index + 1] == '*' {
-            if let Some(end) = find_double_star(&characters, index + 2) {
-                push_plain(&mut spans, &mut plain);
-                let bold: String = characters[index + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                index = end + 2;
-                continue;
-            }
+        let bold_end =
+            if character == '*' && index + 1 < characters.len() && characters[index + 1] == '*' {
+                find_double_star(&characters, index + 2)
+            } else {
+                None
+            };
+        if let Some(end) = bold_end {
+            push_plain(&mut spans, &mut plain);
+            let bold: String = characters[index + 2..end].iter().collect();
+            spans.push(Span::styled(
+                bold,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            index = end + 2;
+            continue;
         }
 
-        if character == '*' {
-            if let Some(end) = find_single_star(&characters, index + 1) {
-                push_plain(&mut spans, &mut plain);
-                let italic: String = characters[index + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    italic,
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
-                index = end + 1;
-                continue;
-            }
+        let italic_end = if character == '*' {
+            find_single_star(&characters, index + 1)
+        } else {
+            None
+        };
+        if let Some(end) = italic_end {
+            push_plain(&mut spans, &mut plain);
+            let italic: String = characters[index + 1..end].iter().collect();
+            spans.push(Span::styled(
+                italic,
+                Style::default().add_modifier(Modifier::ITALIC),
+            ));
+            index = end + 1;
+            continue;
         }
 
         plain.push(character);
@@ -985,13 +1062,17 @@ mod tests {
         row.spans.iter().map(|span| span.content.as_ref()).collect()
     }
 
+    fn message(role: Role, text: &str) -> ChatEntry {
+        ChatEntry::Message {
+            role,
+            content: text.to_string(),
+        }
+    }
+
     #[test]
     fn transcript_marks_user_and_assistant_messages() {
-        let lines = vec![
-            (Role::User, "oi".to_string()),
-            (Role::Assistant, "olá".to_string()),
-        ];
-        let rows = transcript_rows(&lines, 40, false);
+        let lines = vec![message(Role::User, "oi"), message(Role::Assistant, "olá")];
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
         let texts = rows.iter().map(row_text).collect::<Vec<_>>();
 
         assert!(texts.iter().any(|text| text.starts_with("❯")));
@@ -1001,12 +1082,25 @@ mod tests {
     }
 
     #[test]
+    fn user_messages_render_markdown() {
+        let lines = vec![message(Role::User, "# Título\n\nisso é **forte**")];
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("Título"));
+        assert!(!text.contains('#'));
+        assert!(rows.iter().flat_map(|row| row.spans.iter()).any(|span| {
+            span.content == "forte" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
     fn wide_characters_stay_within_width() {
         let lines = vec![
-            (Role::User, "😀😀😀😀😀".to_string()),
-            (Role::Assistant, "resposta ✅ com emoji 🚀".to_string()),
+            message(Role::User, "😀😀😀😀😀"),
+            message(Role::Assistant, "resposta ✅ com emoji 🚀"),
         ];
-        let rows = transcript_rows(&lines, 40, false);
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
 
         for row in &rows {
             assert!(row.width() <= 40, "linha larga: {}", row_text(row));
@@ -1015,11 +1109,30 @@ mod tests {
 
     #[test]
     fn processing_line_appears_while_waiting() {
-        let lines = vec![(Role::User, "oi".to_string())];
-        let rows = transcript_rows(&lines, 40, true);
+        let lines = vec![message(Role::User, "oi")];
+        let rows = transcript_rows(&lines, 40, true, &mut crate::markdown::Cache::default());
         let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
 
         assert!(text.contains("processando..."));
+    }
+
+    #[test]
+    fn tool_entries_render_as_a_compact_line() {
+        let lines = vec![
+            message(Role::User, "leia"),
+            ChatEntry::Tool {
+                call_id: "c1".into(),
+                name: "read".into(),
+                summary: "src/a.rs".into(),
+                ok: Some(true),
+            },
+        ];
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("read · src/a.rs"), "{text}");
+        assert!(text.contains('✓'), "{text}");
+        assert!(text.contains('⚙'), "{text}");
     }
 
     #[test]

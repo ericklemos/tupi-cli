@@ -17,6 +17,10 @@ impl SessionStore {
         self.inner.lock().unwrap().push(role, content);
     }
 
+    pub fn push_message(&self, message: Message) {
+        self.inner.lock().unwrap().messages.push(message);
+    }
+
     pub fn push_assistant_once(&self, content: &str) {
         let mut session = self.inner.lock().unwrap();
         let duplicate = session

@@ -1,14 +1,15 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::stream::unfold;
+use tupi_domain::ToolCall;
 use tupi_kernel::{
     ChatRequest, Provider, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
 };
 
-use crate::sse::{SseParser, extract_delta, is_done};
+use crate::sse::{extract_chunk, is_done, SseParser, ToolCallDelta};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,10 +41,60 @@ impl DeepSeekProvider {
     }
 }
 
+#[derive(Default)]
+struct CallBuilder {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// Remonta `tool_calls` fragmentados no stream, por índice.
+#[derive(Default)]
+pub(crate) struct ToolCallAccumulator {
+    calls: BTreeMap<usize, CallBuilder>,
+}
+
+impl ToolCallAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn merge(&mut self, delta: ToolCallDelta) {
+        let builder = self.calls.entry(delta.index).or_default();
+        if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
+            builder.id = Some(id);
+        }
+        if let Some(name) = delta.name {
+            builder.name.push_str(&name);
+        }
+        if let Some(arguments) = delta.arguments {
+            builder.arguments.push_str(&arguments);
+        }
+    }
+
+    /// Devolve as calls completas, em ordem de índice, e esvazia o acumulador.
+    pub fn finish(&mut self) -> Option<Vec<ToolCall>> {
+        if self.calls.is_empty() {
+            return None;
+        }
+
+        let calls: Vec<ToolCall> = std::mem::take(&mut self.calls)
+            .into_iter()
+            .map(|(index, builder)| ToolCall {
+                id: builder.id.unwrap_or_else(|| format!("call_{index}")),
+                name: builder.name,
+                arguments: builder.arguments,
+            })
+            .collect();
+        Some(calls)
+    }
+}
+
 struct StreamState {
     response: reqwest::Response,
     parser: SseParser,
     pending: VecDeque<String>,
+    calls: ToolCallAccumulator,
     done: bool,
 }
 
@@ -100,6 +151,7 @@ impl Provider for DeepSeekProvider {
             response,
             parser: SseParser::new(),
             pending: VecDeque::new(),
+            calls: ToolCallAccumulator::new(),
             done: false,
         };
 
@@ -107,17 +159,41 @@ impl Provider for DeepSeekProvider {
             loop {
                 if let Some(payload) = state.pending.pop_front() {
                     if is_done(&payload) {
+                        if let Some(calls) = state.calls.finish() {
+                            return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
+                        }
                         return None;
                     }
 
-                    match extract_delta(&payload) {
-                        Ok(Some(text)) => return Some((Ok(ProviderEvent::Text(text)), state)),
-                        Ok(None) => continue,
+                    match extract_chunk(&payload) {
+                        Ok(chunk) => {
+                            for delta in chunk.tool_calls {
+                                state.calls.merge(delta);
+                            }
+                            if let Some(completion_tokens) = chunk.usage {
+                                return Some((
+                                    Ok(ProviderEvent::Usage { completion_tokens }),
+                                    state,
+                                ));
+                            }
+                            if let Some(text) = chunk.text {
+                                return Some((Ok(ProviderEvent::Text(text)), state));
+                            }
+                            if chunk.finish_reason.is_some()
+                                && let Some(calls) = state.calls.finish()
+                            {
+                                return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
+                            }
+                            continue;
+                        }
                         Err(error) => return Some((Err(error), state)),
                     }
                 }
 
                 if state.done {
+                    if let Some(calls) = state.calls.finish() {
+                        return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
+                    }
                     return None;
                 }
 
@@ -148,18 +224,63 @@ pub fn build_body(request: &ChatRequest) -> serde_json::Value {
         .messages
         .iter()
         .map(|message| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "role": message.role.as_str(),
                 "content": message.content,
-            })
+            });
+
+            if !message.tool_calls.is_empty() {
+                let calls: Vec<serde_json::Value> = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            }
+                        })
+                    })
+                    .collect();
+                value["tool_calls"] = serde_json::Value::Array(calls);
+            }
+
+            if let Some(call_id) = &message.tool_call_id {
+                value["tool_call_id"] = serde_json::Value::String(call_id.clone());
+            }
+
+            value
         })
         .collect();
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
         "stream": true,
-    })
+        "stream_options": { "include_usage": true },
+    });
+
+    if !request.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::Value::Array(tools);
+    }
+
+    body
 }
 
 pub fn parse_models(body: &str) -> Result<Vec<String>, ProviderError> {
@@ -189,23 +310,18 @@ pub fn register_all(registry: &mut ProviderRegistry, api_key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tupi_domain::{Message, Role};
+    use tupi_domain::Message;
     use tupi_kernel::{ChatRequest, ProviderRegistry};
 
     #[test]
     fn body_has_model_messages_and_stream() {
-        let request = ChatRequest {
-            model: "deepseek-flash".into(),
-            messages: vec![Message {
-                role: Role::User,
-                content: "oi".into(),
-            }],
-        };
+        let request = ChatRequest::new("deepseek-flash", vec![Message::user("oi")]);
 
         let body = build_body(&request);
 
         assert_eq!(body["model"], "deepseek-flash");
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "oi");
         assert!(body.get("thinking").is_none());
@@ -242,5 +358,129 @@ mod tests {
     fn parse_models_without_data_is_protocol_error() {
         let error = parse_models("{}").unwrap_err();
         assert!(matches!(error, ProviderError::Protocol(_)));
+    }
+
+    use crate::sse::ToolCallDelta;
+    use tupi_domain::ToolCall;
+    use tupi_kernel::ToolSpec;
+
+    fn read_spec() -> ToolSpec {
+        ToolSpec {
+            name: "read".into(),
+            description: "lê".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn body_includes_tools_when_present() {
+        let request =
+            ChatRequest::new("deepseek-flash", vec![Message::user("oi")]).with_tools(vec![read_spec()]);
+        let body = build_body(&request);
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn body_omits_tools_when_empty() {
+        let request = ChatRequest::new("deepseek-flash", vec![Message::user("oi")]);
+        let body = build_body(&request);
+
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn assistant_tool_calls_are_serialized() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{\"path\":\"a.rs\"}".into(),
+        };
+        let request = ChatRequest::new(
+            "deepseek-flash",
+            vec![Message::assistant_with_calls("", vec![call])],
+        );
+        let body = build_body(&request);
+
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a.rs\"}"
+        );
+    }
+
+    #[test]
+    fn tool_message_serializes_call_id() {
+        let request = ChatRequest::new(
+            "deepseek-flash",
+            vec![Message::tool("c1", "resultado")],
+        );
+        let body = build_body(&request);
+
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(body["messages"][0]["tool_call_id"], "c1");
+        assert_eq!(body["messages"][0]["content"], "resultado");
+    }
+
+    #[test]
+    fn accumulator_reassembles_fragmented_arguments() {
+        let mut accumulator = ToolCallAccumulator::new();
+        accumulator.merge(ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read".into()),
+            arguments: Some("{\"path\":\"a".into()),
+        });
+        accumulator.merge(ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments: Some(".rs\"}".into()),
+        });
+
+        let calls = accumulator.finish().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.rs\"}");
+        assert!(accumulator.finish().is_none());
+    }
+
+    #[test]
+    fn accumulator_orders_calls_by_index() {
+        let mut accumulator = ToolCallAccumulator::new();
+        accumulator.merge(ToolCallDelta {
+            index: 1,
+            id: Some("b".into()),
+            name: Some("second".into()),
+            arguments: Some("{}".into()),
+        });
+        accumulator.merge(ToolCallDelta {
+            index: 0,
+            id: Some("a".into()),
+            name: Some("first".into()),
+            arguments: Some("{}".into()),
+        });
+
+        let calls = accumulator.finish().unwrap();
+        assert_eq!(calls[0].name, "first");
+        assert_eq!(calls[1].name, "second");
+    }
+
+    #[test]
+    fn accumulator_generates_an_id_when_the_provider_omits_it() {
+        let mut accumulator = ToolCallAccumulator::new();
+        accumulator.merge(ToolCallDelta {
+            index: 3,
+            id: None,
+            name: Some("read".into()),
+            arguments: Some("{}".into()),
+        });
+
+        let calls = accumulator.finish().unwrap();
+        assert_eq!(calls[0].id, "call_3");
     }
 }

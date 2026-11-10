@@ -8,6 +8,7 @@ license.workspace = true
 tupi-domain.workspace = true
 tupi-kernel.workspace = true
 tupi-store.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
@@ -15,8 +16,12 @@ tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tupi-domain.workspace = true
 tupi-kernel.workspace = true
+tupi-tools.workspace = true
+tupi-providers.workspace = true
+tempfile.workspace = true

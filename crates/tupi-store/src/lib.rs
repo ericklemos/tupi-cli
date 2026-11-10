@@ -48,10 +48,11 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         let db = redb::Database::create(path)
@@ -63,6 +64,8 @@ impl Store {
     }
 
     pub fn models(&self, provider_id: &str) -> Result<Option<CachedModels>, StoreError> {
+        use redb::ReadableDatabase;
+
         let tx = self
             .db
             .begin_read()
@@ -190,6 +193,8 @@ mod tests {
     }
 
     fn read_schema_version_with_redb(path: &Path) -> u64 {
+        use redb::ReadableDatabase;
+
         let db = redb::Database::create(path).unwrap();
         let tx = db.begin_read().unwrap();
         let table = tx.open_table(META).unwrap();

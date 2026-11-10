@@ -15,9 +15,23 @@ pub struct Overlay {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatEntry {
+    Message {
+        role: tupi_domain::Role,
+        content: String,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        summary: String,
+        ok: Option<bool>,
+    },
+}
+
 #[derive(Debug, Default)]
 pub struct ChatState {
-    pub lines: Vec<(tupi_domain::Role, String)>,
+    pub lines: Vec<ChatEntry>,
     pub input: String,
     pub status: Status,
     pub scroll: u16,
@@ -25,12 +39,16 @@ pub struct ChatState {
     pub overlay: Option<Overlay>,
     pub suggestions: Option<Vec<String>>,
     pub suggestion_index: usize,
+    pub(crate) render_cache: std::cell::RefCell<crate::markdown::Cache>,
     streaming_index: Option<usize>,
 }
 
 impl ChatState {
     pub fn push_user(&mut self, text: &str) {
-        self.lines.push((tupi_domain::Role::User, text.to_string()));
+        self.lines.push(ChatEntry::Message {
+            role: tupi_domain::Role::User,
+            content: text.to_string(),
+        });
         self.notice = None;
     }
 
@@ -44,16 +62,41 @@ impl ChatState {
         let index = match self.streaming_index {
             Some(index) => index,
             None => {
-                self.lines
-                    .push((tupi_domain::Role::Assistant, String::new()));
+                self.lines.push(ChatEntry::Message {
+                    role: tupi_domain::Role::Assistant,
+                    content: String::new(),
+                });
                 let index = self.lines.len() - 1;
                 self.streaming_index = Some(index);
                 index
             }
         };
 
-        if let Some((_, line)) = self.lines.get_mut(index) {
-            line.push_str(token);
+        if let Some(ChatEntry::Message { content, .. }) = self.lines.get_mut(index) {
+            content.push_str(token);
+        }
+    }
+
+    /// Uma tool começa: a bolha em stream termina e a chamada vira uma linha.
+    /// `summary` já vem descrito pela tool (ex.: `path=a.rs · symbol=new`).
+    pub fn push_tool_started(&mut self, call_id: &str, name: &str, summary: &str) {
+        self.streaming_index = None;
+        self.lines.push(ChatEntry::Tool {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            summary: compact_summary(summary),
+            ok: None,
+        });
+    }
+
+    pub fn finish_tool(&mut self, call_id: &str, ok: bool) {
+        if let Some(ChatEntry::Tool { ok: slot, .. }) = self
+            .lines
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, ChatEntry::Tool { call_id: id, .. } if id == call_id))
+        {
+            *slot = Some(ok);
         }
     }
 
@@ -94,21 +137,23 @@ impl ChatState {
     }
 
     pub fn overlay_next(&mut self) {
-        if let Some(overlay) = &mut self.overlay {
-            if !overlay.items.is_empty() {
-                overlay.selected = (overlay.selected + 1) % overlay.items.len();
-            }
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        if !overlay.items.is_empty() {
+            overlay.selected = (overlay.selected + 1) % overlay.items.len();
         }
     }
 
     pub fn overlay_prev(&mut self) {
-        if let Some(overlay) = &mut self.overlay {
-            if !overlay.items.is_empty() {
-                overlay.selected = overlay
-                    .selected
-                    .checked_sub(1)
-                    .unwrap_or(overlay.items.len() - 1);
-            }
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        if !overlay.items.is_empty() {
+            overlay.selected = overlay
+                .selected
+                .checked_sub(1)
+                .unwrap_or(overlay.items.len() - 1);
         }
     }
 
@@ -159,21 +204,23 @@ impl ChatState {
     }
 
     pub fn suggestion_next(&mut self) {
-        if let Some(suggestions) = &self.suggestions {
-            if !suggestions.is_empty() {
-                self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
-            }
+        let Some(suggestions) = &self.suggestions else {
+            return;
+        };
+        if !suggestions.is_empty() {
+            self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
         }
     }
 
     pub fn suggestion_prev(&mut self) {
-        if let Some(suggestions) = &self.suggestions {
-            if !suggestions.is_empty() {
-                self.suggestion_index = self
-                    .suggestion_index
-                    .checked_sub(1)
-                    .unwrap_or(suggestions.len() - 1);
-            }
+        let Some(suggestions) = &self.suggestions else {
+            return;
+        };
+        if !suggestions.is_empty() {
+            self.suggestion_index = self
+                .suggestion_index
+                .checked_sub(1)
+                .unwrap_or(suggestions.len() - 1);
         }
     }
 
@@ -185,9 +232,25 @@ impl ChatState {
     }
 }
 
+fn compact_summary(summary: &str) -> String {
+    let flat = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(60).collect();
+    if flat.chars().count() > 60 {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content(entry: &ChatEntry) -> &str {
+        match entry {
+            ChatEntry::Message { content, .. } => content,
+            ChatEntry::Tool { .. } => panic!("esperava mensagem"),
+        }
+    }
 
     #[test]
     fn tokens_accumulate_and_finish_sets_idle() {
@@ -197,7 +260,7 @@ mod tests {
         state.append_token("olá");
         state.append_token(", mundo");
 
-        assert_eq!(state.lines.last().unwrap().1, "olá, mundo");
+        assert_eq!(content(state.lines.last().unwrap()), "olá, mundo");
 
         state.finish_assistant();
         assert_eq!(state.status, Status::Idle);
@@ -215,7 +278,7 @@ mod tests {
         state.append_token("oi");
 
         assert_eq!(state.lines.len(), 1);
-        assert_eq!(state.lines[0].1, "oi");
+        assert_eq!(content(&state.lines[0]), "oi");
         assert!(!state.processing());
     }
 
@@ -228,8 +291,57 @@ mod tests {
         state.fail("conexão caiu");
 
         assert_eq!(state.status, Status::Idle);
-        assert_eq!(state.lines.last().unwrap().1, "parcial");
+        assert_eq!(content(state.lines.last().unwrap()), "parcial");
         assert_eq!(state.notice.as_deref(), Some("conexão caiu"));
+    }
+
+    #[test]
+    fn tool_start_closes_the_streaming_bubble_and_adds_a_line() {
+        let mut state = ChatState::default();
+        state.begin_assistant();
+        state.append_token("vou ler");
+        state.push_tool_started("c1", "read", "path=a.rs · symbol=new");
+
+        assert_eq!(state.lines.len(), 2);
+        match &state.lines[1] {
+            ChatEntry::Tool {
+                call_id,
+                name,
+                summary,
+                ok,
+            } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "read");
+                assert_eq!(summary, "path=a.rs · symbol=new");
+                assert_eq!(*ok, None);
+            }
+            other => panic!("esperava tool, veio {other:?}"),
+        }
+
+        state.append_token("pronto");
+        assert_eq!(state.lines.len(), 3);
+        assert_eq!(content(state.lines.last().unwrap()), "pronto");
+    }
+
+    #[test]
+    fn finish_tool_updates_only_the_matching_call() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "read", "path=a.rs");
+        state.push_tool_started("c2", "peek", "handle=h_1");
+
+        state.finish_tool("c1", true);
+
+        match &state.lines[0] {
+            ChatEntry::Tool { ok, summary, .. } => {
+                assert_eq!(*ok, Some(true));
+                assert_eq!(summary, "path=a.rs");
+            }
+            other => panic!("esperava tool, veio {other:?}"),
+        }
+        assert!(matches!(
+            &state.lines[1],
+            ChatEntry::Tool { ok: None, .. }
+        ));
     }
 
     #[test]

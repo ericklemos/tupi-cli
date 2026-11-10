@@ -4,6 +4,7 @@ mod event;
 mod provider;
 mod query;
 mod registry;
+mod tool;
 
 pub use command::{Command, CommandBus, CommandHandler, CommandOutcome};
 pub use error::{CommandError, ProviderError, QueryError};
@@ -11,6 +12,7 @@ pub use event::EventBus;
 pub use provider::{ChatRequest, Provider, ProviderEvent, ProviderStream};
 pub use query::{Query, QueryBus, QueryHandler, QueryResult};
 pub use registry::ProviderRegistry;
+pub use tool::{Tool, ToolError, ToolRegistry, ToolSpec};
 
 #[cfg(test)]
 mod tests {

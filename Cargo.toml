@@ -7,6 +7,7 @@ members = [
     "crates/tupi-app",
     "crates/tupi-tui",
     "crates/tupi-store",
+    "crates/tupi-tools",
     "crates/tupi",
 ]
 
@@ -22,6 +23,7 @@ tupi-providers = { path = "crates/tupi-providers" }
 tupi-app = { path = "crates/tupi-app" }
 tupi-tui = { path = "crates/tupi-tui" }
 tupi-store = { path = "crates/tupi-store" }
+tupi-tools = { path = "crates/tupi-tools" }
 
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
@@ -35,8 +37,13 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "s
 thiserror = "2.0.21"
 anyhow = "1"
 ratatui = "0.30.2"
+tui-markdown = "0.3.13"
 unicode-width = "0.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+blake3 = "1.5"
+tempfile = "3.10"

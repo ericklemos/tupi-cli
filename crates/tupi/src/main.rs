@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
 use tupi_app::App;
-use tupi_kernel::{CommandBus, EventBus, ProviderRegistry, QueryBus};
+use tupi_kernel::{CommandBus, EventBus, ProviderRegistry, QueryBus, ToolRegistry};
 use tupi_providers::deepseek;
 use tupi_tui::{BusSet, run};
 
@@ -30,12 +31,17 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         };
-    let app = App::with_store(
+    let root = tool_root()?;
+    let mut tools = ToolRegistry::new();
+    tupi_tools::register(root, &mut tools);
+
+    let app = App::with_tools(
         registry,
         provider.clone(),
         config.model.clone(),
         events.clone(),
         store,
+        tools,
     );
 
     let buses = BusSet {
@@ -46,6 +52,12 @@ async fn main() -> anyhow::Result<()> {
 
     run(buses, config.model, provider).await?;
     Ok(())
+}
+
+fn tool_root() -> anyhow::Result<PathBuf> {
+    let root = std::env::current_dir().context("não foi possível obter o diretório atual")?;
+    root.canonicalize()
+        .context("não foi possível resolver o diretório atual")
 }
 
 fn init_tracing(filter: &str) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -108,6 +120,13 @@ fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_root_is_absolute_and_exists() {
+        let root = tool_root().expect("root");
+        assert!(root.is_absolute());
+        assert!(root.exists());
+    }
 
     #[test]
     fn data_dir_uses_home() {
