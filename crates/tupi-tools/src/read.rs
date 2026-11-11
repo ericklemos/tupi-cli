@@ -44,6 +44,7 @@ pub struct ReadTool {
     pub(crate) store: Arc<ResponseStore>,
     ledger: Arc<DeliveryLedger>,
     default_budget_tokens: usize,
+    chunker: AstChunker,
 }
 
 impl ReadTool {
@@ -58,7 +59,13 @@ impl ReadTool {
             store,
             ledger,
             default_budget_tokens,
+            chunker: AstChunker::new(),
         }
+    }
+
+    pub fn with_parse_cache(mut self, cache: Arc<crate::graph::ParseCache>) -> Self {
+        self.chunker = AstChunker::with_cache(cache);
+        self
     }
 
     pub fn read(&self, params: ReadParams) -> Result<String, ToolError> {
@@ -234,7 +241,7 @@ impl ReadTool {
     }
 
     fn outline_sections(&self, path: &Path, content: &str, relative: &str) -> Vec<Rendered> {
-        let snippets = AstChunker::new().snippets(path, content);
+        let snippets = self.chunker.snippets(path, content);
         if snippets.is_empty() {
             return vec![Rendered {
                 section: whole_file_section(content, relative),
@@ -290,7 +297,7 @@ impl ReadTool {
         symbol: &str,
         repeat_allowed: bool,
     ) -> Result<Vec<Rendered>, ToolError> {
-        let snippets = AstChunker::new().snippets(path, content);
+        let snippets = self.chunker.snippets(path, content);
         let file_hash = ledger::content_hash(content);
         let hash = ledger::short_hash(&file_hash);
 

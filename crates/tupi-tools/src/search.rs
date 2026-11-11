@@ -71,6 +71,7 @@ pub struct SearchTool {
     pub(crate) store: Arc<ResponseStore>,
     ledger: Arc<DeliveryLedger>,
     default_budget_tokens: usize,
+    chunker: AstChunker,
 }
 
 impl SearchTool {
@@ -86,7 +87,13 @@ impl SearchTool {
             store,
             ledger,
             default_budget_tokens,
+            chunker: AstChunker::new(),
         }
+    }
+
+    pub fn with_parse_cache(mut self, cache: Arc<crate::graph::ParseCache>) -> Self {
+        self.chunker = AstChunker::with_cache(cache);
+        self
     }
 
     pub fn search(&self, params: SearchParams) -> Result<String, ToolError> {
@@ -121,7 +128,7 @@ impl SearchTool {
                 .push(found.line_number);
         }
 
-        let chunker = AstChunker::new();
+        let chunker = &self.chunker;
         let mut candidates = Vec::new();
         for (path, lines) in by_file {
             let Ok(content) = std::fs::read_to_string(&path) else {

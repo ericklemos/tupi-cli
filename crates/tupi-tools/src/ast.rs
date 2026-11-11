@@ -1,6 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
+
+use crate::graph::ParseCache;
 
 /// Linguagem de código que o AST entende.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,18 +40,31 @@ pub struct AstSnippet {
 }
 
 #[derive(Default, Clone)]
-pub struct AstChunker;
+pub struct AstChunker {
+    cache: Option<Arc<ParseCache>>,
+}
 
 impl AstChunker {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_cache(cache: Arc<ParseCache>) -> Self {
+        Self { cache: Some(cache) }
+    }
+
+    fn tree(&self, path: &Path, content: &str, language: Language) -> Option<Arc<Tree>> {
+        match &self.cache {
+            Some(cache) => cache.parse(path, language, content),
+            None => parse_language(path, content, language).map(Arc::new),
+        }
     }
 
     pub fn snippets(&self, path: &Path, content: &str) -> Vec<AstSnippet> {
         let Some(language) = Language::from_path(path) else {
             return Vec::new();
         };
-        let Some(tree) = parse_language(path, content, language) else {
+        let Some(tree) = self.tree(path, content, language) else {
             return Vec::new();
         };
 
@@ -71,7 +87,7 @@ impl AstChunker {
         let Some(language) = Language::from_path(path) else {
             return Vec::new();
         };
-        let Some(tree) = parse_language(path, content, language) else {
+        let Some(tree) = self.tree(path, content, language) else {
             return Vec::new();
         };
 

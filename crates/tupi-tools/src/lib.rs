@@ -1,4 +1,4 @@
-mod ast;
+pub mod ast;
 mod budget;
 mod edit;
 mod ledger;
@@ -118,21 +118,28 @@ pub fn register_with(
         crate::ledger::DEFAULT_MAX_BYTES,
     ));
     let graph = crate::graph::GraphCache::shared(&root_dir);
-    let read = Arc::new(ReadTool::new(
-        root_dir.clone(),
-        store.clone(),
-        ledger.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    ));
+    let parse_cache = Arc::new(crate::graph::ParseCache::new());
+    let read = Arc::new(
+        ReadTool::new(
+            root_dir.clone(),
+            store.clone(),
+            ledger.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_parse_cache(parse_cache.clone()),
+    );
 
     registry.register(read.clone());
     registry.register(Arc::new(ReadManyTool::new(read)));
-    registry.register(Arc::new(SearchTool::new(
-        root_dir.clone(),
-        store.clone(),
-        ledger,
-        DEFAULT_BUDGET_TOKENS,
-    )));
+    registry.register(Arc::new(
+        SearchTool::new(
+            root_dir.clone(),
+            store.clone(),
+            ledger,
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_parse_cache(parse_cache),
+    ));
     registry.register(Arc::new(WorkflowTool::new(
         root_dir.clone(),
         store.clone(),
