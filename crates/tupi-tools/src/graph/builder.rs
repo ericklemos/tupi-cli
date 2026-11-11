@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use petgraph::stable_graph::NodeIndex;
@@ -9,6 +10,7 @@ use tupi_kernel::ToolError;
 
 use crate::ast::{AstChunker, Language};
 use crate::graph::model::{ProjectCodeGraph, RelationEdge, RelationKind, SymbolNode};
+use crate::graph::parse_cache::ParseCache;
 use crate::graph::queries::GraphQueries;
 use crate::graph::scope::{
     CallSite, FileScope, ImportTarget, Resolution, ScopeResolver, UseItem, crate_name_for,
@@ -17,26 +19,49 @@ use crate::graph::scope::{
 
 pub struct GraphBuilder {
     queries: GraphQueries,
+    cache: Option<Arc<ParseCache>>,
 }
 
 struct ParsedFile {
     relative: PathBuf,
     content: String,
     language: Language,
-    tree: Option<tree_sitter::Tree>,
+    tree: Option<Arc<tree_sitter::Tree>>,
 }
 
 impl GraphBuilder {
     pub fn new() -> Result<Self, ToolError> {
         Ok(Self {
             queries: GraphQueries::new()?,
+            cache: None,
         })
+    }
+
+    pub fn with_parse_cache(mut self, cache: Arc<ParseCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    fn parse_tree(
+        &self,
+        path: &Path,
+        content: &str,
+        language: Language,
+    ) -> Option<Arc<tree_sitter::Tree>> {
+        match &self.cache {
+            Some(cache) => cache.parse(path, language, content),
+            None => parse(content, language).map(Arc::new),
+        }
     }
 
     pub fn build(&self, root: &Path) -> Result<ProjectCodeGraph, ToolError> {
         let files = collect_files(root)?;
         let mut graph = ProjectCodeGraph::new();
         let mut parsed = Vec::new();
+        let chunker = match &self.cache {
+            Some(cache) => AstChunker::with_cache(cache.clone()),
+            None => AstChunker::new(),
+        };
 
         for path in files {
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -53,7 +78,7 @@ impl GraphBuilder {
                 .resolver
                 .register_file(&relative, &crate_name_for(&relative));
 
-            let snippets = AstChunker::new().snippets(&path, &content);
+            let snippets = chunker.snippets(&path, &content);
             for snippet in snippets {
                 let is_callable =
                     snippet.signature.contains("fn ") || snippet.signature.contains("fun ");
@@ -83,7 +108,7 @@ impl GraphBuilder {
             }
 
             parsed.push(ParsedFile {
-                tree: parse(&content, language),
+                tree: self.parse_tree(&path, &content, language),
                 relative,
                 content,
                 language,
@@ -195,6 +220,7 @@ impl GraphBuilder {
             }
         }
 
+        graph.rebuild_defs();
         Ok(graph)
     }
 }

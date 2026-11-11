@@ -156,7 +156,7 @@ impl Tool for ContextTool {
                         callers.push(caller);
                     }
                 }
-                for callee in graph.callees(def) {
+                for callee in graph.callees(&def.name) {
                     if seen.insert((callee.qualified.as_str(), callee.relative.as_str())) {
                         callees.push(callee);
                     }

@@ -117,8 +117,8 @@ pub fn register_with(
         crate::ledger::DEFAULT_ENTRIES,
         crate::ledger::DEFAULT_MAX_BYTES,
     ));
-    let graph = crate::graph::GraphCache::shared(&root_dir);
     let parse_cache = Arc::new(crate::graph::ParseCache::new());
+    let graph = crate::graph::GraphCache::shared_with_parse_cache(&root_dir, parse_cache.clone());
     let read = Arc::new(
         ReadTool::new(
             root_dir.clone(),
@@ -146,7 +146,7 @@ pub fn register_with(
         DEFAULT_BUDGET_TOKENS,
     )));
     registry.register(Arc::new(crate::pipeline::PipelineTool));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(EditTool::new(
             root_dir.clone(),
             store.clone(),
@@ -154,7 +154,7 @@ pub fn register_with(
         )),
         graph.clone(),
     )));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::write::WriteTool::new(
             root_dir.clone(),
             store.clone(),
@@ -162,7 +162,7 @@ pub fn register_with(
         )),
         graph.clone(),
     )));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::write_many::WriteManyTool::new(
             root_dir.clone(),
             store.clone(),
@@ -170,7 +170,7 @@ pub fn register_with(
         )),
         graph.clone(),
     )));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::relocate::MoveTool::new(
             root_dir.clone(),
             store.clone(),
@@ -178,7 +178,7 @@ pub fn register_with(
         )),
         graph.clone(),
     )));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::patch::PatchTool::new(
             root_dir.clone(),
             store.clone(),
@@ -196,7 +196,7 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::graph::InvalidatingTool::new(
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::shell::ShellTool::new(
             root_dir.clone(),
             store.clone(),
