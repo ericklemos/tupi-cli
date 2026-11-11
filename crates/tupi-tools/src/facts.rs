@@ -102,17 +102,31 @@ impl FactsTool {
         }
     }
 
-    #[cfg(test)]
-    fn with_state_dir(root_dir: PathBuf, state_dir: PathBuf) -> Self {
+    pub(crate) fn with_state_dir_and_store(
+        root_dir: PathBuf,
+        store: Arc<ResponseStore>,
+        state_dir: PathBuf,
+        default_budget_tokens: usize,
+    ) -> Self {
         Self {
             root_dir,
-            store: Arc::new(ResponseStore::new(
+            store,
+            state_dir,
+            default_budget_tokens,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_state_dir(root_dir: PathBuf, state_dir: PathBuf) -> Self {
+        Self::with_state_dir_and_store(
+            root_dir,
+            Arc::new(ResponseStore::new(
                 std::time::Duration::from_secs(60),
                 1 << 20,
             )),
             state_dir,
-            default_budget_tokens: 4000,
-        }
+            4000,
+        )
     }
 
     fn path(&self) -> PathBuf {

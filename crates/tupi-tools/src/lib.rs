@@ -61,7 +61,54 @@ mod why;
 mod workflow;
 mod write;
 mod write_many;
+/// Opções de composição das tools.
+#[derive(Debug, Clone)]
+pub struct ToolsOptions {
+    /// Diretório de estado durável. `None` usa o padrão XDG do Tupi.
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Liga o watcher do grafo.
+    pub watcher: bool,
+    /// Liga o cache persistente de `exec`.
+    pub exec_cache: bool,
+    /// Liga o cache persistente de web.
+    pub web_cache: bool,
+}
+
+impl Default for ToolsOptions {
+    fn default() -> Self {
+        Self {
+            state_dir: None,
+            watcher: true,
+            exec_cache: true,
+            web_cache: true,
+        }
+    }
+}
+
+impl ToolsOptions {
+    /// Opções para testes e bench: estado no diretório dado, sem watcher nem caches.
+    pub fn hermetic(state_dir: std::path::PathBuf) -> Self {
+        Self {
+            state_dir: Some(state_dir),
+            watcher: false,
+            exec_cache: false,
+            web_cache: false,
+        }
+    }
+}
+
+/// Registra o catálogo de produção.
 pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
+    register_with(root_dir, registry, ToolsOptions::default());
+}
+
+/// Registra o catálogo com opções explícitas de composição.
+pub fn register_with(
+    root_dir: std::path::PathBuf,
+    registry: &mut ToolRegistry,
+    options: ToolsOptions,
+) {
+    let state_dir = options.state_dir.clone();
     let store = Arc::new(ResponseStore::new(
         Duration::from_secs(600),
         8 * 1024 * 1024,
@@ -200,16 +247,34 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::facts::FactsTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::state::StateTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
+    let facts = match state_dir.clone() {
+        Some(dir) => crate::facts::FactsTool::with_state_dir_and_store(
+            root_dir.clone(),
+            store.clone(),
+            dir,
+            DEFAULT_BUDGET_TOKENS,
+        ),
+        None => crate::facts::FactsTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        ),
+    };
+    registry.register(Arc::new(facts));
+    let state = match state_dir {
+        Some(dir) => crate::state::StateTool::with_state_dir_and_store(
+            root_dir.clone(),
+            store.clone(),
+            dir,
+            DEFAULT_BUDGET_TOKENS,
+        ),
+        None => crate::state::StateTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        ),
+    };
+    registry.register(Arc::new(state));
     registry.register(Arc::new(crate::env::EnvTool::new()));
     registry.register(Arc::new(PeekTool::new(
         store.clone(),
@@ -224,3 +289,43 @@ pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
     )));
 }
 mod pipeline;
+
+/// Tools expostas ao modelo quando a configuração não pede um perfil próprio.
+pub const CORE_TOOLS: &[&str] = &["edit", "exec", "map", "read", "read_many", "search"];
+
+/// Quais tools do catálogo ficam visíveis ao modelo.
+#[derive(Debug, Clone, Copy)]
+pub enum Exposure<'a> {
+    /// Só o conjunto núcleo (`CORE_TOOLS`).
+    Core,
+    /// Todas as tools registradas.
+    All,
+    /// Somente as tools cujo nome está na lista.
+    Only(&'a [String]),
+}
+
+impl Exposure<'_> {
+    /// `true` se `name` fica exposta ao modelo neste perfil.
+    fn admits(&self, name: &str) -> bool {
+        match self {
+            Self::Core => CORE_TOOLS.contains(&name),
+            Self::All => true,
+            Self::Only(names) => names.iter().any(|wanted| wanted == name),
+        }
+    }
+}
+
+/// Registra no `registry` só as tools que `exposure` admite.
+pub fn register_exposed(
+    root_dir: std::path::PathBuf,
+    registry: &mut ToolRegistry,
+    exposure: Exposure<'_>,
+) {
+    let mut staged = ToolRegistry::new();
+    register(root_dir, &mut staged);
+    for tool in staged.into_tools() {
+        if exposure.admits(&tool.spec().name) {
+            registry.register(tool);
+        }
+    }
+}
