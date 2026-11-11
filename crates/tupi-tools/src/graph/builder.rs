@@ -55,12 +55,19 @@ impl GraphBuilder {
 
             let snippets = AstChunker::new().snippets(&path, &content);
             for snippet in snippets {
-                let is_callable = snippet.signature.contains("fn ");
-                let is_public = snippet.signature.trim_start().starts_with("pub");
+                let is_callable =
+                    snippet.signature.contains("fn ") || snippet.signature.contains("fun ");
+                let is_public = if language == Language::Kotlin {
+                    !snippet.signature.contains("private ")
+                        && !snippet.signature.contains("internal ")
+                } else {
+                    snippet.signature.trim_start().starts_with("pub")
+                };
                 let is_test = relative.to_string_lossy().contains("/tests/")
                     || relative.to_string_lossy().starts_with("tests/")
                     || has_test_attribute(&content, snippet.start_line)
-                    || snippet.code.contains("#[cfg(test)]");
+                    || snippet.code.contains("#[cfg(test)]")
+                    || snippet.code.contains("@Test");
                 graph.graph.add_node(SymbolNode {
                     name: snippet.symbol_name,
                     qualified: snippet.qualified_name,
@@ -132,10 +139,9 @@ impl GraphBuilder {
                     .graph
                     .node_indices()
                     .filter(|&index| {
-                        graph
-                            .graph
-                            .node_weight(index)
-                            .is_some_and(|node| node.name == call.name)
+                        graph.graph.node_weight(index).is_some_and(|node| {
+                            node.name == call.name && node.language == file.language
+                        })
                     })
                     .collect();
                 if let Some(receiver) = &call.receiver

@@ -13,6 +13,7 @@ thiserror.workspace = true
 blake3.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-kotlin-ng.workspace = true
 streaming-iterator.workspace = true
 petgraph.workspace = true
 ignore.workspace = true

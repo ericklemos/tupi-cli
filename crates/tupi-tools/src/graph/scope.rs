@@ -350,7 +350,11 @@ pub fn last_segment(path: &str) -> Option<&str> {
 
 fn module_path_of(relative: &Path) -> String {
     let text = relative.to_string_lossy().replace('\\', "/");
-    text.strip_suffix(".rs").unwrap_or(&text).to_string()
+    text.strip_suffix(".rs")
+        .or_else(|| text.strip_suffix(".kt"))
+        .or_else(|| text.strip_suffix(".kts"))
+        .unwrap_or(&text)
+        .to_string()
 }
 
 fn module_aliases(module: &str) -> Vec<String> {

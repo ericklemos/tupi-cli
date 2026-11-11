@@ -6,12 +6,14 @@ use tree_sitter::Node;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Rust,
+    Kotlin,
 }
 
 impl Language {
     pub fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("rs") => Some(Self::Rust),
+            Some("kt") | Some("kts") => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -19,6 +21,7 @@ impl Language {
     pub fn tree_sitter_language(self) -> tree_sitter::Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         }
     }
 }
@@ -42,13 +45,16 @@ impl AstChunker {
     }
 
     pub fn snippets(&self, path: &Path, content: &str) -> Vec<AstSnippet> {
-        let Some(tree) = parse_rust(path, content) else {
+        let Some(language) = Language::from_path(path) else {
+            return Vec::new();
+        };
+        let Some(tree) = parse_language(path, content, language) else {
             return Vec::new();
         };
 
         let bytes = content.as_bytes();
         let mut snippets = Vec::new();
-        collect_snippets(tree.root_node(), bytes, &mut snippets);
+        collect_snippets(tree.root_node(), bytes, &mut snippets, language);
         disambiguate(&mut snippets);
         snippets
     }
@@ -62,7 +68,10 @@ impl AstChunker {
         content: &str,
         lines: &[usize],
     ) -> Vec<AstSnippet> {
-        let Some(tree) = parse_rust(path, content) else {
+        let Some(language) = Language::from_path(path) else {
+            return Vec::new();
+        };
+        let Some(tree) = parse_language(path, content, language) else {
             return Vec::new();
         };
 
@@ -83,8 +92,8 @@ impl AstChunker {
 
             let expanded = root
                 .descendant_for_point_range(point, point)
-                .and_then(|node| enclosing_scope(node, line))
-                .and_then(|node| snippet_for_node(node, bytes));
+                .and_then(|node| enclosing_scope(node, line, language))
+                .and_then(|node| snippet_for_node(node, bytes, language));
 
             let snippet = expanded.unwrap_or_else(|| fallback_snippet(path, content, line));
             if seen.insert((snippet.start_line, snippet.end_line)) {
@@ -98,52 +107,59 @@ impl AstChunker {
     }
 }
 
-fn parse_rust(path: &Path, content: &str) -> Option<tree_sitter::Tree> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-        return None;
-    }
-
+fn parse_language(path: &Path, content: &str, language: Language) -> Option<tree_sitter::Tree> {
+    let _ = path;
     let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
+    parser.set_language(&language.tree_sitter_language()).ok()?;
     parser.parse(content, None)
 }
 
-fn is_expandable(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
-    )
+fn is_expandable(kind: &str, language: Language) -> bool {
+    match language {
+        Language::Rust => matches!(
+            kind,
+            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+        ),
+        Language::Kotlin => matches!(
+            kind,
+            "function_declaration"
+                | "class_declaration"
+                | "object_declaration"
+                | "property_declaration"
+        ),
+    }
 }
 
-fn enclosing_scope(mut node: Node<'_>, line: usize) -> Option<Node<'_>> {
+fn enclosing_scope(mut node: Node<'_>, line: usize, language: Language) -> Option<Node<'_>> {
     loop {
-        if is_expandable(node.kind()) {
+        if is_expandable(node.kind(), language) {
             return Some(node);
         }
-        if node.kind() == "mod_item" && node.start_position().row + 1 == line {
+        if language == Language::Rust
+            && node.kind() == "mod_item"
+            && node.start_position().row + 1 == line
+        {
             return Some(node);
         }
         node = node.parent()?;
     }
 }
 
-fn snippet_for_node(node: Node<'_>, source: &[u8]) -> Option<AstSnippet> {
+fn snippet_for_node(node: Node<'_>, source: &[u8], language: Language) -> Option<AstSnippet> {
     let code = node.utf8_text(source).ok()?.to_string();
     if code.is_empty() {
         return None;
     }
 
-    let symbol_name = symbol_name(node, source);
-    let qualified_name = qualified_name(node, source, &symbol_name);
+    let symbol_name = symbol_name(node, source, language);
+    let qualified_name = qualified_name(node, source, &symbol_name, language);
     let start_line = node.start_position().row + 1;
     let end_line = start_line + code.lines().count().saturating_sub(1);
 
     Some(AstSnippet {
         symbol_name,
         qualified_name,
-        signature: compact_signature(&signature(node, source)),
+        signature: compact_signature(&signature(node, source, language)),
         code,
         start_line,
         end_line,
@@ -172,28 +188,48 @@ fn fallback_snippet(path: &Path, content: &str, line: usize) -> AstSnippet {
     }
 }
 
-fn is_scope(kind: &str) -> bool {
-    matches!(
-        kind,
-        "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item" | "mod_item"
-    )
+fn is_scope(kind: &str, language: Language) -> bool {
+    match language {
+        Language::Rust => matches!(
+            kind,
+            "function_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "mod_item"
+        ),
+        Language::Kotlin => matches!(
+            kind,
+            "function_declaration"
+                | "class_declaration"
+                | "object_declaration"
+                | "property_declaration"
+        ),
+    }
 }
 
-fn collect_snippets(node: Node<'_>, source: &[u8], snippets: &mut Vec<AstSnippet>) {
-    if is_scope(node.kind())
-        && let Some(snippet) = snippet_for_node(node, source)
+fn collect_snippets(
+    node: Node<'_>,
+    source: &[u8],
+    snippets: &mut Vec<AstSnippet>,
+    language: Language,
+) {
+    if is_scope(node.kind(), language)
+        && let Some(snippet) = snippet_for_node(node, source, language)
     {
         snippets.push(snippet);
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_snippets(child, source, snippets);
+        collect_snippets(child, source, snippets, language);
     }
 }
 
-fn symbol_name(node: Node<'_>, source: &[u8]) -> String {
-    if node.kind() == "impl_item"
+fn symbol_name(node: Node<'_>, source: &[u8], language: Language) -> String {
+    if language == Language::Rust
+        && node.kind() == "impl_item"
         && let Some(type_node) = node.child_by_field_name("type")
     {
         return format!("impl {}", type_node.utf8_text(source).unwrap_or(""));
@@ -204,18 +240,33 @@ fn symbol_name(node: Node<'_>, source: &[u8]) -> String {
             return name.to_string();
         }
     }
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index)
+            && matches!(
+                child.kind(),
+                "identifier" | "simple_identifier" | "type_identifier"
+            )
+        {
+            let name = child.utf8_text(source).unwrap_or("");
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
     node.kind().to_string()
 }
 
-fn qualified_name(node: Node<'_>, source: &[u8], symbol: &str) -> String {
+fn qualified_name(node: Node<'_>, source: &[u8], symbol: &str, language: Language) -> String {
     let mut containers = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
-        let container = match parent.kind() {
-            "impl_item" => parent
+        let container = match (language, parent.kind()) {
+            (Language::Rust, "impl_item") => parent
                 .child_by_field_name("type")
                 .map(|type_node| type_node.utf8_text(source).unwrap_or("").to_string()),
-            "mod_item" => parent
+            (Language::Rust, "mod_item")
+            | (Language::Kotlin, "class_declaration")
+            | (Language::Kotlin, "object_declaration") => parent
                 .child_by_field_name("name")
                 .map(|name| name.utf8_text(source).unwrap_or("").to_string()),
             _ => None,
@@ -248,8 +299,17 @@ fn disambiguate(snippets: &mut [AstSnippet]) {
     }
 }
 
-fn signature(node: Node<'_>, source: &[u8]) -> String {
+fn signature(node: Node<'_>, source: &[u8], language: Language) -> String {
     let text = node.utf8_text(source).unwrap_or("");
+    if language == Language::Kotlin {
+        if let Some(index) = text.find('{') {
+            return text[..index].trim().to_string();
+        }
+        if let Some(index) = text.find('=') {
+            return text[..index].trim().to_string();
+        }
+        return text.lines().next().unwrap_or("").trim().to_string();
+    }
     if let Some(body) = node.child_by_field_name("body") {
         let end = body.start_byte().saturating_sub(node.start_byte());
         return text[..end].trim().to_string();
