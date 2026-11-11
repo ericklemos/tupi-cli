@@ -197,8 +197,19 @@ impl ScopeResolver {
         } else if let Some(root) = self.crate_roots.get(head) {
             join(root, &segments[1..])
         } else {
-            let parent = module.rsplit_once('/').map(|(head, _)| head).unwrap_or("");
-            let sibling = join(parent, &segments);
+            // No crate root (`src/main.rs`/`src/lib.rs`), `a` é `crate::a`, não
+            // um irmão de `src`. Fora do root, o caminho é relativo ao módulo
+            // que o contém.
+            let parent = if self.crate_roots.values().any(|root| root == module) {
+                module.to_string()
+            } else {
+                module
+                    .rsplit_once('/')
+                    .map(|(head, _)| head)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let sibling = join(&parent, &segments);
             if self.is_under_prefix(&sibling) {
                 sibling
             } else {
@@ -290,14 +301,21 @@ fn resolve_within(
             .unwrap_or_else(|| Path::new(""))
     };
 
-    if let Some(path) = call_path
-        && let Some(ImportTarget::File(file)) = resolver.resolve_import(caller_file, path)
-        && let Some(node) = definitions
-            .iter()
-            .copied()
-            .find(|&index| file_of(index) == file)
-    {
-        return Resolution::Resolved(node);
+    if let Some(path) = call_path {
+        let mut candidates = vec![path];
+        if let Some((head, _)) = path.rsplit_once("::") {
+            candidates.push(head);
+        }
+        for candidate in candidates {
+            if let Some(ImportTarget::File(file)) = resolver.resolve_import(caller_file, candidate)
+                && let Some(node) = definitions
+                    .iter()
+                    .copied()
+                    .find(|&index| file_of(index) == file)
+            {
+                return Resolution::Resolved(node);
+            }
+        }
     }
 
     let from_globs: Vec<NodeIndex> = definitions

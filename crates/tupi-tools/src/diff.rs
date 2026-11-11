@@ -204,6 +204,19 @@ impl Tool for DiffTool {
                     callers.push(caller);
                 }
             }
+            if include_tests {
+                for dependency in graph.reverse_deps(name, 3) {
+                    if !dependency.is_test || changed_names.contains(dependency.name.as_str()) {
+                        continue;
+                    }
+                    if caller_seen.insert((
+                        dependency.qualified.as_str(),
+                        dependency.relative.as_str(),
+                    )) {
+                        tests.push(dependency);
+                    }
+                }
+            }
         }
 
         let mut summary = format!(

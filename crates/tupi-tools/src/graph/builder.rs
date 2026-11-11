@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -314,10 +314,11 @@ fn collect_calls(
     let name_index = query.capture_index_for_name("call.name");
     let receiver_index = query.capture_index_for_name("call.receiver");
     let path_index = query.capture_index_for_name("call.path");
-    let mut calls = Vec::new();
+    let mut sites: BTreeMap<(usize, usize), CallSite> = BTreeMap::new();
 
     while let Some(m) = matches.next() {
         let mut name = None;
+        let mut name_node = None;
         let mut receiver = None;
         let mut call_path = None;
         for capture in m.captures() {
@@ -327,23 +328,35 @@ fn collect_calls(
                 .ok()
                 .map(str::to_string);
             if Some(capture.index) == name_index {
-                name = text;
+                if let Some(text) = text {
+                    name = Some(text);
+                    name_node = Some(capture.node);
+                }
             } else if Some(capture.index) == receiver_index {
                 receiver = text;
             } else if Some(capture.index) == path_index {
                 call_path = text;
             }
         }
-        if let Some(name) = name {
-            calls.push(CallSite {
+        let (Some(name), Some(name_node)) = (name, name_node) else {
+            continue;
+        };
+        let site = sites
+            .entry((name_node.start_byte(), name_node.end_byte()))
+            .or_insert_with(|| CallSite {
                 name,
-                line: m.captures()[0].node.start_position().row + 1,
-                receiver,
-                path: call_path,
+                line: name_node.start_position().row + 1,
+                receiver: None,
+                path: None,
             });
+        if site.path.is_none() {
+            site.path = call_path;
+        }
+        if site.receiver.is_none() {
+            site.receiver = receiver;
         }
     }
-    calls
+    sites.into_values().collect()
 }
 
 fn collect_bindings(content: &str) -> HashMap<String, String> {
