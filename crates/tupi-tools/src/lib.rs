@@ -6,7 +6,7 @@ mod peek;
 mod ranking;
 mod read;
 mod read_many;
-mod scanner;
+pub mod scanner;
 mod search;
 mod span;
 mod store;

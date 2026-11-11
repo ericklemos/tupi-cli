@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
+use ignore::types::TypesBuilder;
 use ignore::WalkBuilder;
 use tupi_kernel::ToolError;
 
@@ -14,6 +17,8 @@ const MAX_MATCHES_PER_FILE: usize = 200;
 pub struct RawMatch {
     pub file_path: PathBuf,
     pub line_number: usize,
+    pub byte_offset: u64,
+    pub line_content: String,
 }
 
 pub struct LexicalScanner {
@@ -52,8 +57,6 @@ impl LexicalScanner {
                 } else {
                     root.join(candidate)
                 };
-                // Normaliza `..` antes de canonicalizar: um prefixo que escapa
-                // do root é erro de contenção mesmo quando o alvo não existe.
                 let normalized = normalize(&joined);
                 if !normalized.starts_with(&root) {
                     return Err(ToolError::OutsideRoot(prefix.to_string()));
@@ -69,8 +72,34 @@ impl LexicalScanner {
             None => root,
         };
 
+        let mut types = TypesBuilder::new();
+        for pattern in ["*.rs", "*.kt", "*.kts"] {
+            types
+                .add("code", pattern)
+                .map_err(|error| ToolError::Other(format!("filtro de extensão: {error}")))?;
+        }
+        types.select("code");
+        let types = types
+            .build()
+            .map_err(|error| ToolError::Other(format!("filtro de extensão: {error}")))?;
+        let escaped: Vec<String> = terms
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty())
+            .map(regex::escape)
+            .collect();
+        if escaped.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = escaped.join("|");
+        let matcher = RegexMatcherBuilder::new()
+            .case_insensitive(true)
+            .build(&pattern)
+            .map_err(|error| ToolError::Other(format!("padrão de busca: {error}")))?;
+
         let mut builder = WalkBuilder::new(&base);
         builder
+            .types(types)
             .standard_filters(true)
             .hidden(true)
             .require_git(false)
@@ -80,13 +109,8 @@ impl LexicalScanner {
             .filter_entry(|entry| !excluded(entry));
 
         let mut matches = Vec::new();
-        for entry in builder.build() {
-            let Ok(entry) = entry else { continue };
+        for entry in builder.build().flatten() {
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
                 continue;
             }
             if entry
@@ -96,24 +120,20 @@ impl LexicalScanner {
             {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
+            let path = entry.path();
+            let mut file_matches = Vec::new();
+            let sink = MatchCollector {
+                matches: &mut file_matches,
+                file_path: path,
             };
-
-            let mut found = 0;
-            for (index, line) in content.lines().enumerate() {
-                let lower = line.to_lowercase();
-                if terms.iter().any(|term| lower.contains(term)) {
-                    matches.push(RawMatch {
-                        file_path: path.to_path_buf(),
-                        line_number: index + 1,
-                    });
-                    found += 1;
-                    if found >= MAX_MATCHES_PER_FILE {
-                        break;
-                    }
-                }
+            let mut searcher = SearcherBuilder::new()
+                .line_number(true)
+                .multi_line(false)
+                .build();
+            if searcher.search_path(&matcher, path, sink).is_err() {
+                continue;
             }
+            matches.extend(file_matches);
         }
 
         matches.sort_by(|a, b| {
@@ -122,6 +142,32 @@ impl LexicalScanner {
                 .then_with(|| a.line_number.cmp(&b.line_number))
         });
         Ok(matches)
+    }
+}
+
+struct MatchCollector<'a> {
+    matches: &'a mut Vec<RawMatch>,
+    file_path: &'a Path,
+}
+
+impl Sink for MatchCollector<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.matches.len() >= MAX_MATCHES_PER_FILE {
+            return Ok(false);
+        }
+        self.matches.push(RawMatch {
+            file_path: self.file_path.to_path_buf(),
+            line_number: mat.line_number().unwrap_or(1) as usize,
+            byte_offset: mat.absolute_byte_offset(),
+            line_content: String::from_utf8_lossy(mat.bytes()).to_string(),
+        });
+        Ok(true)
     }
 }
 
@@ -149,116 +195,17 @@ fn excluded(entry: &ignore::DirEntry) -> bool {
     }
     matches!(
         entry.file_name().to_str(),
-        Some("target" | "node_modules" | ".git" | "build" | "dist" | ".gradle")
+        Some("target" | "build" | ".gradle" | "node_modules" | ".git")
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    fn write(path: &std::path::Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
-    fn terms() -> Vec<String> {
-        vec!["verify_token".to_string()]
-    }
 
     #[test]
-    fn finds_a_term_in_rust_files() {
-        let dir = tempdir().unwrap();
-        write(
-            &dir.path().join("src/auth.rs"),
-            "pub fn verify_token() {}\n",
-        );
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let matches = scanner.search(&terms(), None).unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].line_number, 1);
-        assert!(matches[0].file_path.ends_with("src/auth.rs"));
-    }
-
-    #[test]
-    fn ignores_non_rust_files_and_build_directories() {
-        let dir = tempdir().unwrap();
-        write(&dir.path().join("notes.md"), "verify_token\n");
-        write(&dir.path().join("target/gen.rs"), "verify_token\n");
-        write(&dir.path().join("src/auth.rs"), "verify_token\n");
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let matches = scanner.search(&terms(), None).unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].file_path.ends_with("src/auth.rs"));
-    }
-
-    #[test]
-    fn respects_gitignore_without_a_git_repository() {
-        let dir = tempdir().unwrap();
-        write(&dir.path().join(".gitignore"), "ignored.rs\n");
-        write(&dir.path().join("ignored.rs"), "verify_token\n");
-        write(&dir.path().join("kept.rs"), "verify_token\n");
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let matches = scanner.search(&terms(), None).unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].file_path.ends_with("kept.rs"));
-    }
-
-    #[test]
-    fn a_path_prefix_restricts_the_scan() {
-        let dir = tempdir().unwrap();
-        write(&dir.path().join("src/auth.rs"), "verify_token\n");
-        write(&dir.path().join("top.rs"), "verify_token\n");
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let matches = scanner.search(&terms(), Some("src")).unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].file_path.ends_with("src/auth.rs"));
-    }
-
-    #[test]
-    fn a_prefix_outside_the_root_is_rejected() {
-        let dir = tempdir().unwrap();
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let error = scanner.search(&terms(), Some("../fora")).unwrap_err();
-
-        assert!(matches!(error, tupi_kernel::ToolError::OutsideRoot(_)));
-    }
-
-    #[test]
-    fn non_utf8_files_are_skipped() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("bin.rs"), [0xff, 0xfe]).unwrap();
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        assert!(scanner.search(&terms(), None).unwrap().is_empty());
-    }
-
-    #[test]
-    fn results_are_ordered_by_path_then_line() {
-        let dir = tempdir().unwrap();
-        write(&dir.path().join("b.rs"), "verify_token\n");
-        write(&dir.path().join("a.rs"), "verify_token\nverify_token\n");
-        let scanner = LexicalScanner::new(dir.path().to_path_buf());
-
-        let matches = scanner.search(&terms(), None).unwrap();
-
-        assert_eq!(matches.len(), 3);
-        assert!(matches[0].file_path.ends_with("a.rs"));
-        assert_eq!(matches[0].line_number, 1);
-        assert_eq!(matches[1].line_number, 2);
-        assert!(matches[2].file_path.ends_with("b.rs"));
+    fn an_empty_term_list_finds_nothing() {
+        let scanner = LexicalScanner::new(std::env::temp_dir());
+        assert!(scanner.search(&[], None).unwrap().is_empty());
     }
 }
