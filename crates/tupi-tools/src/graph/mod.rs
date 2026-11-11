@@ -10,12 +10,14 @@ mod model;
 mod parse_cache;
 mod queries;
 mod scope;
+mod watcher;
 
 pub use builder::GraphBuilder;
 pub use cache::GraphCache;
 pub use model::{CallGraph, Def, ProjectCodeGraph, RelationEdge, RelationKind, SymbolNode};
 pub use parse_cache::ParseCache;
 pub use scope::{FileScope, ImportTarget, Resolution, ScopeResolver};
+pub use watcher::GraphWatcher;
 
 /// Depois de uma tool que muta, o grafo é reconstruído (com os parses em
 /// cache) em vez de ficar com arestas velhas.

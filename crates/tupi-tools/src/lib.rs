@@ -27,7 +27,9 @@ pub use workflow::{
     Catalog, WorkflowTool, catalog, global_agents_dir, local_agents_dir, prompt_section,
 };
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tupi_kernel::ToolRegistry;
@@ -109,6 +111,7 @@ pub fn register_with(
     options: ToolsOptions,
 ) {
     let state_dir = options.state_dir.clone();
+    let watcher = options.watcher;
     let store = Arc::new(ResponseStore::new(
         Duration::from_secs(600),
         8 * 1024 * 1024,
@@ -119,6 +122,9 @@ pub fn register_with(
     ));
     let parse_cache = Arc::new(crate::graph::ParseCache::new());
     let graph = crate::graph::GraphCache::shared_with_parse_cache(&root_dir, parse_cache.clone());
+    if watcher {
+        start_watcher(&root_dir, graph.clone());
+    }
     let read = Arc::new(
         ReadTool::new(
             root_dir.clone(),
@@ -295,6 +301,21 @@ pub fn register_with(
         DEFAULT_BUDGET_TOKENS,
     )));
 }
+fn start_watcher(root: &std::path::Path, cache: Arc<crate::graph::GraphCache>) {
+    static WATCHERS: OnceLock<Mutex<HashMap<PathBuf, crate::graph::GraphWatcher>>> = OnceLock::new();
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut watchers = WATCHERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if watchers.contains_key(&key) {
+        return;
+    }
+    if let Ok(watcher) = crate::graph::GraphWatcher::start(key.clone(), cache) {
+        watchers.insert(key, watcher);
+    }
+}
+
 mod pipeline;
 
 /// Tools expostas ao modelo quando a configuração não pede um perfil próprio.

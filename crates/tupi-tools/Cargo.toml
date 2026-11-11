@@ -16,6 +16,7 @@ tree-sitter-rust.workspace = true
 tree-sitter-kotlin-ng.workspace = true
 streaming-iterator.workspace = true
 petgraph.workspace = true
+notify.workspace = true
 regex.workspace = true
 grep-searcher.workspace = true
 grep-regex.workspace = true
