@@ -2,6 +2,27 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
+/// Linguagem de código que o AST entende.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Rust,
+}
+
+impl Language {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rs") => Some(Self::Rust),
+            _ => None,
+        }
+    }
+
+    pub fn tree_sitter_language(self) -> tree_sitter::Language {
+        match self {
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstSnippet {
     pub symbol_name: String,

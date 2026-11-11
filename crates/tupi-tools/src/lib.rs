@@ -42,7 +42,7 @@ mod env;
 mod exec;
 mod facts;
 mod fetch;
-mod graph;
+pub mod graph;
 mod impact;
 mod map;
 mod patch;
