@@ -267,11 +267,9 @@ pub fn register_with(
             dir,
             DEFAULT_BUDGET_TOKENS,
         ),
-        None => crate::facts::FactsTool::new(
-            root_dir.clone(),
-            store.clone(),
-            DEFAULT_BUDGET_TOKENS,
-        ),
+        None => {
+            crate::facts::FactsTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
+        }
     };
     registry.register(Arc::new(facts));
     let state = match state_dir {
@@ -281,11 +279,9 @@ pub fn register_with(
             dir,
             DEFAULT_BUDGET_TOKENS,
         ),
-        None => crate::state::StateTool::new(
-            root_dir.clone(),
-            store.clone(),
-            DEFAULT_BUDGET_TOKENS,
-        ),
+        None => {
+            crate::state::StateTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
+        }
     };
     registry.register(Arc::new(state));
     registry.register(Arc::new(crate::env::EnvTool::new()));
@@ -302,7 +298,8 @@ pub fn register_with(
     )));
 }
 fn start_watcher(root: &std::path::Path, cache: Arc<crate::graph::GraphCache>) {
-    static WATCHERS: OnceLock<Mutex<HashMap<PathBuf, crate::graph::GraphWatcher>>> = OnceLock::new();
+    static WATCHERS: OnceLock<Mutex<HashMap<PathBuf, crate::graph::GraphWatcher>>> =
+        OnceLock::new();
     let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut watchers = WATCHERS
         .get_or_init(|| Mutex::new(HashMap::new()))

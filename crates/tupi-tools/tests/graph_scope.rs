@@ -39,6 +39,99 @@ fn two_definitions_without_import_are_ambiguous() {
 }
 
 #[test]
+fn an_aliased_import_resolves_the_original_item() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+    write(
+        dir.path(),
+        "src/b.rs",
+        "use crate::a::helper as h;\npub fn caller() { h(); }\n",
+    );
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    let callees = graph.callees("caller");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].qualified, "helper");
+    assert_eq!(callees[0].relative, "src/a.rs");
+}
+
+#[test]
+fn a_glob_import_resolves_the_item() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+    write(
+        dir.path(),
+        "src/b.rs",
+        "use crate::a::*;\npub fn caller() { helper(); }\n",
+    );
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    let callees = graph.callees("caller");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].relative, "src/a.rs");
+}
+
+#[test]
+fn a_typed_parameter_resolves_the_method() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "pub struct A;\npub struct B;\n\
+         impl A { pub fn build(&self) {} }\n\
+         impl B { pub fn build(&self) {} }\n\
+         pub fn run(builder: &A) { builder.build(); }\n",
+    );
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    let callees = graph.callees("run");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].qualified, "A::build");
+}
+
+#[test]
+fn two_same_named_receivers_in_different_functions_keep_their_types() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "pub struct A;\npub struct B;\n\
+         impl A { pub fn build(&self) {} }\n\
+         impl B { pub fn build(&self) {} }\n\
+         pub fn one() { let x = A::new(); x.build(); }\n\
+         pub fn two() { let x = B::new(); x.build(); }\n",
+    );
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    assert_eq!(graph.callees("one")[0].qualified, "A::build");
+    assert_eq!(graph.callees("two")[0].qualified, "B::build");
+}
+
+#[test]
+fn the_root_crate_is_the_same_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+    write(dir.path(), "crates/other/src/b.rs", "pub fn helper() {}\n");
+    write(dir.path(), "src/c.rs", "pub fn caller() { helper(); }\n");
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    let callees = graph.callees("caller");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].relative, "src/a.rs");
+}
+
+#[test]
+fn kotlin_uses_the_first_segment_as_the_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "app/A.kt", "fun helper() {}\n");
+    write(dir.path(), "other/B.kt", "fun helper() {}\n");
+    write(dir.path(), "app/C.kt", "fun caller() { helper() }\n");
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    let callees = graph.callees("caller");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].relative, "app/A.kt");
+}
+
+#[test]
 fn a_typed_receiver_resolves_the_method() {
     let dir = tempfile::tempdir().unwrap();
     write(

@@ -13,8 +13,8 @@ use crate::graph::model::{ProjectCodeGraph, RelationEdge, RelationKind, SymbolNo
 use crate::graph::parse_cache::ParseCache;
 use crate::graph::queries::GraphQueries;
 use crate::graph::scope::{
-    CallSite, FileScope, ImportTarget, Resolution, ScopeResolver, UseItem, crate_name_for,
-    expand_use, pick_target,
+    CallSite, FileScope, ImportBinding, ImportTarget, Resolution, ScopeResolver, UseItem,
+    crate_name_for, expand_use, last_segment, pick_target,
 };
 
 pub struct GraphBuilder {
@@ -160,6 +160,11 @@ impl GraphBuilder {
                     continue;
                 };
 
+                let scope = graph
+                    .scopes
+                    .get(&file.relative)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut definitions: Vec<NodeIndex> = graph
                     .graph
                     .node_indices()
@@ -169,8 +174,30 @@ impl GraphBuilder {
                         })
                     })
                     .collect();
+                if definitions.is_empty()
+                    && let Some(binding) = scope.imports.get(&call.name)
+                    && binding.item != call.name
+                {
+                    let target_file = match &binding.target {
+                        ImportTarget::File(file) => Some(file.as_path()),
+                        ImportTarget::External => None,
+                    };
+                    definitions = graph
+                        .graph
+                        .node_indices()
+                        .filter(|&index| {
+                            graph.graph.node_weight(index).is_some_and(|node| {
+                                node.name == binding.item
+                                    && node.language == file.language
+                                    && target_file.is_none_or(|target| {
+                                        Path::new(node.relative.as_str()) == target
+                                    })
+                            })
+                        })
+                        .collect();
+                }
                 if let Some(receiver) = &call.receiver
-                    && let Some(ty) = bindings.get(receiver)
+                    && let Some(ty) = binding_type_at(&bindings, receiver, call.line)
                 {
                     let typed: Vec<NodeIndex> = definitions
                         .iter()
@@ -187,11 +214,6 @@ impl GraphBuilder {
                     }
                 }
 
-                let scope = graph
-                    .scopes
-                    .get(&file.relative)
-                    .cloned()
-                    .unwrap_or_default();
                 let resolution = pick_target(
                     &call.name,
                     &file.relative,
@@ -286,7 +308,10 @@ fn collect_imports(
                         let target = resolver
                             .resolve_import_in(relative, &module, &path)
                             .unwrap_or(ImportTarget::External);
-                        scope.imports.insert(name, target);
+                        let item = last_segment(&path).unwrap_or(&name).to_string();
+                        scope
+                            .imports
+                            .insert(name, ImportBinding { target, item });
                     }
                     UseItem::Glob { path } => {
                         if let Some(ImportTarget::File(file)) =
@@ -359,9 +384,10 @@ fn collect_calls(
     sites.into_values().collect()
 }
 
-fn collect_bindings(content: &str) -> HashMap<String, String> {
-    let mut bindings = HashMap::new();
-    for line in content.lines() {
+fn collect_bindings(content: &str) -> HashMap<String, Vec<(usize, String)>> {
+    let mut bindings: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
         let line = line.trim();
         if let Some((_, after)) = line.split_once("let ") {
             let rest = after.trim_start_matches("mut ").trim();
@@ -374,18 +400,59 @@ fn collect_bindings(content: &str) -> HashMap<String, String> {
                             .filter(|ty| !ty.is_empty())
                     });
                     if let Some(ty) = ty {
-                        bindings.insert(name.to_string(), ty);
+                        bindings
+                            .entry(name.to_string())
+                            .or_default()
+                            .push((line_number, ty));
                     }
                 }
             } else if let Some((name, ty)) = rest.split_once(':') {
                 let name = name.trim();
                 if !name.is_empty() {
-                    bindings.insert(name.to_string(), clean_type(ty));
+                    bindings
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((line_number, clean_type(ty)));
+                }
+            }
+        }
+
+        if let Some(fn_at) = line.find("fn ")
+            && let Some(open) = line[fn_at..].find('(')
+        {
+            let after_open = fn_at + open + 1;
+            if let Some(close) = line[after_open..].find(')') {
+                let params = &line[after_open..after_open + close];
+                for param in params.split(',') {
+                    if let Some((name, ty)) = param.split_once(':') {
+                        let name = name.trim().trim_start_matches("mut ").trim();
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            bindings
+                                .entry(name.to_string())
+                                .or_default()
+                                .push((line_number, clean_type(ty)));
+                        }
+                    }
                 }
             }
         }
     }
     bindings
+}
+
+fn binding_type_at(
+    bindings: &HashMap<String, Vec<(usize, String)>>,
+    name: &str,
+    line: usize,
+) -> Option<String> {
+    bindings
+        .get(name)?
+        .iter()
+        .filter(|(at, _)| *at <= line)
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, ty)| ty.clone())
 }
 
 fn type_from_expr(expr: &str) -> Option<String> {

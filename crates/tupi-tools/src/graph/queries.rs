@@ -1,5 +1,5 @@
-use tupi_kernel::ToolError;
 use tree_sitter::Query;
+use tupi_kernel::ToolError;
 
 use crate::ast::Language;
 

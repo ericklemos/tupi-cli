@@ -28,9 +28,16 @@ pub enum ImportTarget {
     External,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBinding {
+    pub target: ImportTarget,
+    /// Nome original no arquivo importado, antes de `as`.
+    pub item: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct FileScope {
-    pub imports: HashMap<String, ImportTarget>,
+    pub imports: HashMap<String, ImportBinding>,
     pub globs: Vec<PathBuf>,
 }
 
@@ -90,10 +97,17 @@ impl ScopeResolver {
             .insert(relative.to_path_buf(), module.clone());
         self.file_crates
             .insert(relative.to_path_buf(), crate_name.to_string());
-        let prefix = module
-            .split_once("/src")
-            .map(|(head, _)| format!("{head}/src/"))
-            .unwrap_or_else(|| module.clone());
+        let prefix = if let Some((head, _)) = module.split_once("/src") {
+            format!("{head}/src/")
+        } else if module.starts_with("src/") {
+            "src/".to_string()
+        } else {
+            // Kotlin sem `src/`: o mesmo "crate" é o primeiro segmento do caminho.
+            module
+                .split_once('/')
+                .map(|(head, _)| format!("{head}/"))
+                .unwrap_or_else(|| module.clone())
+        };
         self.file_prefixes.insert(relative.to_path_buf(), prefix);
 
         for alias in module_aliases(&module) {
@@ -152,7 +166,13 @@ impl ScopeResolver {
         let module = self.file_module(relative)?;
         let leaf = module.rsplit_once('/').map(|(_, leaf)| leaf)?;
         if matches!(leaf, "lib" | "main" | "mod") {
-            Some(module.rsplit_once('/').map(|(head, _)| head).unwrap_or("").to_string())
+            Some(
+                module
+                    .rsplit_once('/')
+                    .map(|(head, _)| head)
+                    .unwrap_or("")
+                    .to_string(),
+            )
         } else {
             Some(module.to_string())
         }
@@ -268,8 +288,8 @@ pub fn pick_target(
         return Resolution::Resolved(only);
     }
 
-    if let Some(target) = scope.imports.get(call_name) {
-        return match target {
+    if let Some(binding) = scope.imports.get(call_name) {
+        return match &binding.target {
             ImportTarget::External => Resolution::Unknown,
             ImportTarget::File(file) => match definitions
                 .iter()
@@ -471,7 +491,10 @@ fn expand_into(text: &str, out: &mut Vec<UseItem>) {
 
     if let Some(open) = text.find('{') {
         let prefix = text[..open].trim().trim_end_matches(':').trim();
-        let inner_end = text.rfind('}').unwrap_or(text.len());
+        let Some(close) = text[open + 1..].find('}') else {
+            return;
+        };
+        let inner_end = open + 1 + close;
         let inner = &text[open + 1..inner_end];
         for part in split_top_level_commas(inner) {
             let combined = if prefix.is_empty() {
@@ -609,8 +632,21 @@ mod tests {
     fn brace_groups_expand() {
         let items = expand_use("use crate::a::{b, c as d};");
         assert_eq!(items.len(), 2);
-        assert!(items.iter().any(|item| matches!(item, UseItem::Named { name, .. } if name == "b")));
-        assert!(items.iter().any(|item| matches!(item, UseItem::Named { name, .. } if name == "d")));
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, UseItem::Named { name, .. } if name == "b"))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, UseItem::Named { name, .. } if name == "d"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_use_does_not_panic() {
+        assert!(expand_use("use a::}{b;").is_empty());
     }
 
     #[test]

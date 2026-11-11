@@ -32,6 +32,17 @@ fn a_broken_file_does_not_take_the_other_files_down() {
 }
 
 #[test]
+fn a_malformed_use_does_not_take_the_graph_down() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+    write(dir.path(), "src/bad.rs", "use a::}{b;\npub fn broken() {}\n");
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+    assert_eq!(graph.matching("helper").len(), 1);
+    assert_eq!(graph.matching("broken").len(), 1);
+}
+
+#[test]
 fn a_duplicated_name_without_evidence_has_no_edge() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "src/a.rs", "pub fn helper() {}\n");

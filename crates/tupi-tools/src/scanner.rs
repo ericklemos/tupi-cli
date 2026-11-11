@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
-use ignore::types::TypesBuilder;
 use ignore::WalkBuilder;
+use ignore::types::TypesBuilder;
 use tupi_kernel::ToolError;
 
 /// Mais de 1 MiB é quase sempre gerado/minificado: caro de ler e ruim de exibir.

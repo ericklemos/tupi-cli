@@ -15,7 +15,7 @@ use crate::graph::parse_cache::ParseCache;
 pub struct GraphCache {
     root: PathBuf,
     graph: RwLock<Option<Arc<ProjectCodeGraph>>>,
-    builder: GraphBuilder,
+    builder: Option<GraphBuilder>,
 }
 
 impl GraphCache {
@@ -24,7 +24,7 @@ impl GraphCache {
         Self {
             root,
             graph: RwLock::new(None),
-            builder: GraphBuilder::new().expect("queries tree-sitter válidas"),
+            builder: GraphBuilder::new().ok(),
         }
     }
 
@@ -34,8 +34,8 @@ impl GraphCache {
             root,
             graph: RwLock::new(None),
             builder: GraphBuilder::new()
-                .expect("queries tree-sitter válidas")
-                .with_parse_cache(cache),
+                .ok()
+                .map(|builder| builder.with_parse_cache(cache)),
         }
     }
 
@@ -50,30 +50,38 @@ impl GraphCache {
             return graph.clone();
         }
 
-        let mut slot = self.graph.write().unwrap_or_else(|error| error.into_inner());
+        let mut slot = self
+            .graph
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(graph) = slot.as_ref() {
             return graph.clone();
         }
-        let built = Arc::new(
-            self.builder
-                .build(&self.root)
-                .unwrap_or_else(|_| ProjectCodeGraph::new()),
-        );
+        let built = Arc::new(self.build());
         *slot = Some(built.clone());
         built
     }
 
     pub fn repair(&self, _paths: &[PathBuf]) {
-        let rebuilt = Arc::new(
-            self.builder
-                .build(&self.root)
-                .unwrap_or_else(|_| ProjectCodeGraph::new()),
-        );
-        *self.graph.write().unwrap_or_else(|error| error.into_inner()) = Some(rebuilt);
+        let rebuilt = Arc::new(self.build());
+        *self
+            .graph
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(rebuilt);
+    }
+
+    fn build(&self) -> ProjectCodeGraph {
+        self.builder
+            .as_ref()
+            .and_then(|builder| builder.build(&self.root).ok())
+            .unwrap_or_default()
     }
 
     pub fn invalidate(&self) {
-        *self.graph.write().unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .graph
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 }
 
@@ -109,5 +117,21 @@ impl GraphCache {
         if let Some(cache) = caches.get(&root) {
             cache.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cache_without_builder_degrades_to_an_empty_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = GraphCache {
+            root: dir.path().to_path_buf(),
+            graph: RwLock::new(None),
+            builder: None,
+        };
+        assert!(cache.get().matching("qualquer").is_empty());
     }
 }

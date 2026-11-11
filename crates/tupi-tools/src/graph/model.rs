@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
-use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::Direction;
+use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
 use crate::ast::Language;
 use crate::graph::scope::{FileScope, ScopeResolver};
@@ -121,7 +121,10 @@ impl ProjectCodeGraph {
     }
 
     fn matching_indices(&self, query: &str) -> Vec<NodeIndex> {
-        self.matching(query).into_iter().map(|def| def.node).collect()
+        self.matching(query)
+            .into_iter()
+            .map(|def| def.node)
+            .collect()
     }
 
     pub fn callers(&self, name: &str) -> Vec<&Def> {
@@ -166,6 +169,22 @@ impl ProjectCodeGraph {
         out
     }
 
+    pub fn callees_for(&self, def: &Def) -> Vec<&Def> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for callee in self
+            .graph
+            .neighbors_directed(def.node, Direction::Outgoing)
+        {
+            if seen.insert(callee)
+                && let Some(def) = self.def_for(callee)
+            {
+                out.push(def);
+            }
+        }
+        out
+    }
+
     pub fn trace(&self, from: &str, to: &str, max_depth: usize) -> Option<Vec<String>> {
         let starts = self.matching_indices(from);
         if starts.is_empty() {
@@ -204,7 +223,11 @@ impl ProjectCodeGraph {
                             cursor = parent;
                         }
                         path.reverse();
-                        return Some(path.into_iter().map(|index| self.node_name(index)).collect());
+                        return Some(
+                            path.into_iter()
+                                .map(|index| self.node_name(index))
+                                .collect(),
+                        );
                     }
                     next.push(callee);
                 }
@@ -224,7 +247,11 @@ impl ProjectCodeGraph {
     pub fn incoming_count(&self, name: &str) -> usize {
         self.matching_indices(name)
             .into_iter()
-            .map(|index| self.graph.edges_directed(index, Direction::Incoming).count())
+            .map(|index| {
+                self.graph
+                    .edges_directed(index, Direction::Incoming)
+                    .count()
+            })
             .sum()
     }
 

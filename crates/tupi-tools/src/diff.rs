@@ -209,10 +209,9 @@ impl Tool for DiffTool {
                     if !dependency.is_test || changed_names.contains(dependency.name.as_str()) {
                         continue;
                     }
-                    if caller_seen.insert((
-                        dependency.qualified.as_str(),
-                        dependency.relative.as_str(),
-                    )) {
+                    if caller_seen
+                        .insert((dependency.qualified.as_str(), dependency.relative.as_str()))
+                    {
                         tests.push(dependency);
                     }
                 }

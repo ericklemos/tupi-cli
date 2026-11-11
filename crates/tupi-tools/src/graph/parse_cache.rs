@@ -84,9 +84,7 @@ impl ParseCache {
                 .entries
                 .get(&old_path)
                 .is_some_and(|entry| entry.generation == old_generation);
-            if current
-                && let Some(removed) = inner.entries.remove(&old_path)
-            {
+            if current && let Some(removed) = inner.entries.remove(&old_path) {
                 inner.bytes = inner.bytes.saturating_sub(removed.bytes);
             }
         }

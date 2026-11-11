@@ -208,12 +208,7 @@ fn is_scope(kind: &str, language: Language) -> bool {
     match language {
         Language::Rust => matches!(
             kind,
-            "function_item"
-                | "impl_item"
-                | "struct_item"
-                | "enum_item"
-                | "trait_item"
-                | "mod_item"
+            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item" | "mod_item"
         ),
         Language::Kotlin => matches!(
             kind,

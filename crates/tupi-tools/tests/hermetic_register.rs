@@ -24,7 +24,9 @@ fn hermetic_register_writes_state_under_the_given_dir() {
         .map(|entry| entry.unwrap().path())
         .collect();
     assert!(
-        files.iter().any(|path| path.to_string_lossy().contains("state-")),
+        files
+            .iter()
+            .any(|path| path.to_string_lossy().contains("state-")),
         "esperava state-*.jsonl em {:?}",
         files
     );
