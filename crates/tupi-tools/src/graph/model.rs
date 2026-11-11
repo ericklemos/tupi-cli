@@ -5,6 +5,7 @@ use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::Direction;
 
 use crate::ast::Language;
+use crate::graph::scope::{FileScope, ScopeResolver};
 
 #[derive(Debug, Clone)]
 pub struct SymbolNode {
@@ -37,6 +38,8 @@ pub struct ProjectCodeGraph {
     pub graph: StableDiGraph<SymbolNode, RelationEdge>,
     pub file_hashes: BTreeMap<PathBuf, blake3::Hash>,
     pub dropped: BTreeMap<String, usize>,
+    pub resolver: ScopeResolver,
+    pub scopes: HashMap<PathBuf, FileScope>,
 }
 
 impl ProjectCodeGraph {

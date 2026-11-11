@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -9,17 +10,20 @@ use tupi_kernel::ToolError;
 use crate::ast::{AstChunker, Language};
 use crate::graph::model::{ProjectCodeGraph, RelationEdge, RelationKind, SymbolNode};
 use crate::graph::queries::GraphQueries;
+use crate::graph::scope::{
+    CallSite, FileScope, ImportTarget, Resolution, ScopeResolver, UseItem, crate_name_for,
+    expand_use, pick_target,
+};
 
 pub struct GraphBuilder {
     queries: GraphQueries,
 }
 
-#[allow(dead_code)]
-struct CallSite {
-    name: String,
-    line: usize,
-    receiver: Option<String>,
-    path: Option<String>,
+struct ParsedFile {
+    relative: PathBuf,
+    content: String,
+    language: Language,
+    tree: Option<tree_sitter::Tree>,
 }
 
 impl GraphBuilder {
@@ -32,30 +36,35 @@ impl GraphBuilder {
     pub fn build(&self, root: &Path) -> Result<ProjectCodeGraph, ToolError> {
         let files = collect_files(root)?;
         let mut graph = ProjectCodeGraph::new();
+        let mut parsed = Vec::new();
 
-        for path in &files {
-            let Ok(content) = std::fs::read_to_string(path) else {
+        for path in files {
+            let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let relative = crate::paths::relative(root, path);
-            let hash = blake3::hash(content.as_bytes());
-            graph.file_hashes.insert(path.clone(), hash);
-
-            let Some(language) = Language::from_path(path) else {
+            let relative = PathBuf::from(crate::paths::relative(root, &path));
+            let Some(language) = Language::from_path(&path) else {
                 continue;
             };
-            let snippets = AstChunker::new().snippets(path, &content);
+            graph
+                .file_hashes
+                .insert(path.clone(), blake3::hash(content.as_bytes()));
+            graph
+                .resolver
+                .register_file(&relative, &crate_name_for(&relative));
+
+            let snippets = AstChunker::new().snippets(&path, &content);
             for snippet in snippets {
                 let is_callable = snippet.signature.contains("fn ");
                 let is_public = snippet.signature.trim_start().starts_with("pub");
-                let is_test = relative.contains("/tests/")
-                    || relative.starts_with("tests/")
+                let is_test = relative.to_string_lossy().contains("/tests/")
+                    || relative.to_string_lossy().starts_with("tests/")
                     || has_test_attribute(&content, snippet.start_line)
                     || snippet.code.contains("#[cfg(test)]");
                 graph.graph.add_node(SymbolNode {
                     name: snippet.symbol_name,
                     qualified: snippet.qualified_name,
-                    relative: relative.clone(),
+                    relative: relative.to_string_lossy().to_string(),
                     start_line: snippet.start_line,
                     end_line: snippet.end_line,
                     signature: snippet.signature,
@@ -66,18 +75,47 @@ impl GraphBuilder {
                 });
             }
 
-            let Some(tree) = parse(path, &content, language) else {
+            parsed.push(ParsedFile {
+                tree: parse(&content, language),
+                relative,
+                content,
+                language,
+            });
+        }
+
+        for file in &parsed {
+            let Some(tree) = &file.tree else {
                 continue;
             };
-            let calls = collect_calls(&self.queries, language, &tree.root_node(), &content);
+            let scope = collect_imports(
+                &self.queries,
+                file.language,
+                &tree.root_node(),
+                &file.content,
+                &file.relative,
+                &graph.resolver,
+            );
+            graph.scopes.insert(file.relative.clone(), scope);
+        }
+
+        for file in &parsed {
+            let Some(tree) = &file.tree else {
+                continue;
+            };
+            let calls = collect_calls(
+                &self.queries,
+                file.language,
+                &tree.root_node(),
+                &file.content,
+            );
+            let bindings = collect_bindings(&file.content);
             let callers = graph
                 .graph
                 .node_indices()
                 .filter(|&index| {
-                    graph
-                        .graph
-                        .node_weight(index)
-                        .is_some_and(|node| node.relative == relative && node.is_callable)
+                    graph.graph.node_weight(index).is_some_and(|node| {
+                        node.relative == file.relative.to_string_lossy() && node.is_callable
+                    })
                 })
                 .collect::<Vec<_>>();
 
@@ -89,41 +127,70 @@ impl GraphBuilder {
                 }) else {
                     continue;
                 };
-                let targets = targets_by_name(&graph, &call.name);
-                match targets.len() {
-                    0 => {}
-                    1 => {
+
+                let mut definitions: Vec<NodeIndex> = graph
+                    .graph
+                    .node_indices()
+                    .filter(|&index| {
+                        graph
+                            .graph
+                            .node_weight(index)
+                            .is_some_and(|node| node.name == call.name)
+                    })
+                    .collect();
+                if let Some(receiver) = &call.receiver
+                    && let Some(ty) = bindings.get(receiver)
+                {
+                    let typed: Vec<NodeIndex> = definitions
+                        .iter()
+                        .copied()
+                        .filter(|&index| {
+                            graph.graph.node_weight(index).is_some_and(|node| {
+                                node.qualified.starts_with(&format!("{ty}::"))
+                                    || node.qualified.contains(&format!("::{ty}::"))
+                            })
+                        })
+                        .collect();
+                    if !typed.is_empty() {
+                        definitions = typed;
+                    }
+                }
+
+                let scope = graph
+                    .scopes
+                    .get(&file.relative)
+                    .cloned()
+                    .unwrap_or_default();
+                let resolution = pick_target(
+                    &call.name,
+                    &file.relative,
+                    &scope,
+                    &graph.resolver,
+                    call.path.as_deref(),
+                    &definitions,
+                    &graph,
+                );
+                match resolution {
+                    Resolution::Resolved(target) => {
                         graph.graph.add_edge(
                             caller,
-                            targets[0],
+                            target,
                             RelationEdge {
                                 line: call.line,
                                 kind: RelationKind::Call,
                             },
                         );
                     }
-                    _ => {
-                        *graph.dropped.entry(call.name).or_default() += 1;
+                    Resolution::Ambiguous { .. } => {
+                        *graph.dropped.entry(call.name.clone()).or_default() += 1;
                     }
+                    Resolution::Unknown => {}
                 }
             }
         }
 
         Ok(graph)
     }
-}
-
-fn targets_by_name(graph: &ProjectCodeGraph, name: &str) -> Vec<NodeIndex> {
-    graph
-        .graph
-        .node_indices()
-        .filter(|&index| {
-            graph
-                .graph
-                .node_weight(index)
-                .is_some_and(|node| node.name == name && node.is_callable)
-        })
-        .collect()
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
@@ -148,10 +215,59 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
     Ok(files)
 }
 
-fn parse(_path: &Path, content: &str, language: Language) -> Option<tree_sitter::Tree> {
+fn parse(content: &str, language: Language) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language.tree_sitter_language()).ok()?;
     parser.parse(content, None)
+}
+
+fn collect_imports(
+    queries: &GraphQueries,
+    language: Language,
+    root: &Node<'_>,
+    content: &str,
+    relative: &Path,
+    resolver: &ScopeResolver,
+) -> FileScope {
+    let Some(query) = queries.imports_query(language) else {
+        return FileScope::default();
+    };
+    let Some(module) = resolver.caller_module(relative) else {
+        return FileScope::default();
+    };
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, content.as_bytes());
+    let path_index = query.capture_index_for_name("import.path");
+    let mut scope = FileScope::default();
+
+    while let Some(m) = matches.next() {
+        for capture in m.captures() {
+            if Some(capture.index) != path_index {
+                continue;
+            }
+            let Ok(text) = capture.node.utf8_text(content.as_bytes()) else {
+                continue;
+            };
+            for item in expand_use(text) {
+                match item {
+                    UseItem::Named { name, path } => {
+                        let target = resolver
+                            .resolve_import_in(relative, &module, &path)
+                            .unwrap_or(ImportTarget::External);
+                        scope.imports.insert(name, target);
+                    }
+                    UseItem::Glob { path } => {
+                        if let Some(ImportTarget::File(file)) =
+                            resolver.resolve_import_in(relative, &module, &path)
+                        {
+                            scope.globs.push(file);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    scope
 }
 
 fn collect_calls(
@@ -196,6 +312,60 @@ fn collect_calls(
         }
     }
     calls
+}
+
+fn collect_bindings(content: &str) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some((_, after)) = line.split_once("let ") {
+            let rest = after.trim_start_matches("mut ").trim();
+            if let Some((left, right)) = rest.split_once('=') {
+                let name = left.split(':').next().unwrap_or("").trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let ty = type_from_expr(right).or_else(|| {
+                        left.split_once(':')
+                            .map(|(_, ty)| clean_type(ty))
+                            .filter(|ty| !ty.is_empty())
+                    });
+                    if let Some(ty) = ty {
+                        bindings.insert(name.to_string(), ty);
+                    }
+                }
+            } else if let Some((name, ty)) = rest.split_once(':') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bindings.insert(name.to_string(), clean_type(ty));
+                }
+            }
+        }
+    }
+    bindings
+}
+
+fn type_from_expr(expr: &str) -> Option<String> {
+    let expr = expr.trim().trim_start_matches('&').trim();
+    let head = expr.split(['(', '{', ';']).next()?;
+    let (ty, rest) = head.split_once("::")?;
+    if rest.trim().is_empty() {
+        return None;
+    }
+    let ty = clean_type(ty);
+    (!ty.is_empty()).then_some(ty)
+}
+
+fn clean_type(ty: &str) -> String {
+    ty.trim()
+        .trim_start_matches('&')
+        .trim()
+        .trim_start_matches("mut ")
+        .trim()
+        .trim_end_matches('<')
+        .split('<')
+        .next()
+        .unwrap_or(ty)
+        .trim()
+        .to_string()
 }
 
 fn has_test_attribute(content: &str, start_line: usize) -> bool {
