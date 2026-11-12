@@ -117,6 +117,15 @@ impl ReadTool {
         params: &ReadParams,
         rev: &str,
     ) -> Result<(PathBuf, String, String), ToolError> {
+        let rev = rev.trim();
+        if rev.is_empty()
+            || rev.starts_with('-')
+            || rev
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace() || ch == ':')
+        {
+            return Err(ToolError::InvalidArguments(format!("rev inválida: {rev}")));
+        }
         let root = self
             .root_dir
             .canonicalize()
@@ -138,7 +147,11 @@ impl ReadTool {
             .to_string();
         let output = crate::proc::program(
             "git",
-            &["show".to_string(), format!("{rev}:{relative}")],
+            &[
+                "show".to_string(),
+                "--end-of-options".to_string(),
+                format!("{rev}:{relative}"),
+            ],
             &root,
             std::time::Duration::from_secs(30),
         )?;
@@ -971,5 +984,23 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, ToolError::OutsideRoot(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_flag_like_rev_is_rejected_as_invalid_arguments() {
+        let dir = tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let tool = tool_for(dir.path());
+        let error = tool
+            .read(ReadParams {
+                path: "a.rs".to_string(),
+                symbol: None,
+                budget_tokens: None,
+                repeat: None,
+                rev: Some("--output=/tmp/pwned".to_string()),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
     }
 }

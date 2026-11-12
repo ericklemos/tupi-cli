@@ -44,12 +44,31 @@ impl MoveTool {
 }
 
 fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "symlink não suportado em diretório: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("symlink não suportado em diretório: {}", from.display()),
+            ));
+        } else if file_type.is_dir() {
             copy_dir(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)?;
@@ -432,5 +451,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_a_directory_containing_a_symlink_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top-secret").unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("a/link.txt"),
+        )
+        .unwrap();
+
+        let err = Tool::call(
+            &tool(dir.path()),
+            serde_json::json!({"from": "a", "to": "b", "copy": true}),
+        );
+        assert!(
+            err.is_err(),
+            "copying a directory with a symlink should be rejected"
+        );
+        assert!(!dir.path().join("b/link.txt").exists());
     }
 }

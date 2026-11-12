@@ -17,17 +17,43 @@ const SESSION_ID: u64 = 1;
 
 pub const MAX_TOOL_STEPS: usize = 30;
 
-pub(crate) async fn run_tool(tools: &ToolRegistry, call: &ToolCall) -> Result<String, String> {
+pub(crate) async fn run_tool(
+    tools: &ToolRegistry,
+    call: &ToolCall,
+    cancel_flag: &Arc<AtomicBool>,
+    in_flight: &Arc<tokio::sync::Notify>,
+    in_flight_count: &Arc<AtomicUsize>,
+) -> Result<String, String> {
     let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
         .map_err(|error| format!("argumento inválido: {error}"))?;
     let tool = tools
         .get(&call.name)
         .ok_or_else(|| format!("tool desconhecida: {}", call.name))?;
 
-    tokio::task::spawn_blocking(move || tool.call(arguments))
-        .await
-        .map_err(|error| format!("falha ao executar tool: {error}"))?
-        .map_err(|error| error.to_string())
+    let flag = Arc::clone(cancel_flag);
+    let notify = Arc::clone(in_flight);
+    let count = Arc::clone(in_flight_count);
+    count.fetch_add(1, Ordering::SeqCst);
+
+    struct InFlightGuard {
+        count: Arc<AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.notify.notify_waiters();
+            }
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let _guard = InFlightGuard { count, notify };
+        tupi_kernel::with_tool_cancel(flag, || tool.call(arguments))
+    })
+    .await
+    .map_err(|error| format!("falha ao executar tool: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn describe_call(tools: &ToolRegistry, call: &ToolCall) -> String {
@@ -67,10 +93,76 @@ fn add_tokens(total: Option<u64>, value: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Escala entre o que o provider cobra e o que o app estima, em partes por
+/// milhão: `SCALE_ONE` significa estimativa exata. O template do provedor
+/// cobra tokens que o histórico não mostra (envelope de tool call, envelope de
+/// mensagem), então o único número confiável é o `prompt_tokens` devolvido por
+/// ele. A escala usa esse número como verdade e encolhe o orçamento de
+/// planejamento quando o app subestima — sem constante de calibração chutada.
+const SCALE_ONE: u64 = 1_000_000;
+const SCALE_MIN: u64 = 500_000;
+const SCALE_MAX: u64 = 4_000_000;
+
+fn observed_scale(estimated: usize, charged: u64) -> Option<u64> {
+    if estimated == 0 || charged == 0 {
+        return None;
+    }
+    let scale = (charged as u128 * SCALE_ONE as u128 / estimated as u128) as u64;
+    Some(scale.clamp(SCALE_MIN, SCALE_MAX))
+}
+
+fn next_scale(current: u64, observed: Option<u64>) -> u64 {
+    match observed {
+        Some(observed) => (current + observed) / 2,
+        None => current,
+    }
+}
+
+fn scaled_budget(budget: usize, scale: u64) -> usize {
+    ((budget as u128 * SCALE_ONE as u128) / scale.max(1) as u128) as usize
+}
+
+fn plan_context(
+    messages: &[Message],
+    context_budget: usize,
+    context_target: usize,
+    recent_results: usize,
+    tool_tokens: usize,
+) -> tupi_domain::context::Plan {
+    if context_budget == 0 {
+        return tupi_domain::context::plan_amortized_with(messages, 0, 0, recent_results);
+    }
+
+    let message_budget = context_budget.saturating_sub(tool_tokens).max(1);
+    let message_target = match context_target {
+        0 => message_budget.saturating_mul(2) / 5,
+        target => {
+            ((message_budget as u128 * target.min(context_budget) as u128) / context_budget as u128)
+                as usize
+        }
+    };
+
+    tupi_domain::context::plan_amortized_with(
+        messages,
+        message_budget,
+        message_target,
+        recent_results,
+    )
+}
+
+fn tool_spec_tokens(specs: &[tupi_kernel::ToolSpec]) -> usize {
+    let payload = tupi_kernel::tools_payload(specs);
+    let json = serde_json::to_string(&payload).unwrap_or_default();
+    tupi_domain::tokens::estimate_tokens(&json)
+}
+
 struct StreamHandle {
     request_id: RequestId,
     task: tokio::task::JoinHandle<()>,
     partial: Arc<Mutex<String>>,
+    cancel_flag: Arc<AtomicBool>,
+    in_flight: Arc<tokio::sync::Notify>,
+    in_flight_count: Arc<AtomicUsize>,
 }
 
 pub struct App {
@@ -95,6 +187,8 @@ pub struct App {
     context_target: AtomicUsize,
     /// Quantos resultados de tool recentes ficam inteiros na poda.
     context_recent_results: AtomicUsize,
+    /// Correção do orçamento observada no provider (real/estimado em ppm).
+    token_scale: Arc<AtomicU64>,
     /// Workflows que /workflows/<nome> pode invocar. Vazio por padrão para
     /// que os construtores existentes não dependam do disco.
     workflows: Arc<dyn WorkflowIndex>,
@@ -172,6 +266,7 @@ impl App {
             context_recent_results: AtomicUsize::new(
                 tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
             ),
+            token_scale: Arc::new(AtomicU64::new(SCALE_ONE)),
             workflows: Arc::new(crate::workflow::EmptyIndex),
             telemetry: crate::telemetry::Telemetry::disabled(),
         })
@@ -235,9 +330,7 @@ impl App {
         mut self: Arc<Self>,
         telemetry: crate::telemetry::Telemetry,
     ) -> Arc<Self> {
-        Arc::get_mut(&mut self)
-            .expect("App recém-criado")
-            .telemetry = telemetry;
+        Arc::get_mut(&mut self).expect("App recém-criado").telemetry = telemetry;
         self
     }
 
@@ -295,7 +388,6 @@ impl App {
 
         let request_id = self.next_request.fetch_add(1, Ordering::SeqCst);
         self.active.store(request_id, Ordering::SeqCst);
-        self.session.push(Role::User, text);
 
         let model = self.model.lock().unwrap().clone();
         let specs = self.tools.specs();
@@ -306,53 +398,148 @@ impl App {
         let context_budget = self.context_budget.load(Ordering::SeqCst);
         let context_target = self.context_target.load(Ordering::SeqCst);
         let context_recent_results = self.context_recent_results.load(Ordering::SeqCst);
+        let token_scale = Arc::clone(&self.token_scale);
+        let tool_tokens = tool_spec_tokens(&specs);
+        let prefix_tokens = if prefix.is_empty() {
+            0
+        } else {
+            tupi_domain::tokens::estimate_message(&Message::new(Role::System, prefix.clone()))
+        };
+        let telemetry = self.telemetry.clone();
+        let turn_started_at = std::time::Instant::now();
+
+        if telemetry.is_enabled() {
+            let history = self.session.messages();
+            let estimate = history
+                .iter()
+                .map(tupi_domain::tokens::estimate_message)
+                .sum::<usize>();
+            telemetry.record(crate::telemetry::TelemetryEvent::TurnStarted(
+                crate::telemetry::TurnStarted {
+                    request: request_id,
+                    text_chars: text.chars().count(),
+                    text: text.clone(),
+                    model: model.clone(),
+                    history_messages: history.len(),
+                    history_estimate: estimate,
+                    context_budget,
+                },
+            ));
+        }
+
+        self.session.push(Role::User, text);
 
         let partial = Arc::new(Mutex::new(String::new()));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let in_flight = Arc::new(tokio::sync::Notify::new());
+        let in_flight_count = Arc::new(AtomicUsize::new(0));
         let events = self.events.clone();
         let session = Arc::clone(&self.session);
         let active = Arc::clone(&self.active);
         let current = Arc::clone(&self.current);
         let pending = Arc::clone(&self.pending);
         let task_partial = Arc::clone(&partial);
+        let task_cancel = Arc::clone(&cancel_flag);
+        let task_in_flight = Arc::clone(&in_flight);
+        let task_in_flight_count = Arc::clone(&in_flight_count);
 
         let task = tokio::spawn(async move {
             let mut failure = None;
+            let mut failure_kind: Option<&'static str> = None;
+            let mut failure_http: Option<u16> = None;
             let mut step = 0;
+            let mut tool_calls_count = 0usize;
             let mut prompt_tokens = None;
             let mut cached_tokens = None;
             let mut completion_tokens = None;
+            let warn_at = max_tool_steps.saturating_mul(3) / 5;
 
             while step < max_tool_steps {
                 step += 1;
+                let final_step = step >= max_tool_steps;
+                let remaining = max_tool_steps.saturating_sub(step);
                 task_partial.lock().unwrap().clear();
+
+                let warning_message = if step >= warn_at.max(1) {
+                    let warning = if final_step {
+                        "Freio de passos: última chamada, sem tools. Responda agora, em texto, com o que já foi descoberto. Se faltar dado essencial, diga o que falta.".to_string()
+                    } else {
+                        format!(
+                            "Freio de passos: restam {remaining} de {max_tool_steps} chamadas. Pare de explorar e comece a responder. Só chame tool se for indispensável."
+                        )
+                    };
+                    Some(Message::new(Role::System, warning))
+                } else {
+                    None
+                };
+                let warning_tokens = warning_message
+                    .as_ref()
+                    .map(tupi_domain::tokens::estimate_message)
+                    .unwrap_or(0);
+
+                // Poda amortizada: corta fundo quando estoura o teto, para que o
+                // prefixo cacheado do provedor sobreviva aos próximos passos.
+                // O orçamento é encolhido pela escala observada: se o provider
+                // cobrou mais do que estimamos, planejamos com menos espaço.
+                let request_tool_tokens = if final_step { 0 } else { tool_tokens };
+                let fixed_tokens = request_tool_tokens
+                    .saturating_add(prefix_tokens)
+                    .saturating_add(warning_tokens);
+                let scale = token_scale.load(Ordering::SeqCst);
+                let planned = plan_context(
+                    &session.messages(),
+                    scaled_budget(context_budget, scale),
+                    scaled_budget(context_target, scale),
+                    context_recent_results,
+                    fixed_tokens,
+                );
+                let trimmed = planned.trimmed();
+                let omitted_units = planned.omitted_units;
+                let shrunk_results = planned.shrunk_results;
+                if trimmed {
+                    session.replace_messages(planned.messages.clone());
+                }
 
                 let mut messages = Vec::new();
                 if !prefix.is_empty() {
                     messages.push(Message::new(Role::System, prefix.clone()));
                 }
-                // Poda amortizada: corta fundo quando estoura o teto, para que o
-                // prefixo cacheado do provedor sobreviva aos próximos passos.
-                let target = if context_target == 0 {
-                    context_budget.saturating_mul(2) / 5
-                } else {
-                    context_target
-                };
-                let planned = tupi_domain::context::plan_amortized_with(
-                    &session.messages(),
-                    context_budget,
-                    target,
-                    context_recent_results,
-                );
-                if planned.trimmed() {
+                messages.extend(planned.messages);
+                if let Some(warning) = warning_message {
+                    messages.push(warning);
+                }
+
+                // A estimativa é do que sai no request, não do que o plano
+                // pretendia: prefixo, aviso de freio e chamadas entram aqui.
+                let prompt_estimate = messages
+                    .iter()
+                    .map(tupi_domain::tokens::estimate_message)
+                    .sum::<usize>()
+                    .saturating_add(request_tool_tokens);
+                if trimmed {
                     events.publish(Event::ContextTrimmed {
                         request_id,
-                        estimate: planned.estimate,
-                        omitted_units: planned.omitted_units,
-                        shrunk_results: planned.shrunk_results,
+                        estimate: prompt_estimate,
+                        omitted_units,
+                        shrunk_results,
                     });
+                    if telemetry.is_enabled() {
+                        telemetry.record(crate::telemetry::TelemetryEvent::ContextTrimmed(
+                            crate::telemetry::ContextTrimmed {
+                                request: request_id,
+                                step,
+                                estimate: prompt_estimate,
+                                omitted_units,
+                                shrunk_results,
+                            },
+                        ));
+                    }
                 }
-                messages.extend(planned.messages);
-                let request = ChatRequest::new(model.clone(), messages).with_tools(specs.clone());
+                let request = ChatRequest::new(model.clone(), messages).with_tools(if final_step {
+                    Vec::new()
+                } else {
+                    specs.clone()
+                });
 
                 if show_prompts {
                     events.publish(Event::PromptMessages {
@@ -361,21 +548,66 @@ impl App {
                     });
                 }
 
+                if telemetry.is_enabled() {
+                    let body = crate::debug::render_prompt(&request);
+                    let clipped = crate::telemetry::clip_preview(&body);
+                    telemetry.record(crate::telemetry::TelemetryEvent::PromptSent(
+                        crate::telemetry::PromptSent {
+                            request: request_id,
+                            step,
+                            model: model.clone(),
+                            body: clipped.text,
+                            body_hash: crate::telemetry::text_hash(&body),
+                            body_chars: clipped.chars,
+                            body_bytes: clipped.bytes,
+                            truncated: clipped.truncated,
+                            estimate_tokens: prompt_estimate,
+                            messages: request.messages.len(),
+                            tools: request.tools.len(),
+                        },
+                    ));
+                }
+
                 let mut streamed_text = String::new();
                 let mut calls = Vec::new();
                 let mut stream_failed = false;
+                let provider_started = std::time::Instant::now();
+                let mut first_token_at: Option<std::time::Instant> = None;
+                let mut delta_count = 0usize;
+                let mut delta_chars = 0usize;
+                let mut step_prompt_tokens = None;
+                let mut step_cached_tokens = None;
+                let mut step_completion_tokens = None;
+                let mut step_tool_names: Vec<String> = Vec::new();
 
                 match provider.stream_chat(request).await {
-                    Err(error) => failure = Some(error.to_string()),
+                    Err(error) => {
+                        failure_kind = Some(crate::telemetry::provider_error_kind(&error));
+                        failure_http = crate::telemetry::provider_http_status(&error);
+                        failure = Some(error.to_string());
+                    }
                     Ok(mut stream) => {
                         while let Some(item) = stream.next().await {
                             match item {
                                 Ok(ProviderEvent::Text(text)) => {
+                                    if telemetry.is_enabled() {
+                                        if first_token_at.is_none() {
+                                            first_token_at = Some(std::time::Instant::now());
+                                        }
+                                        delta_count += 1;
+                                        delta_chars += text.chars().count();
+                                    }
                                     streamed_text.push_str(&text);
                                     task_partial.lock().unwrap().push_str(&text);
                                     events.publish(Event::Token { request_id, text });
                                 }
                                 Ok(ProviderEvent::ToolCalls(tool_calls)) => {
+                                    if telemetry.is_enabled() {
+                                        step_tool_names = tool_calls
+                                            .iter()
+                                            .map(|call| call.name.clone())
+                                            .collect();
+                                    }
                                     calls = tool_calls;
                                 }
                                 Ok(ProviderEvent::Usage {
@@ -383,11 +615,18 @@ impl App {
                                     cached_tokens: cached,
                                     completion_tokens: completion,
                                 }) => {
+                                    step_prompt_tokens = add_tokens(step_prompt_tokens, prompt);
+                                    step_cached_tokens = add_tokens(step_cached_tokens, cached);
+                                    step_completion_tokens =
+                                        add_tokens(step_completion_tokens, completion);
                                     prompt_tokens = add_tokens(prompt_tokens, prompt);
                                     cached_tokens = add_tokens(cached_tokens, cached);
                                     completion_tokens = add_tokens(completion_tokens, completion);
                                 }
                                 Err(error) => {
+                                    failure_kind =
+                                        Some(crate::telemetry::provider_error_kind(&error));
+                                    failure_http = crate::telemetry::provider_http_status(&error);
                                     failure = Some(error.to_string());
                                     stream_failed = true;
                                     break;
@@ -397,7 +636,43 @@ impl App {
                     }
                 }
 
-                if !streamed_text.is_empty() || !calls.is_empty() {
+                if let Some(charged) = step_prompt_tokens {
+                    let observed = observed_scale(prompt_estimate, charged);
+                    let current = token_scale.load(Ordering::SeqCst);
+                    token_scale.store(next_scale(current, observed), Ordering::SeqCst);
+                }
+
+                if telemetry.is_enabled() {
+                    telemetry.record(crate::telemetry::TelemetryEvent::ProviderResponse(
+                        crate::telemetry::ProviderResponse {
+                            request: request_id,
+                            step,
+                            estimate_tokens: prompt_estimate,
+                            scale_ppm: scale,
+                            duration_us: crate::telemetry::micros(provider_started.elapsed()),
+                            first_token_us: first_token_at.map(|first| {
+                                crate::telemetry::micros(first.duration_since(provider_started))
+                            }),
+                            delta_count,
+                            delta_chars,
+                            tool_calls: calls.len(),
+                            tool_call_names: step_tool_names,
+                            prompt_tokens: step_prompt_tokens,
+                            cached_tokens: step_cached_tokens,
+                            completion_tokens: step_completion_tokens,
+                            ok: failure.is_none(),
+                            error: failure.clone(),
+                            error_kind: failure_kind.map(|kind| kind.to_string()),
+                            http_status: failure_http,
+                        },
+                    ));
+                }
+
+                if final_step {
+                    if !streamed_text.is_empty() {
+                        session.push_message(Message::assistant(streamed_text));
+                    }
+                } else if !streamed_text.is_empty() || !calls.is_empty() {
                     session
                         .push_message(Message::assistant_with_calls(streamed_text, calls.clone()));
                     *pending.lock().unwrap() = calls.clone();
@@ -411,19 +686,7 @@ impl App {
                     );
                     break;
                 }
-                if calls.is_empty() {
-                    break;
-                }
-
-                if step >= max_tool_steps {
-                    close_unanswered(
-                        &session,
-                        &pending,
-                        "limite de passos atingido: chamada não executada",
-                    );
-                    failure = Some(format!(
-                        "limite de {max_tool_steps} passos de tools atingido"
-                    ));
+                if final_step || calls.is_empty() {
                     break;
                 }
 
@@ -432,22 +695,59 @@ impl App {
                         break;
                     }
 
+                    tool_calls_count += 1;
+                    let summary = describe_call(&tools, &call);
                     events.publish(Event::ToolStarted {
                         request_id,
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
-                        summary: describe_call(&tools, &call),
+                        summary: summary.clone(),
                     });
 
+                    if telemetry.is_enabled() {
+                        let arguments = crate::telemetry::clip(&call.arguments);
+                        telemetry.record(crate::telemetry::TelemetryEvent::ToolStarted(
+                            crate::telemetry::ToolStarted {
+                                request: request_id,
+                                call: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: arguments.text,
+                                arguments_chars: arguments.chars,
+                                arguments_bytes: arguments.bytes,
+                                truncated: arguments.truncated,
+                                summary: summary.clone(),
+                            },
+                        ));
+                    }
+
+                    let tool_started = std::time::Instant::now();
                     let (content, ok) = match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
-                        crate::pipeline::execute(&tools, &events, request_id, &call).await
+                        crate::pipeline::execute(
+                            &tools,
+                            &events,
+                            request_id,
+                            &call,
+                            &telemetry,
+                            &task_cancel,
+                            &task_in_flight,
+                            &task_in_flight_count,
+                        )
+                        .await
                     } else {
-                        run_tool(&tools, &call).await
+                        run_tool(
+                            &tools,
+                            &call,
+                            &task_cancel,
+                            &task_in_flight,
+                            &task_in_flight_count,
+                        )
+                        .await
                     } {
                         Ok(result) => (result, true),
                         Err(error) => (error, false),
                     };
+                    let duration = tool_started.elapsed();
                     let summary = summarize(&content);
 
                     events.publish(Event::ToolFinished {
@@ -455,8 +755,32 @@ impl App {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         ok,
-                        summary,
+                        summary: summary.clone(),
                     });
+
+                    if telemetry.is_enabled() {
+                        let clipped = crate::telemetry::clip(&content);
+                        let (result, error) = if ok {
+                            (Some(clipped.text), None)
+                        } else {
+                            (None, Some(clipped.text))
+                        };
+                        telemetry.record(crate::telemetry::TelemetryEvent::ToolFinished(
+                            crate::telemetry::ToolFinished {
+                                request: request_id,
+                                call: call.id.clone(),
+                                name: call.name.clone(),
+                                duration_us: crate::telemetry::micros(duration),
+                                ok,
+                                result,
+                                result_chars: clipped.chars,
+                                result_bytes: clipped.bytes,
+                                truncated: clipped.truncated,
+                                summary,
+                                error,
+                            },
+                        ));
+                    }
 
                     // O resultado e a baixa no pending são atômicos sob o mesmo
                     // lock que o cancel usa: nenhuma call recebe dois resultados.
@@ -473,11 +797,13 @@ impl App {
             }
             drop(slot);
 
+            let cancelled = active.load(Ordering::SeqCst) != request_id;
+
             // A TUI pode enfileirar e disparar o próximo turno assim que vê
             // o evento: liberar antes do publish evita um Busy espúrio.
             active.store(0, Ordering::SeqCst);
 
-            match failure {
+            match failure.clone() {
                 Some(message) => {
                     events.publish(Event::StreamFailed {
                         request_id,
@@ -493,12 +819,33 @@ impl App {
                     });
                 }
             }
+
+            if telemetry.is_enabled() {
+                telemetry.record(crate::telemetry::TelemetryEvent::TurnFinished(
+                    crate::telemetry::TurnFinished {
+                        request: request_id,
+                        duration_us: crate::telemetry::micros(turn_started_at.elapsed()),
+                        ok: failure.is_none(),
+                        cancelled,
+                        steps: step,
+                        tool_calls: tool_calls_count,
+                        prompt_tokens,
+                        cached_tokens,
+                        completion_tokens,
+                        error: failure.clone(),
+                        error_kind: failure_kind.map(|kind| kind.to_string()),
+                    },
+                ));
+            }
         });
 
         *self.current.lock().unwrap() = Some(StreamHandle {
             request_id,
             task,
             partial,
+            cancel_flag,
+            in_flight,
+            in_flight_count,
         });
 
         Ok(CommandOutcome::Started { request_id })
@@ -514,18 +861,36 @@ impl App {
         }
 
         let handle = self.current.lock().unwrap().take();
-        let (task, partial) = match handle {
-            Some(handle) if handle.request_id == request_id => {
-                (Some(handle.task), Some(handle.partial))
-            }
-            _ => (None, None),
+        let (task, partial, cancel_flag, in_flight, in_flight_count) = match handle {
+            Some(handle) if handle.request_id == request_id => (
+                Some(handle.task),
+                Some(handle.partial),
+                Some(handle.cancel_flag),
+                Some(handle.in_flight),
+                Some(handle.in_flight_count),
+            ),
+            _ => (None, None, None, None, None),
         };
+
+        if let Some(flag) = &cancel_flag {
+            flag.store(true, Ordering::SeqCst);
+        }
 
         // Espera a task parar de verdade: depois disso ela não escreve mais no
         // histórico, e um novo turno pode começar com o histórico consistente.
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
+        }
+
+        if let (Some(notify), Some(count)) = (in_flight, in_flight_count) {
+            loop {
+                let notified = notify.notified();
+                if count.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                notified.await;
+            }
         }
 
         let had_pending = !self.pending.lock().unwrap().is_empty();
@@ -553,120 +918,218 @@ impl App {
 #[async_trait]
 impl CommandHandler for App {
     async fn handle(&self, command: Command) -> Result<CommandOutcome, CommandError> {
-        match command {
-            Command::SendMessage { text } => self.send_message(text),
-            Command::RunWorkflow { name, extra } => self.run_workflow(&name, &extra),
-            Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
-            Command::SetModel { model } => self.set_model(model),
-            Command::ToggleShowPrompts => {
-                let enabled = !self.show_prompts.load(Ordering::SeqCst);
+        let info = self
+            .telemetry
+            .is_enabled()
+            .then(|| crate::telemetry::CommandInfo::new(&command));
+        if let Some(info) = &info {
+            self.telemetry.record(info.started());
+        }
 
-                if let Some(store) = self.store.as_ref()
-                    && let Err(error) = store
-                        .save_setting(crate::debug::SHOW_PROMPTS_KEY, crate::debug::value(enabled))
-                {
-                    return Err(CommandError::Internal(format!(
-                        "falha ao gravar configuração: {error}"
-                    )));
-                }
-
-                self.show_prompts.store(enabled, Ordering::SeqCst);
-                Ok(CommandOutcome::ShowPrompts { enabled })
-            }
-            Command::RefreshModels => {
-                // A TUI só reage a eventos: banco e provedor rodam fora do loop.
-                let provider = self.provider()?;
-                let events = self.events.clone();
-                let store = self.store.clone();
-                let provider_id = self.provider_id.clone();
-
-                tokio::spawn(async move {
-                    let now_unix = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_secs())
-                        .unwrap_or(0);
-
-                    let cached = match store.as_ref() {
-                        Some(store) => {
-                            let store = Arc::clone(store);
-                            let id = provider_id.clone();
-                            tokio::task::spawn_blocking(move || store.models(&id))
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .flatten()
-                        }
-                        None => None,
-                    };
-
-                    if let Some(entry) = cached.as_ref()
-                        && entry.is_fresh(now_unix, MODELS_TTL_SECS)
-                    {
-                        events.publish(Event::ModelsLoaded {
-                            models: entry.models.clone(),
-                        });
-                        return;
+        let started = std::time::Instant::now();
+        let result = async {
+            match command {
+                Command::SendMessage { text } => self.send_message(text),
+                Command::RunWorkflow { name, extra } => self.run_workflow(&name, &extra),
+                Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
+                Command::SetModel { model } => self.set_model(model),
+                Command::NewSession => {
+                    let request_id = self.active.swap(0, Ordering::SeqCst);
+                    if request_id != 0 {
+                        self.cancel(request_id).await;
                     }
 
-                    match provider.list_models().await {
-                        Ok(models) => {
-                            if let Some(store) = store.as_ref() {
+                    close_unanswered(&self.session, &self.pending, "nova sessão iniciada");
+                    self.session.replace_messages(Vec::new());
+
+                    Ok(CommandOutcome::SessionReset)
+                }
+                Command::ToggleShowPrompts => {
+                    let enabled = !self.show_prompts.load(Ordering::SeqCst);
+
+                    if let Some(store) = self.store.as_ref()
+                        && let Err(error) = store
+                            .save_setting(crate::debug::SHOW_PROMPTS_KEY, crate::debug::value(enabled))
+                    {
+                        return Err(CommandError::Internal(format!(
+                            "falha ao gravar configuração: {error}"
+                        )));
+                    }
+
+                    self.show_prompts.store(enabled, Ordering::SeqCst);
+                    Ok(CommandOutcome::ShowPrompts { enabled })
+                }
+                Command::RefreshModels => {
+                    // A TUI só reage a eventos: banco e provedor rodam fora do loop.
+                    let provider = self.provider()?;
+                    let events = self.events.clone();
+                    let store = self.store.clone();
+                    let provider_id = self.provider_id.clone();
+                    let telemetry = self.telemetry.clone();
+
+                    tokio::spawn(async move {
+                        let started = std::time::Instant::now();
+                        let now_unix = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|elapsed| elapsed.as_secs())
+                            .unwrap_or(0);
+
+                        let cached = match store.as_ref() {
+                            Some(store) => {
                                 let store = Arc::clone(store);
                                 let id = provider_id.clone();
-                                let to_save = models.clone();
+                                tokio::task::spawn_blocking(move || store.models(&id))
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                    .flatten()
+                            }
+                            None => None,
+                        };
 
-                                match tokio::task::spawn_blocking(move || {
-                                    store.save_models(&id, &to_save, now_unix)
-                                })
-                                .await
-                                {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(error)) => {
-                                        tracing::warn!(%error, "falha ao gravar catálogo local");
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, "falha ao agendar gravação");
+                        if let Some(entry) = cached.as_ref()
+                            && entry.is_fresh(now_unix, MODELS_TTL_SECS)
+                        {
+                            telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
+                                crate::telemetry::ModelsRefreshed {
+                                    source: "cache".to_string(),
+                                    count: entry.models.len(),
+                                    models: entry.models.clone(),
+                                    duration_us: crate::telemetry::micros(started.elapsed()),
+                                    ok: true,
+                                    error: None,
+                                    error_kind: None,
+                                    http_status: None,
+                                },
+                            ));
+                            events.publish(Event::ModelsLoaded {
+                                models: entry.models.clone(),
+                            });
+                            return;
+                        }
+
+                        match provider.list_models().await {
+                            Ok(models) => {
+                                telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
+                                    crate::telemetry::ModelsRefreshed {
+                                        source: "provider".to_string(),
+                                        count: models.len(),
+                                        models: models.clone(),
+                                        duration_us: crate::telemetry::micros(started.elapsed()),
+                                        ok: true,
+                                        error: None,
+                                        error_kind: None,
+                                        http_status: None,
+                                    },
+                                ));
+
+                                if let Some(store) = store.as_ref() {
+                                    let store = Arc::clone(store);
+                                    let id = provider_id.clone();
+                                    let to_save = models.clone();
+
+                                    match tokio::task::spawn_blocking(move || {
+                                        store.save_models(&id, &to_save, now_unix)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => {
+                                            tracing::warn!(%error, "falha ao gravar catálogo local");
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(%error, "falha ao agendar gravação");
+                                        }
                                     }
                                 }
-                            }
 
-                            events.publish(Event::ModelsLoaded { models });
-                        }
-                        Err(error) => {
-                            if let Some(entry) = cached {
-                                tracing::warn!(%error, "usando catálogo salvo");
-                                events.publish(Event::ModelsLoaded {
-                                    models: entry.models,
-                                });
-                            } else {
-                                events.publish(Event::ModelsFailed {
-                                    message: error.to_string(),
-                                });
+                                events.publish(Event::ModelsLoaded { models });
+                            }
+                            Err(error) => {
+                                let models = cached
+                                    .as_ref()
+                                    .map(|entry| entry.models.clone())
+                                    .unwrap_or_default();
+                                telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
+                                    crate::telemetry::ModelsRefreshed {
+                                        source: "provider".to_string(),
+                                        count: models.len(),
+                                        models,
+                                        duration_us: crate::telemetry::micros(started.elapsed()),
+                                        ok: false,
+                                        error: Some(error.to_string()),
+                                        error_kind: Some(
+                                            crate::telemetry::provider_error_kind(&error).to_string(),
+                                        ),
+                                        http_status: crate::telemetry::provider_http_status(&error),
+                                    },
+                                ));
+
+                                if let Some(entry) = cached {
+                                    tracing::warn!(%error, "usando catálogo salvo");
+                                    events.publish(Event::ModelsLoaded {
+                                        models: entry.models,
+                                    });
+                                } else {
+                                    events.publish(Event::ModelsFailed {
+                                        message: error.to_string(),
+                                    });
+                                }
                             }
                         }
-                    }
-                });
+                    });
 
-                Ok(CommandOutcome::Noop)
+                    Ok(CommandOutcome::Noop)
+                }
             }
         }
+        .await;
+
+        if let Some(info) = &info {
+            self.telemetry
+                .record(info.finished(started.elapsed(), &result));
+        }
+
+        result
     }
 }
 
 #[async_trait]
 impl QueryHandler for App {
     async fn query(&self, query: Query) -> Result<QueryResult, QueryError> {
-        match query {
-            Query::History => Ok(QueryResult::History(self.session.messages())),
-            Query::ListProviders => Ok(QueryResult::Providers(self.registry.ids())),
-            Query::ListModels => {
-                let provider = self.registry.get(&self.provider_id).ok_or_else(|| {
-                    QueryError::Internal(format!("provedor '{}' não registrado", self.provider_id))
-                })?;
-                Ok(QueryResult::Models(provider.list_models().await?))
-            }
-            Query::ListWorkflows => Ok(QueryResult::Workflows(self.workflows.list())),
+        let info = self
+            .telemetry
+            .is_enabled()
+            .then(|| crate::telemetry::QueryInfo::new(&query));
+        if let Some(info) = &info {
+            self.telemetry.record(info.started());
         }
+
+        let started = std::time::Instant::now();
+        let result = async {
+            match query {
+                Query::History => Ok(QueryResult::History(self.session.messages())),
+                Query::ListProviders => Ok(QueryResult::Providers(self.registry.ids())),
+                Query::ListModels => {
+                    let provider = self.registry.get(&self.provider_id).ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "provedor '{}' não registrado",
+                            self.provider_id
+                        ))
+                    })?;
+                    Ok(QueryResult::Models(provider.list_models().await?))
+                }
+                Query::ListWorkflows => Ok(QueryResult::Workflows(self.workflows.list())),
+            }
+        }
+        .await;
+
+        if let Some(info) = &info {
+            self.telemetry
+                .record(info.finished(started.elapsed(), &result));
+        }
+
+        result
     }
 }
 
@@ -775,6 +1238,239 @@ mod prefix_tests {
                 .messages
                 .iter()
                 .all(|message| message.role != Role::System)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_charges_more_shrinks_the_next_budget() {
+        use tupi_kernel::{Tool, ToolError, ToolSpec};
+
+        struct BigEcho;
+
+        impl Tool for BigEcho {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "big".to_string(),
+                    description: "devolve muito texto".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn call(&self, _arguments: serde_json::Value) -> Result<String, ToolError> {
+                Ok("x".repeat(20_000))
+            }
+        }
+
+        fn charged(tokens: u64) -> Vec<Result<ProviderEvent, ProviderError>> {
+            vec![Ok(ProviderEvent::Usage {
+                prompt_tokens: Some(tokens),
+                cached_tokens: None,
+                completion_tokens: None,
+            })]
+        }
+
+        let bus = EventBus::new(128);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(Scripted {
+            scripts: Mutex::new(vec![
+                vec![
+                    Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "big".to_string(),
+                        arguments: "{}".to_string(),
+                    }])),
+                    Ok(ProviderEvent::Usage {
+                        prompt_tokens: Some(400_000),
+                        cached_tokens: None,
+                        completion_tokens: None,
+                    }),
+                ],
+                {
+                    let mut step = text("ok");
+                    step.extend(charged(400_000));
+                    step
+                },
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BigEcho));
+        let app = App::with_tools(
+            registry(provider),
+            "scripted",
+            "modelo".into(),
+            bus,
+            None,
+            tools,
+            String::new(),
+        )
+        .with_context_budget(10_000)
+        .with_context_target(0)
+        .with_context_recent_results(0);
+
+        app.handle(Command::SendMessage { text: "a".into() })
+            .await
+            .unwrap();
+
+        let mut trimmed = false;
+        while let Ok(event) = rx.recv().await {
+            if matches!(event, Event::ContextTrimmed { .. }) {
+                trimmed = true;
+            }
+            if matches!(event, Event::StreamFinished { .. }) {
+                break;
+            }
+        }
+
+        assert!(
+            trimmed,
+            "o provider cobrou 400k e o orçamento do passo seguinte não encolheu"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prompt_estimate_counts_the_system_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let telemetry = crate::telemetry::Telemetry::open(&path);
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let prefix = "PALAVRA ".repeat(200);
+        let expected = tupi_domain::tokens::estimate_tokens(&prefix);
+        let provider = Arc::new(Scripted {
+            scripts: Mutex::new(vec![text("ok")]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = app_with_prefix(provider, bus, &prefix).with_telemetry(telemetry);
+
+        app.handle(Command::SendMessage { text: "a".into() })
+            .await
+            .unwrap();
+        wait_for_finished(&mut rx).await;
+
+        let mut body = String::new();
+        for _ in 0..200 {
+            body = std::fs::read_to_string(&path).unwrap_or_default();
+            if body.contains("\"prompt_sent\"") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let estimate = body
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value["event"] == "prompt_sent")
+            .and_then(|value| value["estimate_tokens"].as_u64())
+            .expect("prompt_sent");
+
+        assert!(
+            estimate >= expected as u64,
+            "estimate {estimate} não contou o prefixo ({expected})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_observed_scale_doubles_when_the_provider_charges_double() {
+        assert_eq!(observed_scale(1_000, 2_000), Some(SCALE_ONE * 2));
+    }
+
+    #[test]
+    fn the_observed_scale_is_ignored_without_numbers() {
+        assert_eq!(observed_scale(0, 100), None);
+        assert_eq!(observed_scale(100, 0), None);
+    }
+
+    #[test]
+    fn the_observed_scale_is_bounded() {
+        assert_eq!(observed_scale(1_000, 100_000), Some(SCALE_MAX));
+        assert_eq!(observed_scale(1_000, 1), Some(SCALE_MIN));
+    }
+
+    #[test]
+    fn a_scaled_budget_shrinks_when_the_app_underestimates() {
+        assert_eq!(scaled_budget(32_000, SCALE_ONE * 2), 16_000);
+        assert_eq!(scaled_budget(32_000, SCALE_ONE), 32_000);
+    }
+
+    #[test]
+    fn the_scale_moves_toward_the_observation() {
+        assert_eq!(next_scale(SCALE_ONE, Some(SCALE_ONE * 3)), SCALE_ONE * 2);
+        assert_eq!(next_scale(SCALE_ONE * 2, None), SCALE_ONE * 2);
+    }
+
+    #[test]
+    fn tool_tokens_measure_the_json_the_provider_sends() {
+        let specs = vec![tupi_kernel::ToolSpec {
+            name: "read".into(),
+            description: "lê um arquivo".into(),
+            schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+        let json = serde_json::to_string(&tupi_kernel::tools_payload(&specs)).unwrap();
+
+        assert_eq!(
+            tool_spec_tokens(&specs),
+            tupi_domain::tokens::estimate_tokens(&json)
+        );
+    }
+
+    #[test]
+    fn plan_context_scales_target_with_message_budget_when_fixed_tokens_are_large() {
+        let mut messages = Vec::new();
+        for index in 0..16 {
+            messages.push(Message::user(format!(
+                "turno {index}: {}",
+                "palavra ".repeat(400)
+            )));
+            messages.push(Message::assistant(format!(
+                "resposta {index}: {}",
+                "palavra ".repeat(400)
+            )));
+        }
+
+        // budget=20_000, target=10_000, fixed_tokens=10_000 -> message_budget=10_000.
+        // Without scaling target proportionally to message_budget, message_target=10_000 == message_budget,
+        // which disables amortized pruning and leaves estimate right near 10_000 instead of cutting to ~5_000.
+        let planned = plan_context(&messages, 20_000, 10_000, 3, 10_000);
+
+        assert!(planned.trimmed());
+        assert!(
+            planned.estimate <= 5_500,
+            "expected amortized cut to <= 5_500 message tokens, got {}",
+            planned.estimate
+        );
+    }
+
+    #[test]
+    fn plan_context_scales_target_smoothly_when_message_budget_is_just_above_target() {
+        let mut messages = Vec::new();
+        for index in 0..16 {
+            messages.push(Message::user(format!(
+                "turno {index}: {}",
+                "palavra ".repeat(400)
+            )));
+            messages.push(Message::assistant(format!(
+                "resposta {index}: {}",
+                "palavra ".repeat(400)
+            )));
+        }
+
+        // budget=32_000, target=16_000, fixed_tokens=15_500 -> message_budget=16_500.
+        // Proportional target is 16_500 * 16_000 / 32_000 = 8_250 (leaving an 8_250-token amortization window),
+        // NOT 16_000 (which would leave only a 500-token window before thrashing again).
+        let planned = plan_context(&messages, 32_000, 16_000, 3, 15_500);
+
+        assert!(planned.trimmed());
+        assert_eq!(planned.budget, 8_250);
+        assert!(
+            planned.estimate <= 8_250,
+            "expected amortized cut to <= 8_250 message tokens, got {}",
+            planned.estimate
         );
     }
 }
@@ -1664,6 +2360,24 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_tool_execution_closes_every_pending_call() {
+        let _ = SlowTool;
+        let finished = Arc::new(AtomicBool::new(false));
+        struct TrackedSlowTool(Arc<AtomicBool>);
+        impl Tool for TrackedSlowTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "echo".to_string(),
+                    description: "demora".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn call(&self, _arguments: serde_json::Value) -> Result<String, ToolError> {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                self.0.store(true, Ordering::SeqCst);
+                Ok("tarde".to_string())
+            }
+        }
+
         let bus = EventBus::new(64);
         let mut rx = bus.subscribe();
         let provider = Arc::new(ScriptedProvider::new(vec![
@@ -1673,7 +2387,11 @@ mod tests {
             ])],
             vec![text_event("depois")],
         ]));
-        let app = app_with_tools(provider, bus, Arc::new(SlowTool));
+        let app = app_with_tools(
+            provider,
+            bus,
+            Arc::new(TrackedSlowTool(Arc::clone(&finished))),
+        );
 
         let CommandOutcome::Started { request_id } = app
             .handle(Command::SendMessage {
@@ -1701,6 +2419,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, CommandOutcome::Cancelled);
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "cancel returned while the blocking tool thread from the cancelled turn was still running!"
+        );
         wait_for_end(&mut rx).await;
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
@@ -1757,7 +2479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_limit_synthesizes_results_for_unanswered_calls() {
+    async fn the_step_limit_finishes_with_a_final_synthesis_instead_of_failing() {
         let bus = EventBus::new(64);
         let mut rx = bus.subscribe();
         let provider = Arc::new(LoopingProvider {
@@ -1785,23 +2507,28 @@ mod tests {
             panic!("esperava Started");
         };
 
-        let mut failed = None;
+        let mut finished = false;
         for _ in 0..(MAX_TOOL_STEPS * 2 + 4) {
-            let event = rx.recv().await.unwrap();
-            if let Event::StreamFailed { message, .. } = event {
-                failed = Some(message);
-                break;
+            match rx.recv().await.unwrap() {
+                Event::StreamFinished { .. } => {
+                    finished = true;
+                    break;
+                }
+                Event::StreamFailed { message, .. } => panic!("não esperava falha: {message}"),
+                _ => {}
             }
         }
-        assert!(failed.unwrap().contains("limite"));
+        assert!(finished, "esperava StreamFinished no limite de passos");
 
         let QueryResult::History(history) = app.query(Query::History).await.unwrap() else {
             panic!("esperava History");
         };
-        assert_eq!(history.len(), 1 + MAX_TOOL_STEPS * 2);
-        let last = history.last().unwrap();
-        assert_eq!(last.role, Role::Tool);
-        assert!(last.content.contains("limite de passos"));
+        assert_eq!(history.len(), 1 + (MAX_TOOL_STEPS - 1) * 2);
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("limite de passos"))
+        );
         let _ = request_id;
     }
 
@@ -1929,5 +2656,201 @@ mod tests {
         }
 
         assert!(omitted.unwrap_or(0) >= 1, "esperava o histórico podado");
+    }
+
+    fn history_with_user_turns(turns: usize, words: usize) -> Vec<Message> {
+        (0..turns)
+            .map(|turn| Message::new(Role::User, format!("turno {turn} {}", "a ".repeat(words))))
+            .collect()
+    }
+
+    #[test]
+    fn tool_specs_are_subtracted_from_the_message_budget() {
+        let messages = history_with_user_turns(6, 2_000);
+        let plan = plan_context(&messages, 5_000, 5_000, 3, 2_000);
+
+        assert_eq!(plan.budget, 3_000);
+        assert!(
+            plan.estimate <= 3_000,
+            "estimativa {} passou do teto de mensagens",
+            plan.estimate
+        );
+    }
+
+    #[test]
+    fn the_configured_target_wins_over_the_default_two_fifths() {
+        let messages = history_with_user_turns(6, 4_000);
+        let plan = plan_context(&messages, 10_000, 2_000, 3, 0);
+
+        assert_eq!(plan.budget, 2_000);
+    }
+
+    #[test]
+    fn zero_target_falls_back_to_two_fifths_of_the_message_budget() {
+        let messages = history_with_user_turns(6, 4_000);
+        let plan = plan_context(&messages, 10_000, 0, 3, 2_000);
+
+        assert_eq!(plan.budget, 3_200);
+    }
+
+    #[test]
+    fn the_configured_recent_results_are_forwarded_to_the_plan() {
+        let mut messages = history_with_user_turns(2, 4_000);
+        messages.push(Message::tool("c1", "x".repeat(16_000)));
+        messages.push(Message::new(Role::User, "depois ".repeat(4_000)));
+
+        let plan = plan_context(&messages, 500, 0, 0, 0);
+
+        assert_eq!(plan.shrunk_results, 1);
+    }
+
+    #[test]
+    fn a_tool_spec_costs_more_than_its_name() {
+        let spec = ToolSpec {
+            name: "read".to_string(),
+            description: "palavra ".repeat(100),
+            schema: serde_json::json!({"type": "object"}),
+        };
+
+        assert!(tool_spec_tokens(&[spec]) >= 100);
+    }
+
+    #[tokio::test]
+    async fn the_step_limit_forces_a_synthesis_without_tools() {
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call("c1", "echo", "{}")])],
+            vec![calls_event(vec![tool_call("c2", "echo", "{}")])],
+            vec![text_event("síntese final")],
+        ]));
+        let app =
+            app_with_tools(provider.clone(), bus, Arc::new(EchoTool::new())).with_max_tool_steps(3);
+
+        app.handle(Command::SendMessage {
+            text: "investigue".into(),
+        })
+        .await
+        .unwrap();
+        wait_for_end(&mut rx).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[0].tools.is_empty());
+        assert!(!requests[1].tools.is_empty());
+        assert!(
+            requests[2].tools.is_empty(),
+            "a última chamada deve ser sem tools"
+        );
+        drop(requests);
+
+        assert!(
+            app.session()
+                .messages
+                .iter()
+                .any(|message| message.content.contains("síntese final"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_is_warned_before_the_hard_step_limit() {
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![calls_event(vec![tool_call("c1", "echo", "{}")])],
+            vec![calls_event(vec![tool_call("c2", "echo", "{}")])],
+            vec![calls_event(vec![tool_call("c3", "echo", "{}")])],
+            vec![calls_event(vec![tool_call("c4", "echo", "{}")])],
+            vec![text_event("fim")],
+        ]));
+        let app =
+            app_with_tools(provider.clone(), bus, Arc::new(EchoTool::new())).with_max_tool_steps(5);
+
+        app.handle(Command::SendMessage {
+            text: "investigue".into(),
+        })
+        .await
+        .unwrap();
+        wait_for_end(&mut rx).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Freio de passos"))
+        );
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("restam 2 de 5"))
+        );
+        assert!(
+            requests[4]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("última chamada"))
+        );
+        let last_msg = requests[2].messages.last().unwrap();
+        assert_eq!(last_msg.role, Role::System);
+        assert!(
+            last_msg.content.contains("Freio de passos"),
+            "o aviso deve ficar no fim da lista de mensagens para preservar o KV-cache do histórico"
+        );
+    }
+
+    #[tokio::test]
+    async fn amortized_trim_persists_in_session_so_next_turn_is_append_only() {
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![text_event("ok 1")],
+            vec![text_event("ok 2")],
+            vec![text_event("ok 3")],
+        ]));
+        let app = app_with_tools(provider.clone(), bus, Arc::new(EchoTool::new()))
+            .with_context_budget(2_000);
+
+        app.handle(Command::SendMessage {
+            text: "a ".repeat(800),
+        })
+        .await
+        .unwrap();
+        wait_for_end(&mut rx).await;
+
+        app.handle(Command::SendMessage {
+            text: "b ".repeat(1_400),
+        })
+        .await
+        .unwrap();
+        let mut trimmed_turn_2 = false;
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::ContextTrimmed { .. } => trimmed_turn_2 = true,
+                Event::StreamFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(trimmed_turn_2, "turn 2 should trigger amortized trim");
+
+        app.handle(Command::SendMessage {
+            text: "c ".repeat(50),
+        })
+        .await
+        .unwrap();
+        let mut trimmed_turn_3 = false;
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::ContextTrimmed { .. } => trimmed_turn_3 = true,
+                Event::StreamFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            !trimmed_turn_3,
+            "turn 3 must grow append-only without re-trimming"
+        );
     }
 }

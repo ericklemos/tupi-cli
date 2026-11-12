@@ -47,35 +47,85 @@ fn outside(path: &str) -> bool {
     path.starts_with('/') || path.split('/').any(|component| component == "..")
 }
 
-fn validate_paths(patch: &str) -> Result<(), ToolError> {
+fn validate_paths(root: &std::path::Path, patch: &str) -> Result<(), ToolError> {
     for line in patch.lines() {
+        if line.starts_with("new file mode 120000")
+            || line.starts_with("old mode 120000")
+            || line.starts_with("new mode 120000")
+            || (line.starts_with("index ") && line.ends_with(" 120000"))
+        {
+            return Err(ToolError::InvalidArguments(
+                "patches de symlink (120000) nao sao permitidos".to_string(),
+            ));
+        }
+
         let headers = [
-            "--- ",
-            "+++ ",
-            "rename from ",
-            "rename to ",
-            "copy from ",
-            "copy to ",
+            ("--- ", Some("a/")),
+            ("+++ ", Some("b/")),
+            ("rename from ", None),
+            ("rename to ", None),
+            ("copy from ", None),
+            ("copy to ", None),
         ];
-        for header in headers {
+        for (header, prefix) in headers {
             if let Some(rest) = line.strip_prefix(header) {
-                let path = rest
+                let raw = rest
                     .split('\t')
                     .next()
                     .unwrap_or(rest)
                     .split_whitespace()
                     .next()
                     .unwrap_or("");
-                if path != "/dev/null" && outside(path) {
-                    return Err(ToolError::OutsideRoot(path.to_string()));
+                if raw.starts_with('"') || raw.ends_with('"') || raw.contains('\\') {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "caminhos entre aspas ou escapados no patch nao sao permitidos: {raw}"
+                    )));
+                }
+                if raw == "/dev/null" {
+                    continue;
+                }
+                if outside(raw) {
+                    return Err(ToolError::OutsideRoot(raw.to_string()));
+                }
+                let relative = match prefix {
+                    Some(p) => raw.strip_prefix(p).unwrap_or(raw),
+                    None => raw,
+                };
+                if outside(relative) {
+                    return Err(ToolError::OutsideRoot(relative.to_string()));
+                }
+                let resolved = crate::paths::resolve_for_write(root, relative)?;
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(ToolError::OutsideRoot(relative.to_string()));
                 }
             }
         }
-        if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some(first) = rest.split_whitespace().next()
-            && outside(first)
-        {
-            return Err(ToolError::OutsideRoot(first.to_string()));
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            for token in rest.split_whitespace().take(2) {
+                if token.starts_with('"') || token.ends_with('"') || token.contains('\\') {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "caminhos entre aspas ou escapados no patch nao sao permitidos: {token}"
+                    )));
+                }
+                if outside(token) {
+                    return Err(ToolError::OutsideRoot(token.to_string()));
+                }
+                let stripped = token
+                    .strip_prefix("a/")
+                    .or_else(|| token.strip_prefix("b/"))
+                    .unwrap_or(token);
+                if outside(stripped) {
+                    return Err(ToolError::OutsideRoot(stripped.to_string()));
+                }
+                let resolved = crate::paths::resolve_for_write(root, stripped)?;
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(ToolError::OutsideRoot(stripped.to_string()));
+                }
+            }
         }
     }
     Ok(())
@@ -174,12 +224,13 @@ impl Tool for PatchTool {
         if !params.patch.contains("\n@@") && !params.patch.starts_with("@@") {
             return Err(ToolError::InvalidArguments("patch sem hunk @@".to_string()));
         }
-        validate_paths(&params.patch)?;
 
         let root = self
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
+        validate_paths(&root, &params.patch)?;
+
         let mut temp = tempfile::NamedTempFile::new().map_err(|error| {
             ToolError::Other(format!("falha ao criar arquivo temporario: {error}"))
         })?;
@@ -329,8 +380,70 @@ mod tests {
     #[test]
     fn a_escaping_path_is_rejected_before_git() {
         let dir = tempfile::tempdir().unwrap();
-        let patch = "diff --git a/../fora.txt b/../fora.txt\n--- a/../fora.txt\n+++ b/../fora.txt\n@@ -1 +1 @@\n-a\n+b\n";
+        let patch = "diff --git a/../fora.txt b/../fora.txt
+--- a/../fora.txt
++++ b/../fora.txt
+@@ -1 +1 @@
+-a
++b
+";
         assert!(Tool::call(&tool(dir.path()), serde_json::json!({"patch": patch})).is_err());
+
+        let quoted = "diff --git \"a/../fora.txt\" \"b/../fora.txt\"
+--- \"a/../fora.txt\"
++++ \"b/../fora.txt\"
+@@ -1 +1 @@
+-a
++b
+";
+        assert!(
+            Tool::call(&tool(dir.path()), serde_json::json!({"patch": quoted})).is_err(),
+            "quoted escaping path should be rejected"
+        );
+
+        let symlink_mode = "diff --git a/link b/link
+new file mode 120000
+--- /dev/null
++++ b/link
+@@ -0,0 +1 @@
++/etc/passwd
+";
+        assert!(
+            Tool::call(
+                &tool(dir.path()),
+                serde_json::json!({"patch": symlink_mode})
+            )
+            .is_err(),
+            "symlink mode 120000 should be rejected"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("secret.txt");
+            std::fs::write(
+                &target, "antes
+",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("escape_dir")).unwrap();
+            let via_symlink = "diff --git a/escape_dir/secret.txt b/escape_dir/secret.txt
+--- a/escape_dir/secret.txt
++++ b/escape_dir/secret.txt
+@@ -1 +1 @@
+-antes
++pwned
+";
+            assert!(
+                Tool::call(&tool(dir.path()), serde_json::json!({"patch": via_symlink})).is_err(),
+                "patch traversing a symlink outside root must be rejected"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "antes
+"
+            );
+        }
     }
 
     #[test]

@@ -75,7 +75,7 @@ fn run(mut command: Command, timeout: Duration) -> Result<Output, ToolError> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) if started.elapsed() >= timeout || tupi_kernel::is_tool_cancelled() => {
                 kill_tree(&mut child);
                 timed_out = true;
                 break child.wait().map_err(|error| {
@@ -162,6 +162,24 @@ mod tests {
         assert!(out.timed_out);
         assert!(!out.success);
         assert!(out.duration < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_command_is_killed_immediately_when_tool_cancel_fires() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = std::sync::Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let out = tupi_kernel::with_tool_cancel(flag, || {
+            bash("sleep 5", Path::new("."), Duration::from_secs(10))
+        })
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(!out.success);
+        assert!(out.duration < Duration::from_secs(1));
     }
 
     #[test]

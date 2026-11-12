@@ -89,18 +89,21 @@ pub fn plan_with(messages: &[Message], budget: usize, recent_results: usize) -> 
         return untouched(messages);
     }
 
-    let mut kept = shrink_old_results(messages, recent_results);
-    let shrunk_results = kept
-        .iter()
-        .filter(|message| is_pointer(&message.content))
-        .count();
+    let (mut kept, shrunk_results) = shrink_old_results(messages, recent_results);
 
     let mut omitted_units = 0;
+    let mut summary_lines: Vec<String> = Vec::new();
     let mut estimate = total(&kept);
     while estimate > budget && units(&kept) > 1 {
         let cut = first_unit_len(&kept);
+        summarize_unit(&kept[..cut], &mut summary_lines);
         kept.drain(..cut);
         omitted_units += 1;
+        estimate = total(&kept);
+    }
+
+    if !summary_lines.is_empty() {
+        attach_summary(&mut kept, &summary_lines, budget);
         estimate = total(&kept);
     }
 
@@ -128,17 +131,10 @@ pub fn plan_amortized_with(
     target: usize,
     recent_results: usize,
 ) -> Plan {
-    let planned = plan_with(messages, ceiling, recent_results);
-    if !planned.trimmed() || target >= ceiling {
-        return planned;
+    if ceiling == 0 || total(messages) <= ceiling || target >= ceiling {
+        return plan_with(messages, ceiling, recent_results);
     }
-
-    let mut deeper = plan_with(&planned.messages, target, recent_results);
-    // A segunda passada não vê o que a primeira já cortou: soma para o resumo
-    // refletir o total, e fica com a contagem de ponteiros mais alta.
-    deeper.omitted_units += planned.omitted_units;
-    deeper.shrunk_results = deeper.shrunk_results.max(planned.shrunk_results);
-    deeper
+    plan_with(messages, target, recent_results)
 }
 
 fn total(messages: &[Message]) -> usize {
@@ -150,7 +146,142 @@ fn is_pointer(content: &str) -> bool {
 }
 
 /// Substitui o conteúdo de resultados antigos por um ponteiro barato.
-fn shrink_old_results(messages: &[Message], recent_results: usize) -> Vec<Message> {
+/// Prefixo do bloco determinístico de resumo de turnos podados.
+pub const SUMMARY_PREFIX: &str = "[Resumo de turnos podados:";
+
+const MIN_RESULT_SHRINK_TOKENS: usize = 24;
+const MIN_ARG_SHRINK_TOKENS: usize = 48;
+const MAX_SUMMARY_TOKENS: usize = 160;
+const KEPT_ARG_KEYS: &[&str] = &[
+    "path", "symbol", "from", "to", "kind", "package", "target", "filter", "action", "url", "query",
+];
+
+fn is_shrunk_arg(arguments: &str) -> bool {
+    arguments.contains("\"_omitted_tokens\"")
+}
+
+fn shrink_json_arguments(arguments: &str, tokens: usize) -> String {
+    let mut out = serde_json::Map::new();
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(arguments)
+    {
+        for &key in KEPT_ARG_KEYS {
+            if let Some(val) = map.get(key) {
+                let keep = match val {
+                    serde_json::Value::String(s) => s.chars().count() <= 120,
+                    serde_json::Value::Number(_) | serde_json::Value::Bool(_) => true,
+                    _ => false,
+                };
+                if keep {
+                    out.insert(key.to_string(), val.clone());
+                }
+            }
+        }
+    }
+    out.insert(
+        "_omitted_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(tokens)),
+    );
+    serde_json::Value::Object(out).to_string()
+}
+
+fn split_existing_summary(content: &str) -> (Vec<String>, &str) {
+    if let Some(rest) = content.strip_prefix(SUMMARY_PREFIX)
+        && let Some(end_idx) = rest.find("\n]\n\n")
+    {
+        let block = &rest[..end_idx];
+        let body = &rest[end_idx + 4..];
+        let lines = block
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- "))
+            .map(ToOwned::to_owned)
+            .collect();
+        return (lines, body);
+    }
+    (Vec::new(), content)
+}
+
+fn format_call_target(name: &str, arguments: &str) -> String {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(arguments)
+    {
+        let path = map.get("path").and_then(|v| v.as_str());
+        let symbol = map.get("symbol").and_then(|v| v.as_str());
+        match (path, symbol) {
+            (Some(p), Some(s)) => return format!("{name}({p}::{s})"),
+            (Some(p), None) => return format!("{name}({p})"),
+            (None, Some(s)) => return format!("{name}({s})"),
+            (None, None) => {}
+        }
+        for key in ["target_symbol_or_file", "symbol_name", "query", "kind"] {
+            if let Some(val) = map.get(key).and_then(|v| v.as_str()) {
+                return format!("{name}({val})");
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn summarize_unit(unit: &[Message], summary_lines: &mut Vec<String>) {
+    let Some(first) = unit.first() else {
+        return;
+    };
+    let (prior_lines, raw_user) = split_existing_summary(&first.content);
+    summary_lines.extend(prior_lines);
+
+    let collapsed: String = raw_user.split_whitespace().collect::<Vec<_>>().join(" ");
+    let snippet: String = collapsed.chars().take(80).collect();
+
+    let mut tools = Vec::new();
+    for msg in unit {
+        if msg.role == Role::Assistant {
+            for call in &msg.tool_calls {
+                let formatted = format_call_target(&call.name, &call.arguments);
+                if !tools.contains(&formatted) && tools.len() < 6 {
+                    tools.push(formatted);
+                }
+            }
+        }
+    }
+
+    let line = if tools.is_empty() {
+        format!("- {snippet}")
+    } else {
+        format!("- {snippet} [tools: {}]", tools.join(", "))
+    };
+    summary_lines.push(line);
+}
+
+fn attach_summary(kept: &mut [Message], summary_lines: &[String], budget: usize) {
+    if kept.is_empty() || kept[0].role != Role::User {
+        return;
+    }
+    let (existing_in_first, clean_body) = split_existing_summary(&kept[0].content);
+    let clean_body_owned = clean_body.to_string();
+    let mut all_lines = Vec::new();
+    all_lines.extend_from_slice(summary_lines);
+    all_lines.extend(existing_in_first);
+
+    while all_lines.len() > 1 {
+        let candidate = format!("{SUMMARY_PREFIX}\n{}\n]\n\n", all_lines.join("\n"));
+        if estimate_tokens(&candidate) <= MAX_SUMMARY_TOKENS {
+            break;
+        }
+        all_lines.remove(0);
+    }
+
+    let header = format!("{SUMMARY_PREFIX}\n{}\n]\n\n", all_lines.join("\n"));
+    let header_tokens = estimate_tokens(&header);
+    if header_tokens > MAX_SUMMARY_TOKENS {
+        return;
+    }
+
+    kept[0].content = format!("{header}{clean_body_owned}");
+    if total(kept) > budget {
+        kept[0].content = clean_body_owned;
+    }
+}
+
+fn shrink_old_results(messages: &[Message], recent_results: usize) -> (Vec<Message>, usize) {
     let tool_indices: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -159,20 +290,51 @@ fn shrink_old_results(messages: &[Message], recent_results: usize) -> Vec<Messag
         .collect();
 
     let shrinkable = tool_indices.len().saturating_sub(recent_results);
-    let mut kept = messages.to_vec();
+    let recent_call_ids: std::collections::HashSet<String> = tool_indices
+        .iter()
+        .skip(shrinkable)
+        .filter_map(|&idx| messages[idx].tool_call_id.clone())
+        .collect();
 
-    for index in tool_indices.into_iter().take(shrinkable) {
+    let mut kept = messages.to_vec();
+    let mut shrunk_count = 0usize;
+
+    for &index in tool_indices.iter().take(shrinkable) {
         let message = &mut kept[index];
         if is_pointer(&message.content) {
             continue;
         }
         let tokens = estimate_tokens(&message.content);
+        if tokens <= MIN_RESULT_SHRINK_TOKENS {
+            continue;
+        }
         message.content = format!(
-            "{POINTER_PREFIX}: ~{tokens} tokens. Chame a tool de novo se precisar do conteúdo — o ledger devolve ponteiro ou diff.]"
+            "{POINTER_PREFIX}: ~{tokens} tokens. Chame a tool de novo com repeat=\"allow\" se precisar do corpo inteiro.]"
         );
+        shrunk_count += 1;
     }
 
-    kept
+    for message in &mut kept {
+        if message.role != Role::Assistant || message.tool_calls.is_empty() {
+            continue;
+        }
+        for call in &mut message.tool_calls {
+            if recent_call_ids.contains(&call.id) {
+                continue;
+            }
+            if is_shrunk_arg(&call.arguments) {
+                continue;
+            }
+            let tokens = estimate_tokens(&call.arguments);
+            if tokens <= MIN_ARG_SHRINK_TOKENS {
+                continue;
+            }
+            call.arguments = shrink_json_arguments(&call.arguments, tokens);
+            shrunk_count += 1;
+        }
+    }
+
+    (kept, shrunk_count)
 }
 
 /// Quantas unidades (turnos do usuário) o histórico tem.
@@ -252,13 +414,17 @@ mod tests {
         let planned = plan(&messages, 4_000);
 
         assert!(planned.shrunk_results > 0);
+        let pointers: Vec<_> = planned
+            .messages
+            .iter()
+            .filter(|message| is_pointer(&message.content))
+            .collect();
+        assert!(!pointers.is_empty());
+        assert!(pointers.len() <= planned.shrunk_results);
         assert!(
-            planned
-                .messages
-                .iter()
-                .filter(|message| is_pointer(&message.content))
-                .count()
-                <= planned.shrunk_results
+            pointers[0].content.contains("repeat=\"allow\""),
+            "expected pointer to instruct repeat=\"allow\" so DeliveryLedger does not block re-reads, got: {}",
+            pointers[0].content
         );
         assert!(planned.estimate < total(&messages));
     }
@@ -313,8 +479,10 @@ mod tests {
         assert!(planned.omitted_units > 0);
         assert_eq!(planned.messages[0].role, Role::User);
         assert!(
-            !planned.messages[0].content.contains("turno 0"),
-            "o turno mais velho deveria ter saído"
+            !planned.messages[0]
+                .content
+                .contains(&format!("turno 0 {}", "a ".repeat(100))),
+            "o corpo pesado do turno mais velho deveria ter saído"
         );
         assert_eq!(
             planned.messages.last().unwrap().content,
@@ -394,5 +562,174 @@ mod tests {
         let planned = plan(&messages, 5_000);
 
         assert!(planned.summary().contains("omitido"));
+    }
+
+    #[test]
+    fn tiny_tool_results_are_not_replaced_by_longer_pointers() {
+        let messages = vec![
+            user("cheque"),
+            Message::assistant_with_calls("", vec![call("c1")]),
+            Message::tool("c1", "SIM"),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            big_result("c2", 2_000),
+            Message::assistant_with_calls("", vec![call("c3")]),
+            big_result("c3", 2_000),
+            Message::assistant_with_calls("", vec![call("c4")]),
+            big_result("c4", 2_000),
+        ];
+
+        let planned = plan_with(&messages, 4_500, 1);
+
+        assert_eq!(planned.messages[2].content, "SIM");
+        assert!(is_pointer(&planned.messages[4].content));
+    }
+
+    #[test]
+    fn old_heavy_tool_call_arguments_are_shrunk_to_valid_json_metadata() {
+        let heavy_args = serde_json::json!({
+            "path": "crates/tupi-app/src/app.rs",
+            "symbol": "send_message",
+            "new_body": "fn send_message() { ".to_string() + &"let x = 1; ".repeat(400) + "}"
+        })
+        .to_string();
+        let messages = vec![
+            user("edite"),
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "edit".into(),
+                    arguments: heavy_args,
+                }],
+            ),
+            Message::tool("c1", "ok"),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            big_result("c2", 1_500),
+        ];
+
+        let planned = plan_with(&messages, 2_000, 1);
+        let shrunk_args = &planned.messages[1].tool_calls[0].arguments;
+        let parsed: serde_json::Value = serde_json::from_str(shrunk_args).unwrap();
+
+        assert_eq!(parsed["path"], "crates/tupi-app/src/app.rs");
+        assert_eq!(parsed["symbol"], "send_message");
+        assert!(parsed.get("new_body").is_none());
+        assert!(parsed["_omitted_tokens"].as_u64().unwrap() > 400);
+        assert!(planned.shrunk_results >= 1);
+    }
+
+    #[test]
+    fn malformed_heavy_tool_call_arguments_shrink_to_valid_json_fallback() {
+        let bad_args = "{not valid json ".to_string() + &"x ".repeat(300);
+        let messages = vec![
+            user("edite"),
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "write".into(),
+                    arguments: bad_args,
+                }],
+            ),
+            Message::tool("c1", "ok"),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            big_result("c2", 1_500),
+        ];
+
+        let planned = plan_with(&messages, 1_500, 1);
+        let shrunk_args = &planned.messages[1].tool_calls[0].arguments;
+        let parsed: serde_json::Value = serde_json::from_str(shrunk_args).unwrap();
+
+        assert!(parsed["_omitted_tokens"].as_u64().unwrap() > 100);
+    }
+
+    #[test]
+    fn replanning_already_shrunk_history_does_not_report_shrunk_results_again() {
+        let heavy_args = serde_json::json!({
+            "path": "crates/tupi-app/src/app.rs",
+            "symbol": "send_message",
+            "new_body": "fn send_message() { ".to_string() + &"let x = 1; ".repeat(400) + "}"
+        })
+        .to_string();
+        let messages = vec![
+            user("edite"),
+            Message::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "edit".into(),
+                    arguments: heavy_args,
+                }],
+            ),
+            big_result("c1", 2_000),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            big_result("c2", 2_000),
+        ];
+
+        let first = plan_with(&messages, 1_000, 1);
+        assert!(first.trimmed());
+        assert_eq!(first.shrunk_results, 2);
+
+        let second = plan_with(&first.messages, 1_000, 1);
+        assert_eq!(second.shrunk_results, 0);
+        assert!(!second.trimmed());
+    }
+
+    #[test]
+    fn dropped_units_leave_a_bounded_deterministic_summary_on_first_surviving_user_message() {
+        let mut messages = Vec::new();
+        messages.push(user(&format!(
+            "corrija o bug no parser {}",
+            "a ".repeat(1_500)
+        )));
+        messages.push(Message::assistant_with_calls(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "edit".into(),
+                arguments: r#"{"path":"src/parser.rs","symbol":"parse"}"#.into(),
+            }],
+        ));
+        messages.push(Message::tool("c1", "ok"));
+        messages.push(Message::assistant("pronto"));
+
+        messages.push(user(&format!(
+            "agora rode os testes {}",
+            "b ".repeat(1_500)
+        )));
+        messages.push(Message::assistant("tudo verde"));
+
+        let planned = plan(&messages, 2_200);
+
+        assert_eq!(planned.omitted_units, 1);
+        assert_eq!(planned.messages[0].role, Role::User);
+        assert!(planned.messages[0].content.starts_with(SUMMARY_PREFIX));
+        assert!(
+            planned.messages[0]
+                .content
+                .contains("corrija o bug no parser")
+        );
+        assert!(
+            planned.messages[0]
+                .content
+                .contains("edit(src/parser.rs::parse)")
+        );
+        assert!(planned.messages[0].content.contains("agora rode os testes"));
+
+        let mut more = planned.messages.clone();
+        more.push(user(&format!("terceiro turno {}", "c ".repeat(1_500))));
+        more.push(Message::assistant("ok"));
+
+        let planned_again = plan(&more, 2_200);
+        let summary_headers = planned_again.messages[0]
+            .content
+            .matches(SUMMARY_PREFIX)
+            .count();
+        assert_eq!(summary_headers, 1);
+        assert!(
+            planned_again.messages[0]
+                .content
+                .contains("agora rode os testes")
+        );
     }
 }

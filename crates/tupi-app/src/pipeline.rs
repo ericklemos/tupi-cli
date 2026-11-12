@@ -99,12 +99,57 @@ pub(crate) fn truncate(text: &str, budget_tokens: usize) -> String {
 }
 
 /// Executa a pipeline e devolve só a concatenação da última step.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     tools: &ToolRegistry,
     events: &EventBus,
     request_id: RequestId,
     call: &ToolCall,
+    telemetry: &crate::telemetry::Telemetry,
+    cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_flight: &std::sync::Arc<tokio::sync::Notify>,
+    in_flight_count: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<String, String> {
+    fn record_finished(
+        telemetry: &crate::telemetry::Telemetry,
+        request_id: RequestId,
+        call: &ToolCall,
+        result: &Result<String, String>,
+        duration: std::time::Duration,
+    ) {
+        if !telemetry.is_enabled() {
+            return;
+        }
+
+        let content = match result {
+            Ok(content) => content,
+            Err(error) => error,
+        };
+        let clipped = crate::telemetry::clip(content);
+        let (text, error) = if result.is_ok() {
+            (Some(clipped.text), None)
+        } else {
+            (None, Some(clipped.text))
+        };
+        let summary = crate::app::summarize(content);
+
+        telemetry.record(crate::telemetry::TelemetryEvent::ToolFinished(
+            crate::telemetry::ToolFinished {
+                request: request_id,
+                call: call.id.clone(),
+                name: call.name.clone(),
+                duration_us: crate::telemetry::micros(duration),
+                ok: result.is_ok(),
+                result: text,
+                result_chars: clipped.chars,
+                result_bytes: clipped.bytes,
+                truncated: clipped.truncated,
+                summary,
+                error,
+            },
+        ));
+    }
+
     let plan: PipelinePlan = serde_json::from_str(&call.arguments)
         .map_err(|error| format!("pipeline inválida: {error}"))?;
     validate(&plan, tools)?;
@@ -127,13 +172,30 @@ pub(crate) async fn execute(
             .collect::<Result<Vec<_>, String>>()?;
 
         for inner_call in &inner {
+            let summary = describe_call(tools, inner_call);
             events.publish(Event::ToolStarted {
                 request_id,
                 call_id: inner_call.id.clone(),
                 name: inner_call.name.clone(),
                 arguments: inner_call.arguments.clone(),
-                summary: describe_call(tools, inner_call),
+                summary: summary.clone(),
             });
+
+            if telemetry.is_enabled() {
+                let arguments = crate::telemetry::clip(&inner_call.arguments);
+                telemetry.record(crate::telemetry::TelemetryEvent::ToolStarted(
+                    crate::telemetry::ToolStarted {
+                        request: request_id,
+                        call: inner_call.id.clone(),
+                        name: inner_call.name.clone(),
+                        arguments: arguments.text,
+                        arguments_chars: arguments.chars,
+                        arguments_bytes: arguments.bytes,
+                        truncated: arguments.truncated,
+                        summary,
+                    },
+                ));
+            }
         }
 
         let serial = step.calls.iter().any(|pipeline_call| {
@@ -147,19 +209,42 @@ pub(crate) async fn execute(
 
         if serial {
             for (index, inner_call) in inner.iter().enumerate() {
-                let result = run_tool(tools, inner_call).await;
+                let started = std::time::Instant::now();
+                let result =
+                    run_tool(tools, inner_call, cancel_flag, in_flight, in_flight_count).await;
+                record_finished(
+                    telemetry,
+                    request_id,
+                    inner_call,
+                    &result,
+                    started.elapsed(),
+                );
                 publish_finished(events, request_id, inner_call, &result);
                 results[index] = Some(result);
             }
         } else {
-            let mut pending =
-                futures_util::stream::iter(inner.iter().cloned().enumerate())
-                    .map(|(index, inner_call)| async move {
-                        (index, run_tool(tools, &inner_call).await)
-                    })
-                    .buffer_unordered(MAX_PARALLEL);
+            let mut pending = futures_util::stream::iter(inner.iter().cloned().enumerate())
+                .map(|(index, inner_call)| {
+                    let cancel_flag = std::sync::Arc::clone(cancel_flag);
+                    let in_flight = std::sync::Arc::clone(in_flight);
+                    let in_flight_count = std::sync::Arc::clone(in_flight_count);
+                    async move {
+                        let started = std::time::Instant::now();
+                        let result = run_tool(
+                            tools,
+                            &inner_call,
+                            &cancel_flag,
+                            &in_flight,
+                            &in_flight_count,
+                        )
+                        .await;
+                        (index, result, started.elapsed())
+                    }
+                })
+                .buffer_unordered(MAX_PARALLEL);
 
-            while let Some((index, result)) = pending.next().await {
+            while let Some((index, result, duration)) = pending.next().await {
+                record_finished(telemetry, request_id, &inner[index], &result, duration);
                 publish_finished(events, request_id, &inner[index], &result);
                 results[index] = Some(result);
             }

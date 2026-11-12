@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-
 use tupi_kernel::{Tool, ToolError, ToolSpec};
 
 use crate::budget::{self, Section};
@@ -12,9 +11,10 @@ use crate::proc::{self, Output};
 use crate::store::ResponseStore;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
-const MAX_TIMEOUT_SECS: u64 = 3600;
-const MAX_ERRORS_SHOWN: usize = 6;
-const MAX_WARNINGS_SHOWN: usize = 3;
+const MAX_TIMEOUT_SECS: u64 = 1_800;
+const MAX_ERRORS_SHOWN: usize = 8;
+const MAX_WARNINGS_SHOWN: usize = 4;
+const MAX_FINGERPRINT_FILES: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,7 +26,7 @@ pub enum ExecKind {
     Xtask,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExecParams {
     pub kind: ExecKind,
     #[serde(default)]
@@ -331,9 +331,9 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
     }
 
     for block in diag.errors.iter().take(MAX_ERRORS_SHOWN) {
-        summary.push_str("\n~~~text\n");
+        summary.push_str("\n\x7e\x7e\x7etext\n");
         summary.push_str(&clip(block, 1_600, 200));
-        summary.push_str("\n~~~\n");
+        summary.push_str("\n\x7e\x7e\x7e\n");
     }
     if diag.errors.len() > MAX_ERRORS_SHOWN {
         summary.push_str(&format!(
@@ -342,9 +342,9 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
         ));
     }
     for block in diag.warnings.iter().take(MAX_WARNINGS_SHOWN) {
-        summary.push_str("\n~~~text\n");
+        summary.push_str("\n\x7e\x7e\x7etext\n");
         summary.push_str(&clip(block, 1_000, 0));
-        summary.push_str("\n~~~\n");
+        summary.push_str("\n\x7e\x7e\x7e\n");
     }
 
     let mut sections = vec![Section {
@@ -366,7 +366,7 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
     if needs_detail {
         sections.push(Section {
             heading: "#### saida completa".to_string(),
-            body: format!("\n~~~text\n{}\n~~~\n", combined.trim()),
+            body: format!("\n\x7e\x7e\x7etext\n{}\n\x7e\x7e\x7e\n", combined.trim()),
             priority: 80,
         });
     }
@@ -388,7 +388,7 @@ pub(crate) fn finish(
     budget::render(&selection, handle.as_deref())
 }
 
-fn fingerprint(root: &Path) -> String {
+fn fingerprint(root: &Path, limit: usize) -> Option<String> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(root);
@@ -417,10 +417,10 @@ fn fingerprint(root: &Path) -> String {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0);
-        entries.push((path.to_path_buf(), metadata.len(), modified));
-        if entries.len() >= 5_000 {
-            break;
+        if entries.len() >= limit {
+            return None;
         }
+        entries.push((path.to_path_buf(), metadata.len(), modified));
     }
     entries.sort();
 
@@ -430,7 +430,7 @@ fn fingerprint(root: &Path) -> String {
         hasher.update(&length.to_le_bytes());
         hasher.update(&modified.to_le_bytes());
     }
-    hasher.finalize().to_hex().to_string()
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 impl Tool for ExecTool {
@@ -496,27 +496,32 @@ impl Tool for ExecTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let key = format!("{}|{}", args.join(" "), fingerprint(&root));
+        let key =
+            fingerprint(&root, MAX_FINGERPRINT_FILES).map(|fp| format!("{}|{fp}", args.join(" ")));
 
         let cached = if params.refresh {
             None
-        } else {
+        } else if let Some(key) = &key {
             self.cache
                 .lock()
                 .unwrap()
                 .clone()
-                .filter(|entry| entry.key == key)
+                .filter(|entry| &entry.key == key)
                 .map(|entry| entry.output)
+        } else {
+            None
         };
 
         let (output, from_cache) = match cached {
             Some(output) => (output, true),
             None => {
                 let output = execute(&root, &params, timeout_for(&params))?;
-                *self.cache.lock().unwrap() = Some(Cached {
-                    key,
-                    output: output.clone(),
-                });
+                if let Some(key) = key {
+                    *self.cache.lock().unwrap() = Some(Cached {
+                        key,
+                        output: output.clone(),
+                    });
+                }
                 (output, false)
             }
         };
@@ -656,5 +661,15 @@ mod tests {
             tool.describe_call(&serde_json::json!({"kind": "test", "filter": "x"})),
             "cargo test --workspace -- x"
         );
+    }
+
+    #[test]
+    fn fingerprint_refuses_to_cache_when_file_count_exceeds_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            std::fs::write(dir.path().join(format!("f{index}.rs")), "fn a() {}").unwrap();
+        }
+        assert!(fingerprint(dir.path(), 10).is_some());
+        assert!(fingerprint(dir.path(), 3).is_none());
     }
 }

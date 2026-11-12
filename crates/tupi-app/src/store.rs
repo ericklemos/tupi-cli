@@ -38,6 +38,10 @@ impl SessionStore {
         self.inner.lock().unwrap().messages.clone()
     }
 
+    pub fn replace_messages(&self, messages: Vec<Message>) {
+        self.inner.lock().unwrap().messages = messages;
+    }
+
     pub fn snapshot(&self) -> Session {
         self.inner.lock().unwrap().clone()
     }
@@ -55,5 +59,18 @@ mod tests {
         store.push_assistant_once("parcial");
 
         assert_eq!(store.messages().len(), 2);
+    }
+
+    #[test]
+    fn replace_messages_overwrites_the_session_history() {
+        let store = SessionStore::new(1);
+        store.push(Role::User, "um");
+        store.push(Role::Assistant, "dois");
+
+        store.replace_messages(vec![Message::user("compactado")]);
+
+        let messages = store.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "compactado");
     }
 }

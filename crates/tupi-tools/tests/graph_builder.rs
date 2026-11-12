@@ -35,7 +35,11 @@ fn a_broken_file_does_not_take_the_other_files_down() {
 fn a_malformed_use_does_not_take_the_graph_down() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
-    write(dir.path(), "src/bad.rs", "use a::}{b;\npub fn broken() {}\n");
+    write(
+        dir.path(),
+        "src/bad.rs",
+        "use a::}{b;\npub fn broken() {}\n",
+    );
 
     let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
     assert_eq!(graph.matching("helper").len(), 1);

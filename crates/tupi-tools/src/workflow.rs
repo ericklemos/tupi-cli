@@ -77,8 +77,42 @@ pub fn catalog(root: &Path) -> Vec<Workflow> {
 
 /// Mesma resolução de [`catalog`], com os diretórios injetados.
 fn catalog_with(root: &Path, layers: &[(PathBuf, WorkflowSource)]) -> Vec<Workflow> {
+    // O `skeptic` ainda não viaja por `include_str!` porque não há
+    // `workflows/skeptic.md`. Quando o arquivo existir, ele entra em `NATIVE`
+    // como os outros quatro e este bloco sai.
+    const SKEPTIC: &str = r#"---
+description: Duvidar de toda afirmação até a ferramenta capaz de contradizê-la dizer que ela vale.
+---
+
+# Skeptic
+
+1. **Separe fato de memória.** Escreva o que está sendo afirmado — "isso compila",
+   "o teste cobre", "só um chamador". Memória e resumo anterior não valem como
+   prova: só conta o que uma ferramenta devolveu nesta sessão.
+2. **Escolha o falsificador.** Para cada afirmação, diga o comando que a
+   derrubaria: `exec` com `kind=check`, `test_many` pelo nome, `search` pelo
+   chamador, `read` pelo corpo. Sem falsificador, a afirmação é palpite —
+   marque como tal em vez de repetir.
+3. **Rode o falsificador.** `diff` mostra o que mudou de fato; `impact_check`
+   mostra quem a assinatura alterada atinge. Não pergunte ao usuário o que uma
+   ferramenta responde.
+4. **Ataque o caminho feliz.** Onde quebra: entrada vazia, arquivo inexistente,
+   falha de IO, concorrência, orçamento estourado. Procure o teste que exercita
+   esse caminho; se não existe, "está coberto" está refutado.
+5. **Cheque o custo do que sobra.** Linha nova é paga em todo request; teste novo
+   é pago em toda execução. Pergunte quais tokens ou segundos ela evita.
+6. **Dê veredito por item.** Provada (ferramenta e linha citadas), refutada
+   (saída que contradiz) ou não verificada (o que falta para verificar).
+
+Saída: a lista do passo 1 com o veredito de cada item; sem "provavelmente".
+"#;
+
     let mut merged: BTreeMap<String, Workflow> = BTreeMap::new();
-    for (name, text) in NATIVE {
+    for (name, text) in NATIVE
+        .iter()
+        .copied()
+        .chain(std::iter::once(("skeptic", SKEPTIC)))
+    {
         merge(&mut merged, parse(name, text, None, WorkflowSource::Native));
     }
     for (dir, source) in layers {
@@ -534,7 +568,8 @@ mod tests {
                 (missing.join("d"), WorkflowSource::LocalTupi),
             ],
         );
-        assert_eq!(workflows.len(), NATIVE.len());
+        // NATIVE mais o `skeptic`, que ainda não tem arquivo em `workflows/`.
+        assert_eq!(workflows.len(), NATIVE.len() + 1);
         assert!(
             workflows
                 .iter()
@@ -656,9 +691,21 @@ mod tests {
 
     #[test]
     fn the_prompt_section_lists_names_without_bodies() {
-        let section = prompt_section(&catalog(Path::new("/nao/existe")));
+        let workflows = catalog(Path::new("/nao/existe"));
+        let section = prompt_section(&workflows);
         assert!(section.starts_with("## Workflows"));
         assert!(section.contains("feature"));
+        assert!(section.contains("skeptic"));
         assert!(!section.contains("impact_check"));
+        assert!(!section.contains("falsificador"));
+
+        let skeptic = workflows
+            .iter()
+            .find(|workflow| workflow.name == "skeptic")
+            .expect("o skeptic viaja com o binário");
+        assert_eq!(skeptic.source, WorkflowSource::Native);
+        assert!(!skeptic.description.is_empty());
+        assert!(skeptic.body.contains("**Escolha o falsificador.**"));
+        assert!(!skeptic.body.starts_with("---"));
     }
 }

@@ -172,10 +172,7 @@ impl ProjectCodeGraph {
     pub fn callees_for(&self, def: &Def) -> Vec<&Def> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for callee in self
-            .graph
-            .neighbors_directed(def.node, Direction::Outgoing)
-        {
+        for callee in self.graph.neighbors_directed(def.node, Direction::Outgoing) {
             if seen.insert(callee)
                 && let Some(def) = self.def_for(callee)
             {

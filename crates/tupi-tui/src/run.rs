@@ -120,6 +120,20 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                             }
                                             Err(error) => state.fail(&error.to_string()),
                                         }
+                                    } else if input == "/new" {
+                                        // A TUI não guarda o histórico: quem o tem é a sessão do
+                                        // app. Limpar aqui é reconstruir o estado local; os nomes
+                                        // dos workflows voltam porque não vêm do app.
+                                        match buses.commands.dispatch(Command::NewSession).await {
+                                            Ok(CommandOutcome::SessionReset) => {
+                                                let workflows = std::mem::take(&mut state.workflows);
+                                                state = ChatState::default();
+                                                state.workflows = workflows;
+                                                state.notice = Some("nova sessão".to_string());
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => state.fail(&error.to_string()),
+                                        }
                                     } else if input == "/enable-show-prompts-messages" {
                                         state.input.clear();
                                         state.refresh_suggestions();

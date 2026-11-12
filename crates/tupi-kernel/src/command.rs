@@ -23,6 +23,8 @@ pub enum Command {
         name: String,
         extra: String,
     },
+    /// `/new`: descarta o histórico e recomeça a conversa do zero.
+    NewSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,8 @@ pub enum CommandOutcome {
     Cancelled,
     ModelChanged { model: String },
     ShowPrompts { enabled: bool },
+    /// `/new` aceito: o histórico foi descartado e a próxima mensagem abre um turno novo.
+    SessionReset,
     Noop,
 }
 

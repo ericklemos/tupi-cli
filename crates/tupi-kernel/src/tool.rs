@@ -9,6 +9,57 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
+/// O array `tools` exatamente como o provider o envia. O orçamento de
+/// contexto conta tokens sobre esta mesma forma: estimar um JSON parecido
+/// mas não igual (sem aspas no nome, sem o envelope `function`) fazia a
+/// contagem divergir do que é cobrado de verdade.
+pub fn tools_payload(specs: &[ToolSpec]) -> Vec<Value> {
+    specs
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.schema,
+                }
+            })
+        })
+        .collect()
+}
+
+thread_local! {
+    static TOOL_CANCEL: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn with_tool_cancel<F, R>(flag: Arc<std::sync::atomic::AtomicBool>, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Guard(Option<Arc<std::sync::atomic::AtomicBool>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            TOOL_CANCEL.with(|cell| {
+                *cell.borrow_mut() = prev;
+            });
+        }
+    }
+    let prev = TOOL_CANCEL.with(|cell| cell.borrow_mut().replace(flag));
+    let _guard = Guard(prev);
+    f()
+}
+
+pub fn is_tool_cancelled() -> bool {
+    TOOL_CANCEL.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("argumento inválido: {0}")]
@@ -79,6 +130,16 @@ impl ToolRegistry {
             .cloned()
     }
 
+    /// `true` se há uma tool registrada com esse nome.
+    pub fn has(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.spec().name == name)
+    }
+
+    /// Remove e devolve as tools registradas, na ordem de registro.
+    pub fn into_tools(mut self) -> Vec<Arc<dyn Tool>> {
+        std::mem::take(&mut self.tools)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -139,6 +200,27 @@ mod tests {
         assert_eq!(
             tool.describe_call(&serde_json::json!({"path": "a.rs"})),
             "{\"path\":\"a.rs\"}"
+        );
+    }
+
+    #[test]
+    fn the_tools_payload_is_the_json_the_provider_sends() {
+        let payload = tools_payload(&[ToolSpec {
+            name: "read".into(),
+            description: "lê".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }]);
+
+        assert_eq!(
+            payload,
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "lê",
+                    "parameters": {"type": "object"},
+                }
+            })]
         );
     }
 

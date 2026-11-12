@@ -16,6 +16,9 @@ async fn main() -> anyhow::Result<()> {
     let config = config::from_env(|key| std::env::var(key).ok())?;
     let _log_guard = init_tracing(&config.log_filter);
 
+    let telemetry = tupi_app::telemetry::Telemetry::from_env(state_dir().join("telemetry.jsonl"));
+    let run_started_at = std::time::Instant::now();
+
     if let Some(path) = dotenv_path {
         tracing::debug!(path = %path.display(), "arquivo .env carregado");
     }
@@ -25,15 +28,20 @@ async fn main() -> anyhow::Result<()> {
     deepseek::register_all(&mut registry, &config.api_key);
 
     let provider = "deepseek".to_string();
-    let store =
-        match tupi_store::Store::open(data_dir(|key| std::env::var(key).ok()).join("tupi.redb")) {
-            Ok(store) => Some(std::sync::Arc::new(store)),
-            Err(error) => {
-                tracing::warn!(%error, "base local indisponível; seguindo sem cache");
-                None
-            }
-        };
+    let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
+    let mut store_error = None;
+    let mut store_error_kind = None;
+    let store = match tupi_store::Store::open(&store_path) {
+        Ok(store) => Some(std::sync::Arc::new(store)),
+        Err(error) => {
+            store_error = Some(error.to_string());
+            store_error_kind = Some(tupi_app::telemetry::store_error_kind(&error).to_string());
+            tracing::warn!(%error, "base local indisponível; seguindo sem cache");
+            None
+        }
+    };
     let root = tool_root()?;
+    let root_label = root.display().to_string();
     let tokens = token::load_token(&root);
     tracing::debug!(
         max_tokens = tokens.max_tokens,
@@ -65,7 +73,44 @@ async fn main() -> anyhow::Result<()> {
     let prefix = format!("{prefix}\n\n{}", tupi_tools::prompt_section(&available));
     let workflows = std::sync::Arc::new(tupi_tools::Catalog::new(root.clone()));
     let mut tools = ToolRegistry::new();
-    tupi_tools::register(root, &mut tools);
+    tupi_tools::register_exposed(root, &mut tools, tool_limits.exposure());
+
+    let tool_names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
+    let workflow_names: Vec<String> = available
+        .iter()
+        .map(|workflow| workflow.name.clone())
+        .collect();
+    let prompt_chars = prefix.chars().count();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    let state_label = state_dir().display().to_string();
+    let telemetry_path = telemetry.path().map(|path| path.display().to_string());
+
+    telemetry.record(tupi_app::telemetry::TelemetryEvent::RunStarted(
+        tupi_app::telemetry::RunStarted {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model: config.model.clone(),
+            provider: provider.clone(),
+            cwd,
+            root: root_label,
+            state_dir: state_label,
+            telemetry_path,
+            log_filter: config.log_filter.clone(),
+            max_tokens: tokens.max_tokens as usize,
+            max_tool_steps: tool_limits.max_tool_steps,
+            context_budget: context_limits.budget,
+            prompt_chars,
+            tool_count: tool_names.len(),
+            tools: tool_names,
+            workflow_count: workflow_names.len(),
+            workflows: workflow_names,
+            store_opened: store.is_some(),
+            store_path: store_path.display().to_string(),
+            store_error,
+            store_error_kind,
+        },
+    ));
 
     let app = App::with_tools(
         registry,
@@ -76,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         tools,
         prefix,
     )
+    .with_telemetry(telemetry.clone())
     .with_max_tool_steps(tool_limits.max_tool_steps)
     .with_context_budget(context_limits.budget)
     .with_context_target(context_limits.target)
@@ -88,7 +134,11 @@ async fn main() -> anyhow::Result<()> {
         events,
     };
 
-    run(buses, config.model, provider).await?;
+    let outcome = run(buses, config.model.clone(), provider).await;
+    let reason = if outcome.is_ok() { "quit" } else { "error" };
+    let error = outcome.as_ref().err().map(|error| error.to_string());
+    telemetry.record(telemetry.run_finished(run_started_at, reason, error));
+    outcome?;
     Ok(())
 }
 

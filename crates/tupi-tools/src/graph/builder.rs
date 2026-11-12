@@ -309,9 +309,7 @@ fn collect_imports(
                             .resolve_import_in(relative, &module, &path)
                             .unwrap_or(ImportTarget::External);
                         let item = last_segment(&path).unwrap_or(&name).to_string();
-                        scope
-                            .imports
-                            .insert(name, ImportBinding { target, item });
+                        scope.imports.insert(name, ImportBinding { target, item });
                     }
                     UseItem::Glob { path } => {
                         if let Some(ImportTarget::File(file)) =
@@ -426,8 +424,7 @@ fn collect_bindings(content: &str) -> HashMap<String, Vec<(usize, String)>> {
                 for param in params.split(',') {
                     if let Some((name, ty)) = param.split_once(':') {
                         let name = name.trim().trim_start_matches("mut ").trim();
-                        if !name.is_empty()
-                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
                         {
                             bindings
                                 .entry(name.to_string())

@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,9 +18,10 @@ use tupi_kernel::{
     Command, CommandError, CommandOutcome, ProviderError, Query, QueryError, QueryResult,
 };
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const CHANNEL_CAPACITY: usize = 1024;
 const MAX_TEXT_BYTES: usize = 512 * 1024;
+const PROMPT_PREVIEW_BYTES: usize = 4 * 1024;
 const ROTATE_BYTES: u64 = 32 * 1024 * 1024;
 const ROTATE_KEEP: usize = 3;
 
@@ -106,6 +107,7 @@ impl Telemetry {
         let path = path.as_ref().to_path_buf();
 
         if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
             && let Err(error) = create_dir(parent)
         {
             tracing::warn!(%error, path = %parent.display(), "telemetria desligada");
@@ -449,6 +451,7 @@ pub struct PromptSent {
     pub request: u64,
     pub step: usize,
     pub model: String,
+    pub body_hash: String,
     pub body: String,
     pub body_chars: usize,
     pub body_bytes: usize,
@@ -462,6 +465,12 @@ pub struct PromptSent {
 pub struct ProviderResponse {
     pub request: u64,
     pub step: usize,
+    /// Estimativa do prompt feita antes do envio. Comparada com
+    /// `prompt_tokens`, mostra quanto o template do provedor cobra além do
+    /// que o histórico declara.
+    pub estimate_tokens: usize,
+    /// Correção de orçamento em vigor no passo (1_000_000 = sem correção).
+    pub scale_ppm: u64,
     pub duration_us: u64,
     pub first_token_us: Option<u64>,
     pub delta_count: usize,
@@ -578,6 +587,14 @@ impl CommandInfo {
                 extra: None,
                 model: None,
             },
+            Command::NewSession => Self {
+                command: "new_session".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: None,
+                model: None,
+            },
             Command::RunWorkflow { name, extra } => Self {
                 command: "run_workflow".to_string(),
                 request: None,
@@ -627,6 +644,7 @@ impl CommandInfo {
                         CommandOutcome::Cancelled => "cancelled",
                         CommandOutcome::ModelChanged { .. } => "model_changed",
                         CommandOutcome::ShowPrompts { .. } => "show_prompts",
+                        CommandOutcome::SessionReset => "session_reset",
                         CommandOutcome::Noop => "noop",
                     }
                     .to_string(),
@@ -641,7 +659,9 @@ impl CommandInfo {
                     CommandOutcome::ShowPrompts { enabled } => {
                         finished.enabled = Some(*enabled);
                     }
-                    CommandOutcome::Cancelled | CommandOutcome::Noop => {}
+                    CommandOutcome::Cancelled
+                    | CommandOutcome::SessionReset
+                    | CommandOutcome::Noop => {}
                 }
             }
             Err(error) => {
@@ -771,10 +791,18 @@ pub struct Clipped {
 
 /// Corta um texto em MAX_TEXT_BYTES, sempre em limite de caractere UTF-8.
 pub fn clip(text: &str) -> Clipped {
+    clip_to(text, MAX_TEXT_BYTES)
+}
+
+pub fn clip_preview(text: &str) -> Clipped {
+    clip_to(text, PROMPT_PREVIEW_BYTES)
+}
+
+fn clip_to(text: &str, max_bytes: usize) -> Clipped {
     let bytes = text.len();
     let chars = text.chars().count();
 
-    if bytes <= MAX_TEXT_BYTES {
+    if bytes <= max_bytes {
         return Clipped {
             text: text.to_string(),
             chars,
@@ -783,7 +811,7 @@ pub fn clip(text: &str) -> Clipped {
         };
     }
 
-    let mut end = MAX_TEXT_BYTES;
+    let mut end = max_bytes;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -794,6 +822,11 @@ pub fn clip(text: &str) -> Clipped {
         bytes,
         truncated: true,
     }
+}
+
+pub fn text_hash(text: &str) -> String {
+    let hex = blake3::hash(text.as_bytes()).to_hex();
+    hex.as_str()[..12].to_string()
 }
 
 pub fn micros(duration: Duration) -> u64 {
@@ -847,14 +880,9 @@ fn open_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn writer(mut file: File, receiver: Receiver<Vec<u8>>) {
-    let mut warned = false;
-
     while let Ok(line) = receiver.recv() {
         if let Err(error) = file.write_all(&line).and_then(|_| file.flush()) {
-            if !warned {
-                tracing::warn!(%error, "falha ao gravar telemetria; desligando");
-                warned = true;
-            }
+            tracing::warn!(%error, "falha ao gravar telemetria; desligando");
             break;
         }
     }
@@ -868,6 +896,8 @@ fn rotate(path: &Path) {
     if metadata.len() < ROTATE_BYTES {
         return;
     }
+
+    let _ = std::fs::remove_file(rotated(path, ROTATE_KEEP));
 
     for index in (1..=ROTATE_KEEP).rev() {
         let from = if index == 1 {
@@ -927,7 +957,7 @@ mod tests {
         let lines = line_events(&path);
         assert_eq!(lines.len(), 2);
         for (index, line) in lines.iter().enumerate() {
-            assert_eq!(line["schema"], 1);
+            assert_eq!(line["schema"], SCHEMA);
             assert!(line["ts_ms"].as_u64().is_some());
             assert_eq!(line["seq"], index as u64 + 1);
             assert!(line["run"].as_str().is_some_and(|run| !run.is_empty()));
@@ -957,6 +987,25 @@ mod tests {
         assert_eq!(clipped.chars, text.chars().count());
         assert!(clipped.text.len() <= MAX_TEXT_BYTES);
         assert!(text.starts_with(&clipped.text));
+    }
+
+    #[test]
+    fn prompt_preview_is_smaller_than_the_full_body() {
+        let text = "x".repeat(PROMPT_PREVIEW_BYTES * 2);
+        let clipped = clip_preview(&text);
+
+        assert!(clipped.truncated);
+        assert_eq!(clipped.bytes, text.len());
+        assert_eq!(clipped.text.len(), PROMPT_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn text_hash_is_short_and_deterministic() {
+        let a = text_hash("abc");
+
+        assert_eq!(a, text_hash("abc"));
+        assert_eq!(a.len(), 12);
+        assert_ne!(a, text_hash("abd"));
     }
 
     #[test]
@@ -1006,6 +1055,8 @@ mod tests {
         telemetry.record(TelemetryEvent::ProviderResponse(ProviderResponse {
             request: 1,
             step: 1,
+            estimate_tokens: 10,
+            scale_ppm: 1_000_000,
             duration_us: 1,
             first_token_us: None,
             delta_count: 0,

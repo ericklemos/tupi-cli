@@ -11,17 +11,38 @@ use crate::token::{CONFIG_DIR, FileConfigError};
 pub const DEFAULT_MAX_TOOL_STEPS: usize = 30;
 
 /// Conteúdo de `configs/tools.ron`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolConfig {
     /// Quantos passos com tool calls o modelo pode dar por turno.
     pub max_tool_steps: usize,
+    /// Nomes das tools expostas ao modelo. Vazio deixa só o conjunto núcleo.
+    #[serde(default)]
+    pub expose: Vec<String>,
+    /// Expõe todas as tools registradas, ignorando `expose`.
+    #[serde(default)]
+    pub expose_all: bool,
+}
+
+impl ToolConfig {
+    /// Perfil de exposição de tools derivado desta configuração.
+    pub fn exposure(&self) -> tupi_tools::Exposure<'_> {
+        if self.expose_all {
+            tupi_tools::Exposure::All
+        } else if self.expose.is_empty() {
+            tupi_tools::Exposure::Core
+        } else {
+            tupi_tools::Exposure::Only(&self.expose)
+        }
+    }
 }
 
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             max_tool_steps: DEFAULT_MAX_TOOL_STEPS,
+            expose: Vec::new(),
+            expose_all: false,
         }
     }
 }
@@ -122,5 +143,21 @@ mod tests {
             load_tools(dir.path()).max_tool_steps,
             DEFAULT_MAX_TOOL_STEPS
         );
+    }
+
+    #[test]
+    fn default_config_registers_only_core_tools_when_wired_to_register_exposed() {
+        let cfg = ToolConfig::default();
+        let mut exposed = tupi_kernel::ToolRegistry::new();
+        tupi_tools::register_exposed(repo_root(), &mut exposed, cfg.exposure());
+
+        let mut all = tupi_kernel::ToolRegistry::new();
+        tupi_tools::register(repo_root(), &mut all);
+
+        assert!(exposed.specs().len() < all.specs().len());
+        assert!(exposed.has("read"));
+        assert!(exposed.has("edit"));
+        assert!(exposed.has("search"));
+        assert!(exposed.has("map"));
     }
 }

@@ -133,11 +133,17 @@ impl Tool for DiffTool {
         if base.is_empty() {
             return Err(ToolError::InvalidArguments("base vazia".to_string()));
         }
+        if base.starts_with('-') || base.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+            return Err(ToolError::InvalidArguments(format!(
+                "base inválida: {base}"
+            )));
+        }
 
         let mut args = vec![
             "diff".to_string(),
             "--unified=0".to_string(),
             "--no-color".to_string(),
+            "--end-of-options".to_string(),
             base.to_string(),
             "--".to_string(),
         ];
@@ -147,7 +153,9 @@ impl Tool for DiffTool {
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
-            args.push(path.to_string());
+            let resolved = crate::paths::resolve(&root, path)?;
+            let relative = crate::paths::relative(&root, &resolved);
+            args.push(relative);
         }
         let output = proc::program("git", &args, &root, Duration::from_secs(60))?;
         if !output.success {
@@ -366,5 +374,53 @@ mod tests {
         );
         let out = Tool::call(&tool(dir.path()), serde_json::json!({})).unwrap();
         assert!(out.contains("arquivos alterados: 0"));
+    }
+
+    #[test]
+    fn a_flag_like_base_is_rejected_before_running_git() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() { 1; }\n").unwrap();
+        git(dir.path(), &["add", "."]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() { 2; }\n").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("pwned.diff");
+        let base = format!("--output={}", target.display());
+
+        let err = Tool::call(
+            &tool(dir.path()),
+            serde_json::json!({ "base": base, "path": "../../outside" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)), "{err:?}");
+        assert!(
+            !target.exists(),
+            "git diff should not have written to {target:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_root_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        let err = Tool::call(
+            &tool(dir.path()),
+            serde_json::json!({ "path": "../outside" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::OutsideRoot(_)), "{err:?}");
     }
 }

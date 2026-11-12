@@ -270,21 +270,7 @@ pub fn build_body(request: &ChatRequest) -> serde_json::Value {
     });
 
     if !request.tools.is_empty() {
-        let tools: Vec<serde_json::Value> = request
-            .tools
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.schema,
-                    }
-                })
-            })
-            .collect();
-        body["tools"] = serde_json::Value::Array(tools);
+        body["tools"] = serde_json::Value::Array(tupi_kernel::tools_payload(&request.tools));
     }
 
     body

@@ -17,33 +17,202 @@ pub struct SearchHit {
 }
 
 pub fn curl(url: &str, cwd: &Path) -> Result<String, ToolError> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(ToolError::InvalidArguments(format!(
-            "url precisa ser http(s): {url}"
-        )));
-    }
-    let args = vec![
-        "-sSL".to_string(),
-        "--max-time".to_string(),
-        "30".to_string(),
-        "--compressed".to_string(),
-        "-A".to_string(),
-        "Mozilla/5.0 (compatible; tupi/0.1)".to_string(),
-        url.to_string(),
-    ];
-    let output = crate::proc::program("curl", &args, cwd, Duration::from_secs(45))?;
-    if !output.success {
-        let detail = if output.stderr.trim().is_empty() {
-            output.stdout.trim()
-        } else {
-            output.stderr.trim()
+    fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
+        let v4 = match ip {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)
+                {
+                    return true;
+                }
+                v6.to_ipv4_mapped().or_else(|| v6.to_ipv4())
+            }
         };
-        return Err(ToolError::Other(format!(
-            "falha ao baixar {url}: {}",
-            crate::exec::clip(detail, 600, 100)
-        )));
+        if let Some(v4) = v4 {
+            let octets = v4.octets();
+            return v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || octets[0] == 0
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || octets[0] >= 240;
+        }
+        false
     }
-    Ok(output.stdout)
+
+    fn parse_and_validate_url(
+        url: &str,
+    ) -> Result<(String, u16, Option<std::net::IpAddr>), ToolError> {
+        use std::net::ToSocketAddrs;
+
+        let (default_port, rest) = if let Some(rest) = url.strip_prefix("http://") {
+            (80u16, rest)
+        } else if let Some(rest) = url.strip_prefix("https://") {
+            (443u16, rest)
+        } else {
+            return Err(ToolError::InvalidArguments(format!(
+                "url precisa ser http(s): {url}"
+            )));
+        };
+
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+            let (h, after) = bracketed.split_once(']').unwrap_or((bracketed, ""));
+            let p = after
+                .strip_prefix(':')
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            (h.trim().to_ascii_lowercase(), p)
+        } else if let Some((h, p_str)) = host_port.rsplit_once(':') {
+            let p = p_str.parse::<u16>().unwrap_or(default_port);
+            (h.trim().to_ascii_lowercase(), p)
+        } else {
+            (host_port.trim().to_ascii_lowercase(), default_port)
+        };
+
+        if host.is_empty()
+            || host == "localhost"
+            || host.ends_with(".localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host.ends_with(".nip.io")
+            || host.ends_with(".sslip.io")
+            || host == "localtest.me"
+            || host.ends_with(".localtest.me")
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "host local ou privado recusado: {url}"
+            )));
+        }
+
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_non_global_ip(ip) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "host local ou privado recusado: {url}"
+                )));
+            }
+            return Ok((host, port, None));
+        }
+
+        let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|error| ToolError::Other(format!("falha ao resolver {host}:{port}: {error}")))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(ToolError::Other(format!(
+                "nenhum endereço resolvido para {host}"
+            )));
+        }
+        if addrs.iter().any(|addr| is_non_global_ip(addr.ip())) {
+            return Err(ToolError::InvalidArguments(format!(
+                "host local ou privado recusado: {url}"
+            )));
+        }
+
+        Ok((host, port, Some(addrs[0].ip())))
+    }
+
+    fn resolve_redirect(base_url: &str, location: &str) -> String {
+        let loc = location.trim();
+        if loc.starts_with("http://") || loc.starts_with("https://") {
+            return loc.to_string();
+        }
+        let (scheme, rest) = if let Some(r) = base_url.strip_prefix("https://") {
+            ("https://", r)
+        } else if let Some(r) = base_url.strip_prefix("http://") {
+            ("http://", r)
+        } else {
+            return loc.to_string();
+        };
+        if let Some(without_slashes) = loc.strip_prefix("//") {
+            return format!("{scheme}{without_slashes}");
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if loc.starts_with('/') {
+            format!("{scheme}{authority}{loc}")
+        } else {
+            format!("{scheme}{authority}/{loc}")
+        }
+    }
+
+    let mut current_url = url.trim().to_string();
+    for _ in 0..=5 {
+        let (host, port, pinned_ip) = parse_and_validate_url(&current_url)?;
+        let mut args = vec![
+            "-sS".to_string(),
+            "-i".to_string(),
+            "--proto".to_string(),
+            "=http,https".to_string(),
+            "--max-time".to_string(),
+            "30".to_string(),
+            "--compressed".to_string(),
+            "-A".to_string(),
+            "Mozilla/5.0 (compatible; tupi/0.1)".to_string(),
+        ];
+        if let Some(ip) = pinned_ip {
+            args.push("--resolve".to_string());
+            args.push(format!("{host}:{port}:{ip}"));
+        }
+        args.push(current_url.clone());
+
+        let output = crate::proc::program("curl", &args, cwd, Duration::from_secs(45))?;
+        if !output.success {
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            return Err(ToolError::Other(format!(
+                "falha ao baixar {current_url}: {}",
+                crate::exec::clip(detail, 600, 100)
+            )));
+        }
+
+        let raw = &output.stdout;
+        let (headers, body) = raw
+            .split_once("\r\n\r\n")
+            .or_else(|| raw.split_once("\n\n"))
+            .unwrap_or(("", raw.as_str()));
+
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(200);
+
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let location = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("location") {
+                    Some(value.trim())
+                } else {
+                    None
+                }
+            });
+            if let Some(loc) = location {
+                current_url = resolve_redirect(&current_url, loc);
+                continue;
+            }
+        }
+
+        return Ok(body.to_string());
+    }
+
+    Err(ToolError::Other(format!(
+        "muitos redirecionamentos ao baixar {url}"
+    )))
 }
 
 pub fn decode_entities(text: &str) -> String {
@@ -388,5 +557,27 @@ mod tests {
     #[test]
     fn percent_encoding_round_trips() {
         assert_eq!(percent_decode(&url_encode("a b&c")), "a b&c");
+
+        let cwd = std::path::Path::new(".");
+        for blocked in [
+            "http://127.0.0.1:8080/secret",
+            "http://localhost/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8000/",
+            "http://10.0.0.1/internal",
+            "http://172.16.0.1/internal",
+            "http://192.168.1.1/router",
+            "http://[::ffff:127.0.0.1]:8080/secret",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://100.64.0.1/cgnat",
+            "http://127.0.0.1.nip.io/admin",
+            "http://localtest.me/admin",
+        ] {
+            let err = curl(blocked, cwd).unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidArguments(_)),
+                "expected {blocked} to be rejected before spawning curl, got {err:?}"
+            );
+        }
     }
 }

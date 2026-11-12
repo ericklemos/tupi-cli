@@ -62,12 +62,48 @@ impl GraphCache {
         built
     }
 
-    pub fn repair(&self, _paths: &[PathBuf]) {
-        let rebuilt = Arc::new(self.build());
-        *self
+    pub fn repair(&self, paths: &[PathBuf]) {
+        let current = self
             .graph
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(rebuilt);
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(current) = current else {
+            return;
+        };
+
+        if !paths.is_empty() {
+            let root = self
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| self.root.clone());
+            let unchanged = paths.iter().all(|path| {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                };
+                match std::fs::read(&resolved) {
+                    Ok(bytes) => {
+                        let hash = blake3::hash(&bytes);
+                        current
+                            .file_hashes
+                            .get(&resolved)
+                            .or_else(|| current.file_hashes.get(path))
+                            .is_some_and(|existing| *existing == hash)
+                    }
+                    Err(_) => {
+                        !current.file_hashes.contains_key(&resolved)
+                            && !current.file_hashes.contains_key(path)
+                    }
+                }
+            });
+            if unchanged {
+                return;
+            }
+        }
+
+        self.invalidate();
     }
 
     fn build(&self) -> ProjectCodeGraph {
@@ -126,12 +162,63 @@ mod tests {
 
     #[test]
     fn a_cache_without_builder_degrades_to_an_empty_graph() {
-        let dir = tempfile::tempdir().unwrap();
         let cache = GraphCache {
-            root: dir.path().to_path_buf(),
-            graph: RwLock::new(None),
+            root: PathBuf::from("."),
             builder: None,
+            graph: RwLock::new(None),
         };
-        assert!(cache.get().matching("qualquer").is_empty());
+        assert!(cache.get().defs.is_empty());
+    }
+
+    #[test]
+    fn repair_skips_rebuilding_when_paths_already_match_graph_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "pub fn alpha() {}\n").unwrap();
+        let cache = GraphCache::new(dir.path().to_path_buf());
+        let first = cache.get();
+
+        // Calling repair again when the file content on disk hasn't changed since the
+        // graph was built (e.g. when GraphWatcher fires after RepairingTool already
+        // repaired) must keep the existing Arc<ProjectCodeGraph> without rebuilding.
+        cache.repair(&[file]);
+        let second = cache.get();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn repair_before_first_get_is_lazy_and_does_not_build_eagerly() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "pub fn alpha() {}\n").unwrap();
+        let cache = GraphCache::new(dir.path().to_path_buf());
+
+        cache.repair(&[file]);
+        assert!(cache.graph.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn repairing_tool_extracts_from_to_and_patch_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "pub fn alpha() {}\n").unwrap();
+        let cache = Arc::new(GraphCache::new(dir.path().to_path_buf()));
+        let first = cache.get();
+
+        let noop = Arc::new(crate::env::EnvTool::new());
+        let repairing = crate::graph::RepairingTool::new(noop, cache.clone());
+
+        // Move arguments on unchanged/non-source or matching file should extract paths rather than empty-paths invalidate
+        let move_paths = repairing.paths(&serde_json::json!({
+            "from": "a.rs",
+            "to": "a.rs"
+        }));
+        assert_eq!(move_paths.len(), 2);
+
+        let patch_paths = repairing.paths(&serde_json::json!({
+            "patch": "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-pub fn alpha() {}\n+pub fn alpha() {}\n"
+        }));
+        assert_eq!(patch_paths, vec![dir.path().join("a.rs")]);
+        assert!(Arc::ptr_eq(&first, &cache.get()));
     }
 }
