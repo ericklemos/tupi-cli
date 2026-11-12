@@ -45,6 +45,7 @@ pub struct ReadTool {
     ledger: Arc<DeliveryLedger>,
     default_budget_tokens: usize,
     chunker: AstChunker,
+    graph: Option<Arc<crate::graph::GraphCache>>,
 }
 
 impl ReadTool {
@@ -60,11 +61,17 @@ impl ReadTool {
             ledger,
             default_budget_tokens,
             chunker: AstChunker::new(),
+            graph: None,
         }
     }
 
     pub fn with_parse_cache(mut self, cache: Arc<crate::graph::ParseCache>) -> Self {
         self.chunker = AstChunker::with_cache(cache);
+        self
+    }
+
+    pub fn with_graph_cache(mut self, graph: Arc<crate::graph::GraphCache>) -> Self {
+        self.graph = Some(graph);
         self
     }
 
@@ -313,61 +320,103 @@ impl ReadTool {
         let snippets = self.chunker.snippets(path, content);
         let file_hash = ledger::content_hash(content);
         let hash = ledger::short_hash(&file_hash);
+        let graph = if relative.contains('@') {
+            None
+        } else {
+            self.graph.as_ref().map(|cache| cache.get())
+        };
 
-        Ok(snippets
+        let mut sections = Vec::new();
+        for snippet in snippets
             .into_iter()
             .filter(|snippet| snippet.symbol_name == symbol || snippet.qualified_name == symbol)
-            .map(|snippet| {
-                let display = snippet.qualified_name.clone();
-                let heading = format!(
-                    "### `{display}` (`{relative}:{}-{}`) · blake3 `{hash}`",
-                    snippet.start_line, snippet.end_line
-                );
-                let fence = format!("```rust\n{}\n```\n", snippet.code);
-                let mut body = fence.clone();
+        {
+            let display = snippet.qualified_name.clone();
+            let heading = format!(
+                "### `{display}` (`{relative}:{}-{}`) · blake3 `{hash}`",
+                snippet.start_line, snippet.end_line
+            );
+            let fence = format!("```rust\n{}\n```\n", snippet.code);
+            let mut body = fence.clone();
 
-                let mut pending = Pending {
-                    path: path.to_path_buf(),
-                    id: snippet.qualified_name.clone(),
-                    file_hash,
-                    text: snippet.code.clone(),
-                    complete: true,
-                    omitted: false,
-                };
+            let mut pending = Pending {
+                path: path.to_path_buf(),
+                id: snippet.qualified_name.clone(),
+                file_hash,
+                text: snippet.code.clone(),
+                complete: true,
+                omitted: false,
+            };
 
-                if !repeat_allowed {
-                    match self.ledger.check(
-                        path,
-                        &snippet.qualified_name,
-                        &file_hash,
-                        &snippet.code,
-                        snippet.start_line,
-                    ) {
-                        Verdict::Seen(seen) => {
-                            let handle = self.live_handle(&seen, path, &snippet.qualified_name);
-                            body = ledger::pointer_body(&seen, &handle);
-                            pending.omitted = true;
-                        }
-                        Verdict::Changed(changed) => {
-                            body = ledger::changed_body(&changed);
-                        }
-                        Verdict::Full { reason, .. } => {
-                            body = format!("{}\n{fence}", ledger::full_note(reason));
-                        }
-                        Verdict::Fresh => {}
+            if !repeat_allowed {
+                match self.ledger.check(
+                    path,
+                    &snippet.qualified_name,
+                    &file_hash,
+                    &snippet.code,
+                    snippet.start_line,
+                ) {
+                    Verdict::Seen(seen) => {
+                        let handle = self.live_handle(&seen, path, &snippet.qualified_name);
+                        body = ledger::pointer_body(&seen, &handle);
+                        pending.omitted = true;
                     }
+                    Verdict::Changed(changed) => {
+                        body = ledger::changed_body(&changed);
+                    }
+                    Verdict::Full { reason, .. } => {
+                        body = format!("{}\n{fence}", ledger::full_note(reason));
+                    }
+                    Verdict::Fresh => {}
                 }
+            }
 
-                Rendered {
-                    section: Section {
-                        heading,
-                        body,
-                        priority: 255,
-                    },
-                    pending: Some(pending),
+            let show_neighbors = !pending.omitted;
+            sections.push(Rendered {
+                section: Section {
+                    heading,
+                    body,
+                    priority: 255,
+                },
+                pending: Some(pending),
+            });
+
+            if show_neighbors
+                && let Some(graph) = &graph
+                && let Some(def) = graph.defs.iter().find(|def| {
+                    def.relative == relative
+                        && (def.qualified == snippet.qualified_name
+                            || (def.name == snippet.symbol_name
+                                && def.start_line == snippet.start_line))
+                })
+            {
+                let mut lines = Vec::new();
+                let callees = graph.callees_for(def);
+                if !callees.is_empty() {
+                    lines.push(format_neighbors("chama", &callees));
                 }
-            })
-            .collect())
+                let callers = graph.callers_for(def);
+                if !callers.is_empty() {
+                    lines.push(format_neighbors("chamado por", &callers));
+                }
+                if !lines.is_empty() {
+                    let first = lines.remove(0);
+                    sections.push(Rendered {
+                        section: Section {
+                            heading: first,
+                            body: if lines.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}\n", lines.join("\n"))
+                            },
+                            priority: 180,
+                        },
+                        pending: None,
+                    });
+                }
+            }
+        }
+        Ok(sections)
     }
 
     fn live_handle(&self, seen: &Seen, path: &Path, id: &str) -> String {
@@ -1002,5 +1051,59 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+    }
+
+    #[test]
+    fn symbol_read_includes_resolved_graph_neighbors() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("token.rs"),
+            "pub fn decode_jwt(raw: &str) -> bool {\n    !raw.is_empty()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("auth.rs"),
+            "use crate::token::decode_jwt;\n\npub fn verify_token(raw: &str) -> bool {\n    decode_jwt(raw)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("api.rs"),
+            "use crate::auth::verify_token;\n\npub fn login(raw: &str) -> bool {\n    verify_token(raw)\n}\n",
+        )
+        .unwrap();
+
+        let graph = crate::graph::GraphCache::shared(dir.path());
+        let tool = tool_for(dir.path()).with_graph_cache(graph);
+
+        let text = read(&tool, "auth.rs", Some("verify_token"), None, None).unwrap();
+        assert!(
+            text.contains("> chama: `decode_jwt` (token.rs:1)"),
+            "{text}"
+        );
+        assert!(text.contains("> chamado por: `login` (api.rs:3)"), "{text}");
+
+        let second = read(&tool, "auth.rs", Some("verify_token"), None, None).unwrap();
+        assert!(second.contains("Já entregue nesta sessão"), "{second}");
+        assert!(!second.contains("> chama:"), "{second}");
+        assert!(!second.contains("> chamado por:"), "{second}");
+    }
+}
+
+const MAX_NEIGHBORS: usize = 6;
+
+fn format_neighbors(label: &str, defs: &[&crate::graph::Def]) -> String {
+    let items: Vec<String> = defs
+        .iter()
+        .take(MAX_NEIGHBORS)
+        .map(|def| format!("`{}` ({}:{})", def.qualified, def.relative, def.start_line))
+        .collect();
+    if defs.len() > MAX_NEIGHBORS {
+        format!(
+            "> {label}: {}, +{} mais",
+            items.join(", "),
+            defs.len() - MAX_NEIGHBORS
+        )
+    } else {
+        format!("> {label}: {}", items.join(", "))
     }
 }

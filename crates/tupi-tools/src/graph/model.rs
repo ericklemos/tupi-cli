@@ -8,6 +8,29 @@ use crate::ast::Language;
 use crate::graph::scope::{FileScope, ScopeResolver};
 
 #[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SectionId(pub String);
+
+impl SectionId {
+    pub fn new(relative: &str, symbol: &str) -> Self {
+        Self(format!("{relative}#{symbol}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    Container,
+    Member,
+    DocumentChunk,
+}
+
+pub type SectionNode = SymbolNode;
+
+#[derive(Debug, Clone)]
 pub struct SymbolNode {
     pub name: String,
     pub qualified: String,
@@ -19,6 +42,9 @@ pub struct SymbolNode {
     pub is_callable: bool,
     pub is_test: bool,
     pub language: Language,
+    pub kind: SectionKind,
+    pub id: SectionId,
+    pub hash: blake3::Hash,
 }
 
 /// View read-only sobre `SymbolNode`, mantida para as tools que já usavam
@@ -40,6 +66,11 @@ pub struct Def {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationKind {
+    BelongsTo,
+    Calls,
+    TypeUse,
+    Implements,
+    References,
     Call,
     Import,
 }
@@ -141,6 +172,19 @@ impl ProjectCodeGraph {
                 {
                     out.push(def);
                 }
+            }
+        }
+        out
+    }
+
+    pub fn callers_for(&self, def: &Def) -> Vec<&Def> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for caller in self.graph.neighbors_directed(def.node, Direction::Incoming) {
+            if seen.insert(caller)
+                && let Some(def) = self.def_for(caller)
+            {
+                out.push(def);
             }
         }
         out
@@ -286,5 +330,20 @@ impl ProjectCodeGraph {
             .node_weight(index)
             .map(|node| node.name.clone())
             .unwrap_or_default()
+    }
+
+    pub fn container_of(&self, member: NodeIndex) -> Option<NodeIndex> {
+        self.graph
+            .edges_directed(member, Direction::Outgoing)
+            .find(|edge| edge.weight().kind == RelationKind::BelongsTo)
+            .map(|edge| edge.target())
+    }
+
+    pub fn members_of(&self, container: NodeIndex) -> Vec<NodeIndex> {
+        self.graph
+            .edges_directed(container, Direction::Incoming)
+            .filter(|edge| edge.weight().kind == RelationKind::BelongsTo)
+            .map(|edge| edge.source())
+            .collect()
     }
 }

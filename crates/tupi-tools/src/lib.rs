@@ -132,7 +132,8 @@ pub fn register_with(
             ledger.clone(),
             DEFAULT_BUDGET_TOKENS,
         )
-        .with_parse_cache(parse_cache.clone()),
+        .with_parse_cache(parse_cache.clone())
+        .with_graph_cache(graph.clone()),
     );
 
     registry.register(read.clone());

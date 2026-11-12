@@ -9,6 +9,7 @@ tupi-kernel.workspace = true
 tupi-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ron.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 tree-sitter.workspace = true

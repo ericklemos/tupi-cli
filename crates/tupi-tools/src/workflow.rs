@@ -1,20 +1,7 @@
-//! Descoberta dos workflows em cinco camadas, da mais fraca à mais forte:
-//!
-//! 1. **nativo** — embutido no binário por `include_str!`;
-//! 2. **global `.agents`** — `~/.agents/workflows/*.md`;
-//! 3. **global `.tupi`** — `~/.tupi/workflows/*.md`;
-//! 4. **local `.agents`** — `<root>/.agents/workflows/*.md`;
-//! 5. **local `.tupi`** — `<root>/.tupi/workflows/*.md`.
-//!
-//! O mais próximo do projeto vence; as camadas perdedoras ficam registradas em
-//! [`Workflow::shadowed`]. `.agents` é o diretório compartilhado com outros
-//! agentes; `.tupi` é a decisão deste agente e por isso vence no mesmo escopo.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Deserialize;
 use serde_json::Value;
 use tupi_domain::{Workflow, WorkflowSource};
 use tupi_kernel::{Tool, ToolError, ToolSpec, WorkflowIndex};
@@ -23,15 +10,9 @@ use crate::budget::Section;
 use crate::exec::finish;
 use crate::store::ResponseStore;
 
-/// Workflows que viajam dentro do binário. O nome é o do arquivo.
-pub const NATIVE: &[(&str, &str)] = &[
-    ("feature", include_str!("../workflows/feature.md")),
-    ("fix-bug", include_str!("../workflows/fix-bug.md")),
-    ("refactor", include_str!("../workflows/refactor.md")),
-    ("review", include_str!("../workflows/review.md")),
-];
-
 const DESCRIPTION_CHARS: usize = 120;
+
+include!(concat!(env!("OUT_DIR"), "/native_workflows.rs"));
 
 fn home() -> PathBuf {
     let home = if cfg!(windows) {
@@ -42,27 +23,22 @@ fn home() -> PathBuf {
     PathBuf::from(home.unwrap_or_else(|| ".".into()))
 }
 
-/// `~/.agents/workflows`, ou `%USERPROFILE%\.agents\workflows` no Windows.
 pub fn global_agents_dir() -> PathBuf {
     home().join(".agents").join("workflows")
 }
 
-/// `~/.tupi/workflows`.
 pub fn global_dir() -> PathBuf {
     home().join(".tupi").join("workflows")
 }
 
-/// `<root>/.agents/workflows`.
 pub fn local_agents_dir(root: &Path) -> PathBuf {
     root.join(".agents").join("workflows")
 }
 
-/// `<root>/.tupi/workflows`.
 pub fn local_dir(root: &Path) -> PathBuf {
     root.join(".tupi").join("workflows")
 }
 
-/// Catálogo do projeto: nativo, global e local, com o mais forte vencendo.
 pub fn catalog(root: &Path) -> Vec<Workflow> {
     catalog_with(
         root,
@@ -75,45 +51,13 @@ pub fn catalog(root: &Path) -> Vec<Workflow> {
     )
 }
 
-/// Mesma resolução de [`catalog`], com os diretórios injetados.
 fn catalog_with(root: &Path, layers: &[(PathBuf, WorkflowSource)]) -> Vec<Workflow> {
-    // O `skeptic` ainda não viaja por `include_str!` porque não há
-    // `workflows/skeptic.md`. Quando o arquivo existir, ele entra em `NATIVE`
-    // como os outros quatro e este bloco sai.
-    const SKEPTIC: &str = r#"---
-description: Duvidar de toda afirmação até a ferramenta capaz de contradizê-la dizer que ela vale.
----
-
-# Skeptic
-
-1. **Separe fato de memória.** Escreva o que está sendo afirmado — "isso compila",
-   "o teste cobre", "só um chamador". Memória e resumo anterior não valem como
-   prova: só conta o que uma ferramenta devolveu nesta sessão.
-2. **Escolha o falsificador.** Para cada afirmação, diga o comando que a
-   derrubaria: `exec` com `kind=check`, `test_many` pelo nome, `search` pelo
-   chamador, `read` pelo corpo. Sem falsificador, a afirmação é palpite —
-   marque como tal em vez de repetir.
-3. **Rode o falsificador.** `diff` mostra o que mudou de fato; `impact_check`
-   mostra quem a assinatura alterada atinge. Não pergunte ao usuário o que uma
-   ferramenta responde.
-4. **Ataque o caminho feliz.** Onde quebra: entrada vazia, arquivo inexistente,
-   falha de IO, concorrência, orçamento estourado. Procure o teste que exercita
-   esse caminho; se não existe, "está coberto" está refutado.
-5. **Cheque o custo do que sobra.** Linha nova é paga em todo request; teste novo
-   é pago em toda execução. Pergunte quais tokens ou segundos ela evita.
-6. **Dê veredito por item.** Provada (ferramenta e linha citadas), refutada
-   (saída que contradiz) ou não verificada (o que falta para verificar).
-
-Saída: a lista do passo 1 com o veredito de cada item; sem "provavelmente".
-"#;
-
     let mut merged: BTreeMap<String, Workflow> = BTreeMap::new();
-    for (name, text) in NATIVE
-        .iter()
-        .copied()
-        .chain(std::iter::once(("skeptic", SKEPTIC)))
-    {
-        merge(&mut merged, parse(name, text, None, WorkflowSource::Native));
+    for (default_name, text) in NATIVE {
+        merge(
+            &mut merged,
+            parse(default_name, text, None, WorkflowSource::Native),
+        );
     }
     for (dir, source) in layers {
         for workflow in read_dir(root, dir, *source) {
@@ -124,26 +68,24 @@ Saída: a lista do passo 1 com o veredito de cada item; sem "provavelmente".
 }
 
 fn merge(merged: &mut BTreeMap<String, Workflow>, incoming: Workflow) {
-    let key = incoming.name.clone();
-    match merged.remove(&key) {
+    match merged.get_mut(&incoming.name) {
+        Some(existing) => {
+            if incoming.source > existing.source {
+                let mut shadowed = existing.shadowed.clone();
+                shadowed.push(existing.source);
+                let mut replaced = incoming;
+                replaced.shadowed = shadowed;
+                *existing = replaced;
+            } else {
+                existing.shadowed.push(incoming.source);
+            }
+        }
         None => {
-            merged.insert(key, incoming);
-        }
-        Some(current) if incoming.source > current.source => {
-            let mut winner = incoming;
-            winner.shadowed = current.shadowed;
-            winner.shadowed.push(current.source);
-            merged.insert(key, winner);
-        }
-        Some(mut current) => {
-            current.shadowed.push(incoming.source);
-            merged.insert(key, current);
+            merged.insert(incoming.name.clone(), incoming);
         }
     }
 }
 
-/// Lê `*.md` de um diretório. Diretório ausente devolve vazio: workflow é
-/// opcional por definição.
 fn read_dir(root: &Path, dir: &Path, source: WorkflowSource) -> Vec<Workflow> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -151,7 +93,8 @@ fn read_dir(root: &Path, dir: &Path, source: WorkflowSource) -> Vec<Workflow> {
     let mut out: Vec<Workflow> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        if ext != Some("md") && ext != Some("ron") {
             continue;
         }
         let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -167,13 +110,41 @@ fn read_dir(root: &Path, dir: &Path, source: WorkflowSource) -> Vec<Workflow> {
     out
 }
 
-fn parse(name: &str, text: &str, path: Option<PathBuf>, source: WorkflowSource) -> Workflow {
-    let (front, body) = split_front_matter(text);
-    let description = front
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| first_paragraph(&body));
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct WorkflowRon {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    pub body: String,
+}
+
+fn parse(
+    default_name: &str,
+    text: &str,
+    path: Option<PathBuf>,
+    source: WorkflowSource,
+) -> Workflow {
+    let (name, description, body) = if let Ok(ron_parsed) = ron::from_str::<WorkflowRon>(text) {
+        let name = ron_parsed
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| default_name.to_string());
+        let desc = if !ron_parsed.description.trim().is_empty() {
+            ron_parsed.description
+        } else {
+            first_paragraph(&ron_parsed.body)
+        };
+        (name, desc, ron_parsed.body)
+    } else {
+        let (front, body) = split_front_matter(text);
+        let desc = front
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| first_paragraph(&body));
+        (default_name.to_string(), desc, body)
+    };
     Workflow {
-        name: name.to_string(),
+        name,
         description: truncate(&description, DESCRIPTION_CHARS),
         source,
         path,
@@ -182,7 +153,6 @@ fn parse(name: &str, text: &str, path: Option<PathBuf>, source: WorkflowSource) 
     }
 }
 
-/// Front-matter opcional `---\ndescription: …\n---`; o corpo sai sem ele.
 fn split_front_matter(text: &str) -> (Option<String>, String) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text
@@ -207,8 +177,6 @@ fn split_front_matter(text: &str) -> (Option<String>, String) {
     (description, body)
 }
 
-/// Descrição de reserva para arquivo sem front-matter: o primeiro parágrafo,
-/// caindo para o título quando o arquivo só tem títulos.
 fn first_paragraph(body: &str) -> String {
     let mut title = String::new();
     for line in body.lines() {
@@ -228,21 +196,14 @@ fn first_paragraph(body: &str) -> String {
 }
 
 fn truncate(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    for (count, ch) in text.chars().enumerate() {
-        if count == max {
-            out.push('…');
-            return out;
-        }
-        out.push(ch);
+    if text.chars().count() <= max {
+        return text.to_string();
     }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
-/// Bloco do prompt de sistema: um nome por workflow, sem descrição nem corpo.
-///
-/// Custa uma linha por sessão e evita um passo de `workflow` só para descobrir
-/// o que existe.
 pub fn prompt_section(workflows: &[Workflow]) -> String {
     if workflows.is_empty() {
         return String::new();
@@ -260,8 +221,6 @@ pub fn prompt_section(workflows: &[Workflow]) -> String {
     )
 }
 
-/// Catálogo de arquivos do projeto: atende a porta que o `App` e a TUI usam.
-#[derive(Debug, Clone)]
 pub struct Catalog {
     root: PathBuf,
 }
@@ -278,14 +237,14 @@ impl WorkflowIndex for Catalog {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WorkflowAction {
     List,
     Read,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowParams {
     pub action: WorkflowAction,
     pub name: Option<String>,
@@ -323,7 +282,7 @@ impl Tool for WorkflowTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Nome do arquivo sem .md; exigido por read."
+                        "description": "Nome do arquivo sem extensão; exigido por read."
                     },
                     "budget_tokens": {
                         "type": "integer",
@@ -568,8 +527,7 @@ mod tests {
                 (missing.join("d"), WorkflowSource::LocalTupi),
             ],
         );
-        // NATIVE mais o `skeptic`, que ainda não tem arquivo em `workflows/`.
-        assert_eq!(workflows.len(), NATIVE.len() + 1);
+        assert_eq!(workflows.len(), NATIVE.len());
         assert!(
             workflows
                 .iter()
@@ -608,7 +566,7 @@ mod tests {
     #[test]
     fn a_windows_front_matter_is_understood() {
         let (description, body) =
-            split_front_matter("---\r\ndescription: windows\r\n---\r\n\r\ncorpo");
+            split_front_matter("---\r\ndescription: windows\r\n---\r\n\rcorpo");
         assert_eq!(description.as_deref(), Some("windows"));
         assert_eq!(body, "corpo");
     }
@@ -706,6 +664,41 @@ mod tests {
         assert_eq!(skeptic.source, WorkflowSource::Native);
         assert!(!skeptic.description.is_empty());
         assert!(skeptic.body.contains("**Escolha o falsificador.**"));
+        assert!(skeptic.body.contains("The Skeptic 🤨"));
+        assert!(skeptic.body.contains("THE SKEPTIC'S DAILY PROCESS:"));
         assert!(!skeptic.body.starts_with("---"));
+    }
+
+    #[test]
+    fn a_ron_workflow_file_is_parsed_with_name_description_and_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let ron_content = "(name: \"custom-call\", description: \"workflow em ron\", body: \"# Custom\\n\\n1. faca\\n\")";
+        std::fs::create_dir_all(dir.path().join("local-tupi")).unwrap();
+        std::fs::write(dir.path().join("local-tupi/ignored_stem.ron"), ron_content).unwrap();
+
+        let workflows = catalog_with(dir.path(), &layers(dir.path()));
+        let custom = workflows
+            .iter()
+            .find(|workflow| workflow.name == "custom-call")
+            .expect("workflow com name no .ron deve usar esse nome");
+        assert_eq!(custom.source, WorkflowSource::LocalTupi);
+        assert_eq!(custom.description, "workflow em ron");
+        assert_eq!(custom.body.trim(), "# Custom\n\n1. faca");
+    }
+
+    #[test]
+    fn every_native_workflow_is_valid_ron_in_configs() {
+        assert_eq!(NATIVE.len(), 5);
+        for (name, text) in NATIVE {
+            let parsed = ron::from_str::<WorkflowRon>(text);
+            assert!(
+                parsed.is_ok(),
+                "workflow nativo {name} não é RON válido: {:?}",
+                parsed.err()
+            );
+            let ron = parsed.unwrap();
+            assert_eq!(ron.name.as_deref(), Some(*name));
+            assert!(!ron.body.trim().is_empty(), "corpo vazio em {name}");
+        }
     }
 }

@@ -29,10 +29,16 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutcome {
-    Started { request_id: RequestId },
+    Started {
+        request_id: RequestId,
+    },
     Cancelled,
-    ModelChanged { model: String },
-    ShowPrompts { enabled: bool },
+    ModelChanged {
+        model: String,
+    },
+    ShowPrompts {
+        enabled: bool,
+    },
     /// `/new` aceito: o histórico foi descartado e a próxima mensagem abre um turno novo.
     SessionReset,
     Noop,

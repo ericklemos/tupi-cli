@@ -3207,9 +3207,12 @@ name = "tupi-providers"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "futures-util",
  "reqwest",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3241,6 +3244,7 @@ dependencies = [
  "notify",
  "petgraph",
  "regex",
+ "ron",
  "serde",
  "serde_json",
  "streaming-iterator",
