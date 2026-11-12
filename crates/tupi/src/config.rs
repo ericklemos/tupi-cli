@@ -1,20 +1,26 @@
-pub const KEY: &str = "TUPI_CLI_DEEPSEEK_PLATAFORM_APIKEY";
-pub const MODEL: &str = "TUPI_MODEL";
-pub const LOG: &str = "TUPI_LOG";
+use std::path::{Path, PathBuf};
 
+const KEY: &str = "DEEPSEEK_API_KEY";
+const MODEL: &str = "DEEPSEEK_MODEL";
+const PROVIDER: &str = "TUPI_PROVIDER";
+const TUPI_MODEL: &str = "TUPI_MODEL";
+const LOG: &str = "TUPI_LOG";
 const DEFAULT_MODEL: &str = "deepseek-flash";
-const DEFAULT_LOG: &str = "warn";
+const DEFAULT_ANTIGRAVITY_MODEL: &str = "antigravity-gemini-3.8-flash";
+const DEFAULT_LOG: &str = "info";
+const DEFAULT_PROVIDER: &str = "deepseek";
 
 #[derive(Debug)]
 pub struct Config {
     pub api_key: String,
     pub model: String,
     pub log_filter: String,
+    pub provider: String,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("variável de ambiente {0} não definida")]
+    #[error("variável de ambiente '{0}' ausente ou vazia")]
     Missing(&'static str),
 }
 
@@ -22,13 +28,23 @@ pub fn from_env<F>(get: F) -> Result<Config, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let api_key = get(KEY)
+    let provider = get(PROVIDER)
         .filter(|value| !value.trim().is_empty())
-        .ok_or(ConfigError::Missing(KEY))?;
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
 
-    let model = get(MODEL)
+    let (api_key, default_model) = if provider == "antigravity" {
+        (get(KEY).unwrap_or_default(), DEFAULT_ANTIGRAVITY_MODEL)
+    } else {
+        let key = get(KEY)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::Missing(KEY))?;
+        (key, DEFAULT_MODEL)
+    };
+
+    let model = get(TUPI_MODEL)
+        .or_else(|| get(MODEL))
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| default_model.to_string());
 
     let log_filter = get(LOG)
         .filter(|value| !value.trim().is_empty())
@@ -38,6 +54,7 @@ where
         api_key,
         model,
         log_filter,
+        provider,
     })
 }
 
@@ -55,6 +72,7 @@ mod tests {
     fn model_defaults_to_deepseek_flash() {
         let config = from_env(|key| (key == KEY).then(|| "sk-1".to_string())).unwrap();
         assert_eq!(config.model, "deepseek-flash");
+        assert_eq!(config.provider, "deepseek");
     }
 
     #[test]
@@ -67,8 +85,30 @@ mod tests {
         .unwrap();
         assert_eq!(config.model, "deepseek-v4-pro");
     }
+
+    #[test]
+    fn provider_can_be_set_to_antigravity_without_deepseek_key() {
+        let config = from_env(|key| match key {
+            "TUPI_PROVIDER" => Some("antigravity".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.provider, "antigravity");
+        assert_eq!(config.model, "antigravity-gemini-3.8-flash");
+    }
+
+    #[test]
+    fn antigravity_model_can_be_overridden() {
+        let config = from_env(|key| match key {
+            "TUPI_PROVIDER" => Some("antigravity".to_string()),
+            "TUPI_MODEL" => Some("antigravity-claude-sonnet-4-6".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.model, "antigravity-claude-sonnet-4-6");
+    }
 }
-/// Configuração da compactação de contexto, lida de `context.ron`.
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextConfig {
@@ -84,17 +124,15 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            budget: tupi_domain::context::DEFAULT_CONTEXT_TOKENS,
-            target: 0,
-            recent_results: tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
+            budget: 32_000,
+            target: 12_800,
+            recent_results: 4,
         }
     }
 }
 
-use std::path::{Path, PathBuf};
-
 pub fn context_path(root: &Path) -> PathBuf {
-    crate::token::token_path(root).with_file_name("context.ron")
+    root.join("configs").join("context.ron")
 }
 
 pub fn parse_context(

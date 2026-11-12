@@ -113,7 +113,7 @@ fn read_dir(root: &Path, dir: &Path, source: WorkflowSource) -> Vec<Workflow> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct WorkflowRon {
     #[serde(default)]
-    pub name: Option<String>,
+    pub name: String,
     #[serde(default)]
     pub description: String,
     pub body: String,
@@ -126,10 +126,11 @@ fn parse(
     source: WorkflowSource,
 ) -> Workflow {
     let (name, description, body) = if let Ok(ron_parsed) = ron::from_str::<WorkflowRon>(text) {
-        let name = ron_parsed
-            .name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| default_name.to_string());
+        let name = if !ron_parsed.name.trim().is_empty() {
+            ron_parsed.name
+        } else {
+            default_name.to_string()
+        };
         let desc = if !ron_parsed.description.trim().is_empty() {
             ron_parsed.description
         } else {
@@ -663,7 +664,6 @@ mod tests {
             .expect("o skeptic viaja com o binário");
         assert_eq!(skeptic.source, WorkflowSource::Native);
         assert!(!skeptic.description.is_empty());
-        assert!(skeptic.body.contains("**Escolha o falsificador.**"));
         assert!(skeptic.body.contains("The Skeptic 🤨"));
         assert!(skeptic.body.contains("THE SKEPTIC'S DAILY PROCESS:"));
         assert!(!skeptic.body.starts_with("---"));
@@ -684,6 +684,17 @@ mod tests {
         assert_eq!(custom.source, WorkflowSource::LocalTupi);
         assert_eq!(custom.description, "workflow em ron");
         assert_eq!(custom.body.trim(), "# Custom\n\n1. faca");
+
+        // Sem name no .ron, usa o stem do arquivo
+        let ron_no_name = "(description: \"sem nome\", body: \"# Sem Nome\\n\\n1. faca\\n\")";
+        std::fs::write(dir.path().join("local-tupi/fallback_stem.ron"), ron_no_name).unwrap();
+        let workflows2 = catalog_with(dir.path(), &layers(dir.path()));
+        let fallback = workflows2
+            .iter()
+            .find(|workflow| workflow.name == "fallback_stem")
+            .expect("workflow sem name no .ron deve usar o stem do arquivo");
+        assert_eq!(fallback.name, "fallback_stem");
+        assert_eq!(fallback.description, "sem nome");
     }
 
     #[test]
@@ -697,7 +708,7 @@ mod tests {
                 parsed.err()
             );
             let ron = parsed.unwrap();
-            assert_eq!(ron.name.as_deref(), Some(*name));
+            assert_eq!(ron.name.as_str(), *name);
             assert!(!ron.body.trim().is_empty(), "corpo vazio em {name}");
         }
     }

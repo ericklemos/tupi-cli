@@ -25,9 +25,24 @@ async fn main() -> anyhow::Result<()> {
 
     let events = EventBus::new(256);
     let mut registry = ProviderRegistry::new();
-    deepseek::register_all(&mut registry, &config.api_key);
+    if !config.api_key.is_empty() {
+        deepseek::register_all(&mut registry, &config.api_key);
+    }
 
-    let provider = "deepseek".to_string();
+    let tupi_config_dir = state_dir();
+    let opencode_config_dir = data_dir(|key| std::env::var(key).ok())
+        .parent()
+        .map(|p| p.join("opencode"));
+
+    if let Some(creds) = tupi_providers::antigravity::AntigravityCredentials::load_from_dirs(
+        &tupi_config_dir,
+        opencode_config_dir.as_deref(),
+    ) {
+        tracing::debug!(project = %creds.project_id, "credenciais Antigravity carregadas");
+        tupi_providers::antigravity::register_all(&mut registry, creds);
+    }
+
+    let provider = config.provider.clone();
     let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
     let mut store_error = None;
     let mut store_error_kind = None;

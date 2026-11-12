@@ -23,9 +23,9 @@ fn main() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("ron") {
                 println!("cargo:rerun-if-changed={}", path.display());
-                let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
                 let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
-                entries.push((stem, file_name));
+                let abs_path = path.canonicalize().unwrap_or(path);
+                entries.push((stem, abs_path));
             }
         }
     }
@@ -35,9 +35,9 @@ fn main() {
         "/// Workflows nativos gerados em tempo de compilação a partir de configs/workflows/*.ron\n",
     );
     code.push_str("pub const NATIVE: &[(&str, &str)] = &[\n");
-    for (stem, file_name) in &entries {
-        let rel_path = format!("../../../configs/workflows/{file_name}");
-        code.push_str(&format!("    ({stem:?}, include_str!({rel_path:?})),\n"));
+    for (stem, abs_path) in &entries {
+        let path_str = abs_path.to_str().unwrap().replace('\\', "/");
+        code.push_str(&format!("    ({stem:?}, include_str!({path_str:?})),\n"));
     }
     code.push_str("];\n");
 

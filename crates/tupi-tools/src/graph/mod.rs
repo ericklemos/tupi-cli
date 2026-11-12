@@ -14,13 +14,14 @@ mod watcher;
 
 pub use builder::GraphBuilder;
 pub use cache::GraphCache;
-pub use model::{CallGraph, Def, ProjectCodeGraph, RelationEdge, RelationKind, SymbolNode};
+pub use model::{
+    CallGraph, Def, ProjectCodeGraph, RelationEdge, RelationKind, SectionId, SectionKind,
+    SectionNode, SymbolNode,
+};
 pub use parse_cache::ParseCache;
 pub use scope::{FileScope, ImportTarget, Resolution, ScopeResolver};
 pub use watcher::GraphWatcher;
 
-/// Depois de uma tool que muta, o grafo é reconstruído (com os parses em
-/// cache) em vez de ficar com arestas velhas.
 pub(crate) struct RepairingTool {
     inner: Arc<dyn Tool>,
     cache: Arc<GraphCache>,
@@ -76,15 +77,9 @@ impl Tool for RepairingTool {
 
     fn call(&self, arguments: Value) -> Result<String, ToolError> {
         let paths = self.paths(&arguments);
-        let result = self.inner.call(arguments);
-        if result.is_ok() {
-            if paths.is_empty() {
-                self.cache.invalidate();
-            } else {
-                self.cache.repair(&paths);
-            }
-        }
-        result
+        let result = self.inner.call(arguments)?;
+        self.cache.repair(&paths);
+        Ok(result)
     }
 
     fn describe_call(&self, arguments: &Value) -> String {

@@ -40,7 +40,7 @@ impl GraphQueries {
             &rust,
             r#"
             (call_expression function: (identifier) @call.name)
-            (call_expression function: (field_expression value: (identifier) @call.receiver field: (field_identifier) @call.name))
+            (call_expression function: (field_expression value: (_) @call.receiver field: (field_identifier) @call.name))
             (call_expression function: (scoped_identifier path: (identifier) @call.receiver name: (identifier) @call.name))
             (call_expression function: (scoped_identifier name: (identifier) @call.name) @call.path)
             (call_expression function: (scoped_identifier path: (scoped_identifier) @call.path name: (identifier) @call.name))

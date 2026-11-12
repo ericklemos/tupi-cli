@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,7 +9,9 @@ use tree_sitter::{Node, QueryCursor};
 use tupi_kernel::ToolError;
 
 use crate::ast::{AstChunker, Language};
-use crate::graph::model::{ProjectCodeGraph, RelationEdge, RelationKind, SymbolNode};
+use crate::graph::model::{
+    ProjectCodeGraph, RelationEdge, RelationKind, SectionId, SectionKind, SymbolNode,
+};
 use crate::graph::parse_cache::ParseCache;
 use crate::graph::queries::GraphQueries;
 use crate::graph::scope::{
@@ -93,9 +95,19 @@ impl GraphBuilder {
                     || has_test_attribute(&content, snippet.start_line)
                     || snippet.code.contains("#[cfg(test)]")
                     || snippet.code.contains("@Test");
+                let is_container = snippet.signature.contains("struct ")
+                    || snippet.signature.contains("class ")
+                    || snippet.signature.contains("enum ")
+                    || snippet.signature.contains("trait ")
+                    || snippet.signature.contains("interface ");
+                let kind = if is_container {
+                    SectionKind::Container
+                } else {
+                    SectionKind::Member
+                };
                 graph.graph.add_node(SymbolNode {
                     name: snippet.symbol_name,
-                    qualified: snippet.qualified_name,
+                    qualified: snippet.qualified_name.clone(),
                     relative: relative.to_string_lossy().to_string(),
                     start_line: snippet.start_line,
                     end_line: snippet.end_line,
@@ -104,6 +116,9 @@ impl GraphBuilder {
                     is_callable,
                     is_test,
                     language,
+                    kind,
+                    id: SectionId::new(&relative.to_string_lossy(), &snippet.qualified_name),
+                    hash: blake3::hash(snippet.code.as_bytes()),
                 });
             }
 
@@ -113,6 +128,48 @@ impl GraphBuilder {
                 content,
                 language,
             });
+        }
+
+        let container_indices: Vec<(NodeIndex, String, String)> = graph
+            .graph
+            .node_indices()
+            .filter_map(|idx| {
+                let node = graph.graph.node_weight(idx)?;
+                if node.kind == SectionKind::Container {
+                    Some((idx, node.name.clone(), node.relative.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for member_idx in graph.graph.node_indices().collect::<Vec<_>>() {
+            let Some(member) = graph.graph.node_weight(member_idx) else {
+                continue;
+            };
+            if member.kind != SectionKind::Member {
+                continue;
+            }
+            if let Some((container_name, _)) = member.qualified.rsplit_once("::") {
+                let target = container_indices
+                    .iter()
+                    .find(|(_, name, rel)| name == container_name && rel == &member.relative)
+                    .or_else(|| {
+                        container_indices
+                            .iter()
+                            .find(|(_, name, _)| name == container_name)
+                    });
+                if let Some(&(container_idx, _, _)) = target {
+                    graph.graph.add_edge(
+                        member_idx,
+                        container_idx,
+                        RelationEdge {
+                            line: member.start_line,
+                            kind: RelationKind::BelongsTo,
+                        },
+                    );
+                }
+            }
         }
 
         for file in &parsed {
@@ -159,6 +216,26 @@ impl GraphBuilder {
                 }) else {
                     continue;
                 };
+
+                if call.receiver.as_deref() == Some("self")
+                    && let Some(container) = graph.container_of(caller)
+                {
+                    if let Some(target) = graph
+                        .members_of(container)
+                        .into_iter()
+                        .find(|&idx| graph.graph[idx].name == call.name)
+                    {
+                        graph.graph.add_edge(
+                            caller,
+                            target,
+                            RelationEdge {
+                                line: call.line,
+                                kind: RelationKind::Call,
+                            },
+                        );
+                        continue;
+                    }
+                }
 
                 let scope = graph
                     .scopes
@@ -248,21 +325,23 @@ impl GraphBuilder {
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
-    let mut builder = WalkBuilder::new(root);
-    builder
+    let mut files = Vec::new();
+    let walker = WalkBuilder::new(root)
         .standard_filters(true)
         .hidden(true)
-        .require_git(false)
-        .filter_entry(|entry| entry.file_name() != "target");
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
 
-    let mut files = Vec::new();
-    for entry in builder.build().flatten() {
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if Language::from_path(path).is_some() {
-            files.push(path.to_path_buf());
+    for entry in walker {
+        let entry = entry.map_err(|error| ToolError::Other(error.to_string()))?;
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let path = entry.into_path();
+            if Language::from_path(&path).is_some() {
+                files.push(path);
+            }
         }
     }
     files.sort();
@@ -331,6 +410,7 @@ fn collect_calls(
     root: &Node<'_>,
     content: &str,
 ) -> Vec<CallSite> {
+    use std::collections::BTreeMap;
     let query = queries.calls_query(language);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, content.as_bytes());
@@ -435,6 +515,31 @@ fn collect_bindings(content: &str) -> HashMap<String, Vec<(usize, String)>> {
                 }
             }
         }
+
+        if !line.starts_with("fn ") && !line.starts_with("let ") && !line.starts_with("//") {
+            let field_line = line
+                .trim_start_matches("pub ")
+                .trim_start_matches("pub(crate) ")
+                .trim();
+            if let Some((name, ty)) = field_line.split_once(':') {
+                let name = name.trim();
+                let ty = ty.trim().trim_end_matches(',').trim();
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !ty.is_empty()
+                {
+                    let clean = clean_type(ty);
+                    bindings
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((line_number, clean.clone()));
+                    bindings
+                        .entry(format!("self.{name}"))
+                        .or_default()
+                        .push((line_number, clean));
+                }
+            }
+        }
     }
     bindings
 }
@@ -444,44 +549,49 @@ fn binding_type_at(
     name: &str,
     line: usize,
 ) -> Option<String> {
-    bindings
-        .get(name)?
-        .iter()
-        .filter(|(at, _)| *at <= line)
-        .max_by_key(|(at, _)| *at)
-        .map(|(_, ty)| ty.clone())
+    bindings.get(name).and_then(|entries| {
+        entries
+            .iter()
+            .filter(|(at, _)| *at <= line)
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, ty)| ty.clone())
+    })
 }
 
 fn type_from_expr(expr: &str) -> Option<String> {
-    let expr = expr.trim().trim_start_matches('&').trim();
-    let head = expr.split(['(', '{', ';']).next()?;
-    let (ty, rest) = head.split_once("::")?;
-    if rest.trim().is_empty() {
-        return None;
+    let expr = expr.trim().trim_end_matches(';').trim();
+    if let Some((type_part, _)) = expr.split_once("::new(") {
+        return Some(clean_type(type_part));
     }
-    let ty = clean_type(ty);
-    (!ty.is_empty()).then_some(ty)
+    if let Some((type_part, _)) = expr.split_once("::default(") {
+        return Some(clean_type(type_part));
+    }
+    None
 }
 
 fn clean_type(ty: &str) -> String {
-    ty.trim()
-        .trim_start_matches('&')
-        .trim()
-        .trim_start_matches("mut ")
-        .trim()
-        .trim_end_matches('<')
-        .split('<')
-        .next()
-        .unwrap_or(ty)
-        .trim()
-        .to_string()
+    let ty = ty.trim();
+    let ty = ty.strip_prefix('&').unwrap_or(ty).trim();
+    let ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
+    if let Some(inner) = ty.strip_prefix("Arc<").and_then(|t| t.strip_suffix('>')) {
+        return clean_type(inner);
+    }
+    if let Some(inner) = ty.strip_prefix("Box<").and_then(|t| t.strip_suffix('>')) {
+        return clean_type(inner);
+    }
+    ty.split('<').next().unwrap_or(ty).trim().to_string()
 }
 
 fn has_test_attribute(content: &str, start_line: usize) -> bool {
-    let from = start_line.saturating_sub(4);
-    content
-        .lines()
-        .skip(from)
-        .take(start_line.saturating_sub(from))
-        .any(|line| line.contains("#[test]") || line.contains("::test]"))
+    let lines: Vec<&str> = content.lines().collect();
+    let check_range = start_line.saturating_sub(5)..start_line;
+    for line_idx in check_range {
+        if let Some(line) = lines.get(line_idx) {
+            let trimmed = line.trim();
+            if trimmed == "#[test]" || trimmed == "@Test" || trimmed.starts_with("#[tokio::test") {
+                return true;
+            }
+        }
+    }
+    false
 }

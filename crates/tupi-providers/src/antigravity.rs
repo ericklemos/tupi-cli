@@ -1,15 +1,18 @@
 use crate::sse::SseParser;
 use futures_util::stream::unfold;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tupi_domain::{Role, ToolCall};
-use tupi_kernel::{ChatRequest, Provider, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream};
+use tupi_kernel::{
+    ChatRequest, Provider, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
+};
 
 pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -32,6 +35,20 @@ pub const SUPPORTED_MODELS: &[&str] = &[
 ];
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn url_encode(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
 
 fn generate_request_id() -> String {
     let count = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -78,7 +95,8 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
                     parts.push(json!({ "text": msg.content }));
                 }
                 for call in &msg.tool_calls {
-                    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+                    let args: Value =
+                        serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
                     parts.push(json!({
                         "functionCall": {
                             "id": call.id,
@@ -178,7 +196,11 @@ pub fn extract_chunk(payload: &str) -> Result<AntigravityChunk, ProviderError> {
                         text_parts.push(text.to_string());
                     }
                     if let Some(fc) = part.get("functionCall") {
-                        let name = fc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                        let name = fc
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         let id = fc
                             .get("id")
                             .and_then(Value::as_str)
@@ -255,12 +277,114 @@ impl AntigravityCredentials {
             email,
         })
     }
+
+    pub fn parse_token_response(
+        payload: &str,
+        now_secs: u64,
+    ) -> Result<(String, u64), ProviderError> {
+        let val: Value = serde_json::from_str(payload)
+            .map_err(|e| ProviderError::Protocol(format!("resposta de token invalida: {e}")))?;
+
+        if let Some(error) = val.get("error").and_then(Value::as_str) {
+            let desc = val
+                .get("error_description")
+                .and_then(Value::as_str)
+                .unwrap_or(error);
+            return Err(ProviderError::Protocol(format!(
+                "erro de autenticacao: {desc}"
+            )));
+        }
+
+        let access_token = val
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Protocol("access_token ausente".to_string()))?
+            .to_string();
+
+        let expires_in = val
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(3600);
+
+        Ok((access_token, now_secs + expires_in))
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, content)
+    }
+
+    pub fn load_from_dirs(tupi_dir: &Path, opencode_dir: Option<&Path>) -> Option<Self> {
+        let tupi_path = tupi_dir.join("antigravity.json");
+        if let Ok(content) = std::fs::read_to_string(&tupi_path) {
+            if let Some(creds) = Self::from_json_str(&content) {
+                return Some(creds);
+            }
+        }
+
+        if let Some(op_dir) = opencode_dir {
+            let op_path = op_dir.join("antigravity-accounts.json");
+            if let Ok(content) = std::fs::read_to_string(&op_path) {
+                if let Some(creds) = Self::from_opencode_json_str(&content) {
+                    return Some(creds);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub async fn refresh_if_expired(
+        &mut self,
+        client: &reqwest::Client,
+        now_secs: u64,
+    ) -> Result<(), ProviderError> {
+        if !self.is_expired(now_secs) && !self.access_token.is_empty() {
+            return Ok(());
+        }
+
+        let body = format!(
+            "grant_type=refresh_token&refresh_token={}&client_id={}&client_secret={}",
+            url_encode(&self.refresh_token),
+            url_encode(ANTIGRAVITY_CLIENT_ID),
+            url_encode(ANTIGRAVITY_CLIENT_SECRET)
+        );
+
+        let response = client
+            .post("https://oauth2.googleapis.com/token")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let (new_access, new_expires_at) = Self::parse_token_response(&body, now_secs)?;
+        self.access_token = new_access;
+        self.expires_at = new_expires_at;
+
+        Ok(())
+    }
 }
 
 pub struct AntigravityProvider {
     credentials: Arc<Mutex<AntigravityCredentials>>,
     client: reqwest::Client,
     base_url: String,
+    save_path: Option<std::path::PathBuf>,
 }
 
 impl AntigravityProvider {
@@ -273,11 +397,17 @@ impl AntigravityProvider {
             credentials: Arc::new(Mutex::new(credentials)),
             client,
             base_url: ANTIGRAVITY_ENDPOINT.to_string(),
+            save_path: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_save_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.save_path = Some(path.into());
         self
     }
 }
@@ -300,20 +430,38 @@ impl Provider for AntigravityProvider {
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
-        let creds = self.credentials.lock().await.clone();
-        let project_id = if creds.project_id.is_empty() {
-            ANTIGRAVITY_DEFAULT_PROJECT_ID
-        } else {
-            &creds.project_id
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let (access_token, project_id) = {
+            let mut creds = self.credentials.lock().await;
+            if creds.is_expired(now_secs) || creds.access_token.is_empty() {
+                creds.refresh_if_expired(&self.client, now_secs).await?;
+                if let Some(path) = &self.save_path {
+                    let _ = creds.save(path);
+                }
+            }
+            (creds.access_token.clone(), creds.project_id.clone())
         };
 
-        let body = build_body(&request, project_id);
-        let url = format!("{}/v1internal:streamGenerateContent?alt=sse", self.base_url.trim_end_matches('/'));
+        let effective_project_id = if project_id.is_empty() {
+            ANTIGRAVITY_DEFAULT_PROJECT_ID
+        } else {
+            &project_id
+        };
+
+        let body = build_body(&request, effective_project_id);
+        let url = format!(
+            "{}/v1internal:streamGenerateContent?alt=sse",
+            self.base_url.trim_end_matches('/')
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", creds.access_token))
+            HeaderValue::from_str(&format!("Bearer {}", access_token))
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
         );
         headers.insert(USER_AGENT, HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
@@ -427,10 +575,7 @@ mod tests {
         );
         let body = build_body(&request, "rising-fact-p41fc");
 
-        assert_eq!(
-            body["request"]["systemInstruction"]["role"],
-            "user"
-        );
+        assert_eq!(body["request"]["systemInstruction"]["role"], "user");
         assert_eq!(
             body["request"]["systemInstruction"]["parts"][0]["text"],
             "voce e um assistente"
@@ -460,7 +605,10 @@ mod tests {
         assert_eq!(decls[0]["name"], "read_file");
         assert_eq!(decls[0]["description"], "le um arquivo");
         assert_eq!(decls[0]["parameters"]["type"], "object");
-        assert_eq!(decls[0]["parameters"]["properties"]["path"]["type"], "string");
+        assert_eq!(
+            decls[0]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -503,7 +651,8 @@ mod tests {
 
     #[test]
     fn chunk_extracts_text_delta() {
-        let payload = r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Ola mundo"}]}}]}}"#;
+        let payload =
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"Ola mundo"}]}}]}}"#;
         let chunk = extract_chunk(payload).unwrap();
         assert_eq!(chunk.text, Some("Ola mundo".into()));
         assert!(chunk.tool_calls.is_empty());
@@ -582,6 +731,75 @@ mod tests {
         assert!(creds.is_expired(945));
         // after: expired
         assert!(creds.is_expired(1050));
+    }
+
+    #[test]
+    fn parse_token_response_success() {
+        let json = r#"{"access_token":"ya29.new_token","expires_in":3600,"token_type":"Bearer"}"#;
+        let (token, expires_at) = AntigravityCredentials::parse_token_response(json, 1000).unwrap();
+        assert_eq!(token, "ya29.new_token");
+        assert_eq!(expires_at, 4600);
+    }
+
+    #[test]
+    fn parse_token_response_error() {
+        let json =
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        let err = AntigravityCredentials::parse_token_response(json, 1000).unwrap_err();
+        match err {
+            ProviderError::Protocol(msg) => {
+                assert!(msg.contains("Token has been expired or revoked"));
+            }
+            _ => panic!("esperava ProviderError::Protocol"),
+        }
+    }
+
+    #[test]
+    fn credentials_file_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = AntigravityCredentials {
+            access_token: "ya29.saved".into(),
+            refresh_token: "1//refresh".into(),
+            expires_at: 2000,
+            project_id: "my-project".into(),
+            email: Some("me@test.com".into()),
+        };
+
+        let file_path = dir.path().join("antigravity.json");
+        creds.save(&file_path).unwrap();
+
+        let loaded = AntigravityCredentials::load_from_dirs(dir.path(), None).unwrap();
+        assert_eq!(loaded, creds);
+    }
+
+    #[test]
+    fn load_from_dirs_falls_back_to_opencode_file() {
+        let tupi_dir = tempfile::tempdir().unwrap();
+        let opencode_dir = tempfile::tempdir().unwrap();
+
+        let opencode_json = r#"{
+            "version": 4,
+            "accounts": [
+                {
+                    "refreshToken": "1//opencode_saved",
+                    "projectId": "opencode-proj",
+                    "email": "user@gmail.com"
+                }
+            ],
+            "activeIndex": 0
+        }"#;
+        std::fs::write(
+            opencode_dir.path().join("antigravity-accounts.json"),
+            opencode_json,
+        )
+        .unwrap();
+
+        let loaded =
+            AntigravityCredentials::load_from_dirs(tupi_dir.path(), Some(opencode_dir.path()))
+                .unwrap();
+        assert_eq!(loaded.refresh_token, "1//opencode_saved");
+        assert_eq!(loaded.project_id, "opencode-proj");
+        assert_eq!(loaded.email, Some("user@gmail.com".into()));
     }
 
     #[tokio::test]

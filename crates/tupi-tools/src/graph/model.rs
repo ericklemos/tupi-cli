@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use petgraph::Direction;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+use petgraph::visit::EdgeRef;
 
 use crate::ast::Language;
 use crate::graph::scope::{FileScope, ScopeResolver};
 
-#[derive(Debug, Clone)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SectionId(pub String);
 
@@ -21,14 +21,12 @@ impl SectionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SectionKind {
     Container,
     Member,
     DocumentChunk,
 }
-
-pub type SectionNode = SymbolNode;
 
 #[derive(Debug, Clone)]
 pub struct SymbolNode {
@@ -47,8 +45,9 @@ pub struct SymbolNode {
     pub hash: blake3::Hash,
 }
 
-/// View read-only sobre `SymbolNode`, mantida para as tools que já usavam
-/// `Def` no grafo antigo.
+pub type SectionNode = SymbolNode;
+pub type CallGraph = ProjectCodeGraph;
+
 #[derive(Debug, Clone)]
 pub struct Def {
     pub name: String,
@@ -81,7 +80,7 @@ pub struct RelationEdge {
     pub kind: RelationKind,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ProjectCodeGraph {
     pub graph: StableDiGraph<SymbolNode, RelationEdge>,
     pub file_hashes: BTreeMap<PathBuf, blake3::Hash>,
@@ -92,18 +91,29 @@ pub struct ProjectCodeGraph {
     def_index: HashMap<NodeIndex, usize>,
 }
 
-pub type CallGraph = ProjectCodeGraph;
+impl Default for ProjectCodeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ProjectCodeGraph {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            graph: StableDiGraph::new(),
+            file_hashes: BTreeMap::new(),
+            dropped: BTreeMap::new(),
+            resolver: ScopeResolver::new(),
+            scopes: HashMap::new(),
+            defs: Vec::new(),
+            def_index: HashMap::new(),
+        }
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &SymbolNode> {
         self.graph.node_weights()
     }
 
-    /// Reconstroi a view `Def` a partir dos nós e das arestas resolvidas.
     pub fn rebuild_defs(&mut self) {
         self.defs.clear();
         self.def_index.clear();
@@ -321,17 +331,6 @@ impl ProjectCodeGraph {
         out
     }
 
-    fn def_for(&self, index: NodeIndex) -> Option<&Def> {
-        self.def_index.get(&index).and_then(|&at| self.defs.get(at))
-    }
-
-    fn node_name(&self, index: NodeIndex) -> String {
-        self.graph
-            .node_weight(index)
-            .map(|node| node.name.clone())
-            .unwrap_or_default()
-    }
-
     pub fn container_of(&self, member: NodeIndex) -> Option<NodeIndex> {
         self.graph
             .edges_directed(member, Direction::Outgoing)
@@ -345,5 +344,16 @@ impl ProjectCodeGraph {
             .filter(|edge| edge.weight().kind == RelationKind::BelongsTo)
             .map(|edge| edge.source())
             .collect()
+    }
+
+    fn def_for(&self, index: NodeIndex) -> Option<&Def> {
+        self.def_index.get(&index).and_then(|&at| self.defs.get(at))
+    }
+
+    fn node_name(&self, index: NodeIndex) -> String {
+        self.graph
+            .node_weight(index)
+            .map(|node| node.name.clone())
+            .unwrap_or_default()
     }
 }

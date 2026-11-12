@@ -1,5 +1,5 @@
 use tupi_tools::graph::{
-    ProjectCodeGraph, RelationEdge, RelationKind, SectionId, SectionKind, SymbolNode,
+    GraphBuilder, ProjectCodeGraph, RelationEdge, RelationKind, SectionId, SectionKind, SymbolNode,
 };
 
 #[test]
@@ -86,4 +86,107 @@ fn container_and_members_hierarchy_in_stable_graph() {
     graph.graph.remove_node(method1_idx);
     assert_eq!(graph.graph.node_weight(method2_idx).unwrap().name, "baz");
     assert_eq!(graph.members_of(container_idx), vec![method2_idx]);
+}
+
+#[test]
+fn builder_extracts_container_with_fields_and_belongs_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_rs = r#"
+pub struct TokenService {
+    secret: String,
+}
+
+pub struct AuthService {
+    token_service: TokenService,
+}
+
+impl AuthService {
+    pub fn login(&self) -> bool {
+        true
+    }
+
+    pub fn logout(&self) {}
+}
+"#;
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/auth.rs"), auth_rs).unwrap();
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+
+    let auth_idx = graph
+        .graph
+        .node_indices()
+        .find(|&idx| {
+            graph.graph[idx].name == "AuthService"
+                && graph.graph[idx].kind == SectionKind::Container
+        })
+        .expect("AuthService container node should exist");
+
+    let members = graph.members_of(auth_idx);
+    assert_eq!(
+        members.len(),
+        2,
+        "AuthService must have login and logout as members"
+    );
+
+    let member_names: Vec<&str> = members
+        .iter()
+        .map(|&idx| graph.graph[idx].name.as_str())
+        .collect();
+    assert!(member_names.contains(&"login"));
+    assert!(member_names.contains(&"logout"));
+
+    let login_idx = members
+        .into_iter()
+        .find(|&idx| graph.graph[idx].name == "login")
+        .unwrap();
+    assert_eq!(graph.container_of(login_idx), Some(auth_idx));
+}
+
+#[test]
+fn resolver_resolves_self_method_and_field_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = r#"
+pub struct TokenService {
+    secret: String,
+}
+
+impl TokenService {
+    pub fn decode(&self) -> bool {
+        true
+    }
+}
+
+pub struct AuthService {
+    token: TokenService,
+}
+
+impl AuthService {
+    pub fn internal_check(&self) -> bool {
+        true
+    }
+
+    pub fn login(&self) -> bool {
+        let ok = self.internal_check();
+        let valid = self.token.decode();
+        ok && valid
+    }
+}
+"#;
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/auth.rs"), code).unwrap();
+
+    let graph = GraphBuilder::new().unwrap().build(dir.path()).unwrap();
+
+    let login_callees = graph.callees("login");
+    let callee_names: Vec<&str> = login_callees.iter().map(|d| d.name.as_str()).collect();
+
+    assert!(
+        callee_names.contains(&"internal_check"),
+        "self.internal_check() must resolve to sibling method: {callee_names:?}"
+    );
+    assert!(
+        callee_names.contains(&"decode"),
+        "self.token.decode() must resolve via field type TokenService: {callee_names:?}"
+    );
 }
