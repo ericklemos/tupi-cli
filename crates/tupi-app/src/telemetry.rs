@@ -114,7 +114,9 @@ impl Telemetry {
             return Self::disabled();
         }
 
-        rotate(&path);
+        if let Err(error) = trim(&path) {
+            tracing::warn!(%error, path = %path.display(), "falha ao cortar telemetria");
+        }
 
         let file = match open_file(&path) {
             Ok(file) => file,
@@ -125,9 +127,10 @@ impl Telemetry {
         };
 
         let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
+        let writer_path = path.clone();
         let joiner = std::thread::Builder::new()
             .name("tupi-telemetry".to_string())
-            .spawn(move || writer(file, receiver));
+            .spawn(move || writer(file, writer_path, receiver));
 
         let joiner = match joiner {
             Ok(joiner) => joiner,
@@ -603,6 +606,22 @@ impl CommandInfo {
                 extra: Some(extra.clone()),
                 model: None,
             },
+            Command::Connect { provider } => Self {
+                command: "connect".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: Some(provider.clone()),
+                model: None,
+            },
+            Command::Memory { .. } => Self {
+                command: "memory".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: None,
+                model: None,
+            },
         }
     }
 
@@ -645,6 +664,9 @@ impl CommandInfo {
                         CommandOutcome::ModelChanged { .. } => "model_changed",
                         CommandOutcome::ShowPrompts { .. } => "show_prompts",
                         CommandOutcome::SessionReset => "session_reset",
+                        CommandOutcome::Memory { .. } => "memory",
+                        CommandOutcome::MemoryToggled { .. } => "memory_toggled",
+                        CommandOutcome::MemoryForgotten { .. } => "memory_forgotten",
                         CommandOutcome::Noop => "noop",
                     }
                     .to_string(),
@@ -659,7 +681,12 @@ impl CommandInfo {
                     CommandOutcome::ShowPrompts { enabled } => {
                         finished.enabled = Some(*enabled);
                     }
+                    CommandOutcome::MemoryToggled { enabled } => {
+                        finished.enabled = Some(*enabled);
+                    }
                     CommandOutcome::Cancelled
+                    | CommandOutcome::Memory { .. }
+                    | CommandOutcome::MemoryForgotten { .. }
                     | CommandOutcome::SessionReset
                     | CommandOutcome::Noop => {}
                 }
@@ -879,47 +906,92 @@ fn open_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn writer(mut file: File, receiver: Receiver<Vec<u8>>) {
+fn writer(file: File, path: PathBuf, receiver: Receiver<Vec<u8>>) {
+    let mut file = file;
+    let mut size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    // teto do arquivo: 96 MiB (32 MiB × 3), abaixo dos 100 MB pedidos
+    let cap = ROTATE_BYTES * ROTATE_KEEP as u64;
+
     while let Ok(line) = receiver.recv() {
         if let Err(error) = file.write_all(&line).and_then(|_| file.flush()) {
             tracing::warn!(%error, "falha ao gravar telemetria; desligando");
             break;
         }
+
+        size += line.len() as u64;
+        if size <= cap {
+            continue;
+        }
+
+        // passou do teto: descarta os registros mais antigos e reabre
+        match trim(&path) {
+            Ok(trimmed) => size = trimmed,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "falha ao cortar telemetria");
+                break;
+            }
+        }
+
+        match open_file(&path) {
+            Ok(reopened) => file = reopened,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "telemetria desligada");
+                break;
+            }
+        }
     }
 }
 
-fn rotate(path: &Path) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
+/// Corta os registros mais antigos quando o `telemetry.jsonl` passa do teto de
+/// 96 MiB (32 MiB × 3), mantendo o arquivo abaixo dos 100 MB.
+fn trim(path: &Path) -> std::io::Result<u64> {
+    trim_at(path, ROTATE_BYTES * ROTATE_KEEP as u64)
+}
+
+/// Mantém o arquivo abaixo de `max_bytes` descartando os registros mais antigos.
+///
+/// Devolve o tamanho final do arquivo.
+fn trim_at(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
     };
 
-    if metadata.len() < ROTATE_BYTES {
-        return;
+    if len <= max_bytes {
+        return Ok(len);
     }
 
-    let _ = std::fs::remove_file(rotated(path, ROTATE_KEEP));
+    // sobram só os últimos `max_bytes / 2` bytes, para não reescrever o arquivo
+    // a cada evento gravado
+    let keep = max_bytes / 2;
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(len - keep))?;
+    let mut tail = Vec::with_capacity(keep as usize);
+    file.read_to_end(&mut tail)?;
 
-    for index in (1..=ROTATE_KEEP).rev() {
-        let from = if index == 1 {
-            path.to_path_buf()
-        } else {
-            rotated(path, index - 1)
-        };
-        let to = rotated(path, index);
-        let _ = std::fs::rename(from, to);
+    // o recorte pode cair no meio de uma linha: descarta a primeira
+    let start = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(tail.len(), |at| at + 1);
+    let tail = &tail[start..];
+
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, tail)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
     }
-}
 
-fn rotated(path: &Path, index: usize) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| "telemetry".to_string());
-    let extension = path
-        .extension()
-        .map(|extension| format!(".{}", extension.to_string_lossy()))
-        .unwrap_or_default();
-    path.with_file_name(format!("{stem}.{index}{extension}"))
+    std::fs::rename(&temporary, path)?;
+    Ok(tail.len() as u64)
 }
 
 #[cfg(test)]
@@ -1018,19 +1090,37 @@ mod tests {
     }
 
     #[test]
-    fn startup_rotation_keeps_bounded_files() {
+    fn trimming_drops_the_oldest_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.jsonl");
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(ROTATE_BYTES)
-            .unwrap();
+        let mut body = String::new();
+        while body.len() < 4_000 {
+            body.push_str(&format!("{{\"n\":{}}}\n", body.len()));
+        }
+        std::fs::write(&path, &body).unwrap();
 
-        let telemetry = Telemetry::open(&path);
-        drop(telemetry);
+        let size = trim_at(&path, 600).unwrap();
+        let kept = std::fs::read_to_string(&path).unwrap();
 
-        assert!(dir.path().join("telemetry.1.jsonl").exists());
-        assert!(!dir.path().join("telemetry.4.jsonl").exists());
+        assert!(size <= 300, "cortou até a metade do teto");
+        assert_eq!(size, kept.len() as u64);
+        assert!(
+            body.ends_with(&kept),
+            "sobram só os registros mais recentes"
+        );
+        assert!(!dir.path().join("telemetry.jsonl.tmp").exists());
+
+        let first = kept.lines().next().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(first).is_ok());
+
+        // arquivo abaixo do teto fica intacto
+        let small = dir.path().join("small.jsonl");
+        std::fs::write(&small, "{\"a\":1}\n").unwrap();
+        assert_eq!(trim_at(&small, 600).unwrap(), 8);
+        assert_eq!(std::fs::read_to_string(&small).unwrap(), "{\"a\":1}\n");
+
+        // caminho inexistente não é erro
+        assert_eq!(trim_at(&dir.path().join("nada.jsonl"), 600).unwrap(), 0);
     }
 
     #[test]

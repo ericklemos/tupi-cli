@@ -168,7 +168,7 @@ struct StreamHandle {
 pub struct App {
     session: Arc<SessionStore>,
     registry: ProviderRegistry,
-    provider_id: String,
+    provider_id: Arc<Mutex<String>>,
     model: Mutex<String>,
     events: EventBus,
     store: Option<Arc<Store>>,
@@ -194,6 +194,11 @@ pub struct App {
     workflows: Arc<dyn WorkflowIndex>,
     /// Telemetria estruturada. Desligada por padrão; main liga explicitamente.
     telemetry: crate::telemetry::Telemetry,
+    /// Memória do repositório; desligada até with_memory.
+    memory: Arc<crate::memory::Memory>,
+    /// Diretório do artefato de depuração com a última mensagem e o payload.
+    /// `None` desliga a gravação (testes e construtores antigos).
+    debug_dir: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -249,7 +254,7 @@ impl App {
         Arc::new(Self {
             session: Arc::new(SessionStore::new(SESSION_ID)),
             registry,
-            provider_id: provider_id.into(),
+            provider_id: Arc::new(Mutex::new(provider_id.into())),
             model: Mutex::new(model),
             events,
             next_request: AtomicU64::new(1),
@@ -269,6 +274,8 @@ impl App {
             token_scale: Arc::new(AtomicU64::new(SCALE_ONE)),
             workflows: Arc::new(crate::workflow::EmptyIndex),
             telemetry: crate::telemetry::Telemetry::disabled(),
+            memory: Arc::new(crate::memory::Memory::disabled()),
+            debug_dir: None,
         })
     }
 
@@ -282,6 +289,11 @@ impl App {
     ///
     /// Nome desconhecido não vira chamada ao modelo: devolve o erro com a lista
     /// do que existe, que a TUI mostra sem gastar tokens.
+    pub fn with_debug_dir(mut self: Arc<Self>, dir: std::path::PathBuf) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("App recém-criado").debug_dir = Some(dir);
+        self
+    }
+
     fn run_workflow(&self, name: &str, extra: &str) -> Result<CommandOutcome, CommandError> {
         let name = name.trim();
         if name.is_empty() {
@@ -354,10 +366,14 @@ impl App {
         self.session.snapshot()
     }
 
-    fn provider(&self) -> Result<std::sync::Arc<dyn tupi_kernel::Provider>, CommandError> {
-        self.registry.get(&self.provider_id).ok_or_else(|| {
-            CommandError::Internal(format!("provedor '{}' não registrado", self.provider_id))
-        })
+    pub fn provider(&self) -> Result<std::sync::Arc<dyn tupi_kernel::Provider>, CommandError> {
+        let id = self.provider_id.lock().unwrap().clone();
+        if self.registry.get(&id).is_none() {
+            Self::sync_connected_providers(&self.registry, self.store.as_ref());
+        }
+        self.registry
+            .get(&id)
+            .ok_or_else(|| CommandError::Internal(format!("provedor '{}' não registrado", id)))
     }
 
     fn set_model(&self, model: String) -> Result<CommandOutcome, CommandError> {
@@ -365,7 +381,26 @@ impl App {
             return Err(CommandError::Busy);
         }
 
-        *self.model.lock().unwrap() = model.clone();
+        if let Some((prov, m)) = model.split_once('/') {
+            if self.registry.get(prov).is_none() {
+                return Err(CommandError::Internal(format!(
+                    "provedor '{prov}' não registrado"
+                )));
+            }
+            *self.provider_id.lock().unwrap() = prov.to_string();
+            *self.model.lock().unwrap() = m.to_string();
+        } else {
+            *self.model.lock().unwrap() = model.clone();
+        }
+
+        if let Some(store) = self.store.as_ref() {
+            let prov = self.provider_id.lock().unwrap().clone();
+            let m = self.model.lock().unwrap().clone();
+            if let Err(error) = Self::save_selected_model(store, &prov, &m) {
+                tracing::warn!(%error, "falha ao salvar modelo selecionado no redb");
+            }
+        }
+
         Ok(CommandOutcome::ModelChanged { model })
     }
 
@@ -427,6 +462,8 @@ impl App {
             ));
         }
 
+        let last_user_message = text.clone();
+        let debug_dir = self.debug_dir.clone();
         self.session.push(Role::User, text);
 
         let partial = Arc::new(Mutex::new(String::new()));
@@ -442,9 +479,35 @@ impl App {
         let task_cancel = Arc::clone(&cancel_flag);
         let task_in_flight = Arc::clone(&in_flight);
         let task_in_flight_count = Arc::clone(&in_flight_count);
+        let memory = Arc::clone(&self.memory);
+        let provider_for_memory = Arc::clone(&provider);
 
         let task = tokio::spawn(async move {
             let mut failure = None;
+            let memory_block = memory
+                .begin_turn(
+                    provider_for_memory.as_ref(),
+                    &model,
+                    &last_user_message,
+                    &task_cancel,
+                )
+                .await;
+            if let Some(block) = &memory_block {
+                events.publish(Event::Memory {
+                    text: block.summary(),
+                    after: false,
+                });
+            }
+            let memory_tokens = memory_block
+                .as_ref()
+                .map(|block| tupi_domain::tokens::estimate_tokens(&block.text))
+                .unwrap_or(0);
+            let mut tool_log: Vec<String> = Vec::new();
+            let mut stated: Vec<String> = memory_block
+                .as_ref()
+                .map(|block| block.fact_texts.clone())
+                .unwrap_or_default();
+            let mut final_text = String::new();
             let mut failure_kind: Option<&'static str> = None;
             let mut failure_http: Option<u16> = None;
             let mut step = 0;
@@ -483,6 +546,7 @@ impl App {
                 // cobrou mais do que estimamos, planejamos com menos espaço.
                 let request_tool_tokens = if final_step { 0 } else { tool_tokens };
                 let fixed_tokens = request_tool_tokens
+                    .saturating_add(memory_tokens)
                     .saturating_add(prefix_tokens)
                     .saturating_add(warning_tokens);
                 let scale = token_scale.load(Ordering::SeqCst);
@@ -503,6 +567,9 @@ impl App {
                 let mut messages = Vec::new();
                 if !prefix.is_empty() {
                     messages.push(Message::new(Role::System, prefix.clone()));
+                }
+                if let Some(block) = &memory_block {
+                    messages.push(Message::new(Role::System, block.text.clone()));
                 }
                 messages.extend(planned.messages);
                 if let Some(warning) = warning_message {
@@ -636,6 +703,12 @@ impl App {
                     }
                 }
 
+                if let Some(dir) = &debug_dir {
+                    if let Some(payload) = provider.last_payload() {
+                        crate::debug::write_last_prompt(dir, &last_user_message, &payload);
+                    }
+                }
+
                 if let Some(charged) = step_prompt_tokens {
                     let observed = observed_scale(prompt_estimate, charged);
                     let current = token_scale.load(Ordering::SeqCst);
@@ -668,6 +741,10 @@ impl App {
                     ));
                 }
 
+                if !streamed_text.is_empty() {
+                    final_text = streamed_text.clone();
+                }
+
                 if final_step {
                     if !streamed_text.is_empty() {
                         session.push_message(Message::assistant(streamed_text));
@@ -695,6 +772,11 @@ impl App {
                         break;
                     }
 
+                    tool_log.push(format!(
+                        "{}({})",
+                        call.name,
+                        crate::telemetry::clip(&call.arguments).text
+                    ));
                     tool_calls_count += 1;
                     let summary = describe_call(&tools, &call);
                     events.publish(Event::ToolStarted {
@@ -722,33 +804,53 @@ impl App {
                     }
 
                     let tool_started = std::time::Instant::now();
-                    let (content, ok) = match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
-                        crate::pipeline::execute(
-                            &tools,
-                            &events,
-                            request_id,
-                            &call,
-                            &telemetry,
-                            &task_cancel,
-                            &task_in_flight,
-                            &task_in_flight_count,
-                        )
-                        .await
-                    } else {
-                        run_tool(
-                            &tools,
-                            &call,
-                            &task_cancel,
-                            &task_in_flight,
-                            &task_in_flight_count,
-                        )
-                        .await
-                    } {
-                        Ok(result) => (result, true),
-                        Err(error) => (error, false),
-                    };
+                    let (mut content, ok) =
+                        match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
+                            crate::pipeline::execute(
+                                &tools,
+                                &events,
+                                request_id,
+                                &call,
+                                &telemetry,
+                                &task_cancel,
+                                &task_in_flight,
+                                &task_in_flight_count,
+                            )
+                            .await
+                        } else {
+                            run_tool(
+                                &tools,
+                                &call,
+                                &task_cancel,
+                                &task_in_flight,
+                                &task_in_flight_count,
+                            )
+                            .await
+                        } {
+                            Ok(result) => (result, true),
+                            Err(error) => (error, false),
+                        };
+                    let tool_summary = summarize(&content);
+                    if ok
+                        && let Some(block) = memory
+                            .recall_for_tool(
+                                provider_for_memory.as_ref(),
+                                &model,
+                                &call.name,
+                                &call.arguments,
+                                &task_cancel,
+                            )
+                            .await
+                    {
+                        events.publish(Event::Memory {
+                            text: block.summary(),
+                            after: false,
+                        });
+                        content = format!("{}\n\n{content}", block.text);
+                        stated.extend(block.fact_texts);
+                    }
                     let duration = tool_started.elapsed();
-                    let summary = summarize(&content);
+                    let summary = tool_summary;
 
                     events.publish(Event::ToolFinished {
                         request_id,
@@ -789,6 +891,32 @@ impl App {
                     pending_calls.retain(|pending| pending.id != call.id);
                 }
                 pending.lock().unwrap().clear();
+            }
+
+            if !tool_log.is_empty() {
+                let evidence = crate::memory::Evidence {
+                    user: last_user_message.clone(),
+                    assistant: final_text.clone(),
+                    tools: tool_log.clone(),
+                    injected: stated.clone(),
+                };
+                let memory = Arc::clone(&memory);
+                let provider = Arc::clone(&provider_for_memory);
+                let model = model.clone();
+                let events = events.clone();
+                let cancel = Arc::clone(&task_cancel);
+                tokio::spawn(async move {
+                    if let Some(outcome) = memory
+                        .feed(provider.as_ref(), &model, &evidence, &cancel)
+                        .await
+                        && outcome.added > 0
+                    {
+                        events.publish(Event::Memory {
+                            text: outcome.summary(),
+                            after: true,
+                        });
+                    }
+                });
             }
 
             let mut slot = current.lock().unwrap();
@@ -913,6 +1041,105 @@ impl App {
         });
         CommandOutcome::Cancelled
     }
+
+    pub fn load_antigravity_credentials(
+        store: &Store,
+    ) -> Option<tupi_providers::antigravity::AntigravityCredentials> {
+        match store.provider_credentials("antigravity") {
+            Ok(Some(raw)) => {
+                if let Some(creds) =
+                    tupi_providers::antigravity::AntigravityCredentials::from_json_str(&raw)
+                {
+                    return Some(creds);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "falha ao ler provedor Antigravity do redb");
+            }
+        }
+
+        if let Ok(Some(raw)) = store.setting("antigravity_credentials")
+            && let Some(creds) =
+                tupi_providers::antigravity::AntigravityCredentials::from_json_str(&raw)
+        {
+            let _ = store.save_provider_credentials("antigravity", &raw);
+            return Some(creds);
+        }
+
+        None
+    }
+
+    pub fn save_antigravity_credentials(
+        store: &Store,
+        creds: &tupi_providers::antigravity::AntigravityCredentials,
+    ) -> Result<(), tupi_store::StoreError> {
+        let json = serde_json::to_string(creds)
+            .map_err(|error| tupi_store::StoreError::Corrupt(error.to_string()))?;
+        store.save_provider_credentials("antigravity", &json)
+    }
+
+    pub fn load_selected_model(store: &Store) -> Option<(String, String)> {
+        let prov = match store.setting("selected_provider") {
+            Ok(Some(value)) if !value.trim().is_empty() => value,
+            _ => return None,
+        };
+        let model = match store.setting("selected_model") {
+            Ok(Some(value)) if !value.trim().is_empty() => value,
+            _ => return None,
+        };
+        Some((prov, model))
+    }
+
+    pub fn save_selected_model(
+        store: &Store,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), tupi_store::StoreError> {
+        store.save_setting("selected_provider", provider)?;
+        store.save_setting("selected_model", model)
+    }
+
+    pub fn register_antigravity_credentials(
+        registry: &ProviderRegistry,
+        creds: tupi_providers::antigravity::AntigravityCredentials,
+        store: Option<Arc<Store>>,
+    ) {
+        let mut provider = tupi_providers::antigravity::AntigravityProvider::new(creds);
+        if let Some(store) = store {
+            provider = provider.with_on_refresh(move |updated| {
+                if let Err(error) = Self::save_antigravity_credentials(&store, updated) {
+                    tracing::warn!(%error, "falha ao persistir token Antigravity atualizado no redb");
+                }
+            });
+        }
+        tupi_providers::antigravity::register_provider(registry, provider);
+    }
+
+    fn is_legacy_antigravity_cache(provider_id: &str, models: &[String]) -> bool {
+        provider_id == "antigravity"
+            && models
+                .iter()
+                .any(|model| model == "antigravity-gemini-3.8-flash")
+    }
+
+    pub fn sync_connected_providers(registry: &ProviderRegistry, store: Option<&Arc<Store>>) {
+        let Some(store) = store else { return };
+        let Ok(connected) = store.connected_providers() else {
+            return;
+        };
+        for id in connected {
+            if id == "antigravity" && registry.get("antigravity").is_none() {
+                if let Some(creds) = Self::load_antigravity_credentials(store) {
+                    Self::register_antigravity_credentials(
+                        registry,
+                        creds,
+                        Some(Arc::clone(store)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -933,6 +1160,7 @@ impl CommandHandler for App {
                 Command::RunWorkflow { name, extra } => self.run_workflow(&name, &extra),
                 Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
                 Command::SetModel { model } => self.set_model(model),
+                Command::Memory { action } => Ok(self.memory_command(action)),
                 Command::NewSession => {
                     let request_id = self.active.swap(0, Ordering::SeqCst);
                     if request_id != 0 {
@@ -941,6 +1169,7 @@ impl CommandHandler for App {
 
                     close_unanswered(&self.session, &self.pending, "nova sessão iniciada");
                     self.session.replace_messages(Vec::new());
+                    self.memory.new_session();
 
                     Ok(CommandOutcome::SessionReset)
                 }
@@ -960,11 +1189,9 @@ impl CommandHandler for App {
                     Ok(CommandOutcome::ShowPrompts { enabled })
                 }
                 Command::RefreshModels => {
-                    // A TUI só reage a eventos: banco e provedor rodam fora do loop.
-                    let provider = self.provider()?;
+                    let registry = self.registry.clone();
                     let events = self.events.clone();
                     let store = self.store.clone();
-                    let provider_id = self.provider_id.clone();
                     let telemetry = self.telemetry.clone();
 
                     tokio::spawn(async move {
@@ -974,112 +1201,173 @@ impl CommandHandler for App {
                             .map(|elapsed| elapsed.as_secs())
                             .unwrap_or(0);
 
-                        let cached = match store.as_ref() {
-                            Some(store) => {
-                                let store = Arc::clone(store);
-                                let id = provider_id.clone();
-                                tokio::task::spawn_blocking(move || store.models(&id))
-                                    .await
-                                    .ok()
-                                    .and_then(Result::ok)
-                                    .flatten()
-                            }
-                            None => None,
-                        };
+                        Self::sync_connected_providers(&registry, store.as_ref());
+                        let provider_ids = registry.ids();
+                        let multi_provider = provider_ids.len() > 1;
+                        let mut aggregated = Vec::new();
+                        let mut last_error = None;
 
-                        if let Some(entry) = cached.as_ref()
-                            && entry.is_fresh(now_unix, MODELS_TTL_SECS)
-                        {
-                            telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
-                                crate::telemetry::ModelsRefreshed {
-                                    source: "cache".to_string(),
-                                    count: entry.models.len(),
-                                    models: entry.models.clone(),
-                                    duration_us: crate::telemetry::micros(started.elapsed()),
-                                    ok: true,
-                                    error: None,
-                                    error_kind: None,
-                                    http_status: None,
-                                },
-                            ));
-                            events.publish(Event::ModelsLoaded {
-                                models: entry.models.clone(),
-                            });
-                            return;
-                        }
+                        for id in &provider_ids {
+                            let Some(prov) = registry.get(id) else { continue };
 
-                        match provider.list_models().await {
-                            Ok(models) => {
-                                telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
-                                    crate::telemetry::ModelsRefreshed {
-                                        source: "provider".to_string(),
-                                        count: models.len(),
-                                        models: models.clone(),
-                                        duration_us: crate::telemetry::micros(started.elapsed()),
-                                        ok: true,
-                                        error: None,
-                                        error_kind: None,
-                                        http_status: None,
-                                    },
-                                ));
-
-                                if let Some(store) = store.as_ref() {
+                            let cached = match store.as_ref() {
+                                Some(store) => {
                                     let store = Arc::clone(store);
-                                    let id = provider_id.clone();
-                                    let to_save = models.clone();
+                                    let id_clone = id.clone();
+                                    tokio::task::spawn_blocking(move || store.models(&id_clone))
+                                        .await
+                                        .ok()
+                                        .and_then(Result::ok)
+                                        .flatten()
+                                }
+                                None => None,
+                            };
 
-                                    match tokio::task::spawn_blocking(move || {
-                                        store.save_models(&id, &to_save, now_unix)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) => {
-                                            tracing::warn!(%error, "falha ao gravar catálogo local");
+                            let models = if let Some(entry) = cached.as_ref()
+                                && entry.is_fresh(now_unix, MODELS_TTL_SECS)
+                                && !Self::is_legacy_antigravity_cache(id, &entry.models)
+                            {
+                                entry.models.clone()
+                            } else {
+                                match prov.list_models().await {
+                                    Ok(models) => {
+                                        if let Some(store) = store.as_ref() {
+                                            let store = Arc::clone(store);
+                                            let id_clone = id.clone();
+                                            let to_save = models.clone();
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                store.save_models(&id_clone, &to_save, now_unix)
+                                            })
+                                            .await;
                                         }
-                                        Err(error) => {
-                                            tracing::warn!(%error, "falha ao agendar gravação");
-                                        }
+                                        models
+                                    }
+                                    Err(e) => {
+                                        last_error = Some(e.to_string());
+                                        cached.map(|e| e.models).unwrap_or_default()
                                     }
                                 }
+                            };
 
-                                events.publish(Event::ModelsLoaded { models });
-                            }
-                            Err(error) => {
-                                let models = cached
-                                    .as_ref()
-                                    .map(|entry| entry.models.clone())
-                                    .unwrap_or_default();
-                                telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
-                                    crate::telemetry::ModelsRefreshed {
-                                        source: "provider".to_string(),
-                                        count: models.len(),
-                                        models,
-                                        duration_us: crate::telemetry::micros(started.elapsed()),
-                                        ok: false,
-                                        error: Some(error.to_string()),
-                                        error_kind: Some(
-                                            crate::telemetry::provider_error_kind(&error).to_string(),
-                                        ),
-                                        http_status: crate::telemetry::provider_http_status(&error),
-                                    },
-                                ));
-
-                                if let Some(entry) = cached {
-                                    tracing::warn!(%error, "usando catálogo salvo");
-                                    events.publish(Event::ModelsLoaded {
-                                        models: entry.models,
-                                    });
+                            for m in models {
+                                if multi_provider {
+                                    aggregated.push(format!("{id}/{m}"));
                                 } else {
-                                    events.publish(Event::ModelsFailed {
-                                        message: error.to_string(),
-                                    });
+                                    aggregated.push(m);
                                 }
                             }
+                        }
+
+                        telemetry.record(crate::telemetry::TelemetryEvent::ModelsRefreshed(
+                            crate::telemetry::ModelsRefreshed {
+                                source: "aggregated".to_string(),
+                                count: aggregated.len(),
+                                models: aggregated.clone(),
+                                duration_us: crate::telemetry::micros(started.elapsed()),
+                                ok: true,
+                                error: None,
+                                error_kind: None,
+                                http_status: None,
+                            },
+                        ));
+
+                        if aggregated.is_empty() && last_error.is_some() {
+                            events.publish(Event::ModelsFailed {
+                                message: last_error.unwrap(),
+                            });
+                        } else {
+                            events.publish(Event::ModelsLoaded { models: aggregated });
                         }
                     });
 
                     Ok(CommandOutcome::Noop)
+                }
+                Command::Connect { provider } => {
+                    if provider == "antigravity" {
+                        let events = self.events.clone();
+                        let registry = self.registry.clone();
+                        let store = self.store.clone();
+
+                        tokio::spawn(async move {
+                            events.publish(Event::Notice {
+                                message: "Abrindo navegador para autenticação no Google...".to_string(),
+                            });
+
+                            let notify_events = events.clone();
+                            let flow_res = tupi_providers::antigravity::run_login_flow(true, move |url| {
+                                notify_events.publish(Event::Notice {
+                                    message: format!("Acesse para login: {url}"),
+                                });
+                            })
+                            .await;
+
+                            match flow_res {
+                                Ok(creds) => {
+                                    let mut saved = false;
+                                    if let Some(store_ref) = store.as_ref() {
+                                        let store_clone = Arc::clone(store_ref);
+                                        let creds_clone = creds.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            Self::save_antigravity_credentials(
+                                                &store_clone,
+                                                &creds_clone,
+                                            )
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(())) => saved = true,
+                                            Ok(Err(error)) => {
+                                                tracing::warn!(%error, "falha ao salvar credenciais Antigravity no redb");
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, "falha na tarefa de salvamento Antigravity");
+                                            }
+                                        }
+                                    }
+
+                                    Self::register_antigravity_credentials(
+                                        &registry,
+                                        creds,
+                                        store.clone(),
+                                    );
+
+                                    if let (Some(store_ref), Some(prov)) =
+                                        (store.as_ref(), registry.get("antigravity"))
+                                        && let Ok(models) = prov.list_models().await
+                                    {
+                                        let now_unix = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .map(|elapsed| elapsed.as_secs())
+                                            .unwrap_or(0);
+                                        let store_clone = Arc::clone(store_ref);
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            store_clone.save_models("antigravity", &models, now_unix)
+                                        })
+                                        .await;
+                                    }
+
+                                    let message = if saved {
+                                        "Antigravity conectado e salvo! Digite /models para selecionar o modelo."
+                                    } else {
+                                        "Antigravity conectado com sucesso! Digite /models para selecionar o modelo."
+                                    };
+
+                                    events.publish(Event::Notice {
+                                        message: message.to_string(),
+                                    });
+                                }
+                                Err(err) => {
+                                    events.publish(Event::Notice {
+                                        message: format!("Falha na autenticação Antigravity: {err}"),
+                                    });
+                                }
+                            }
+                        });
+
+                        Ok(CommandOutcome::Started { request_id: 0 })
+                    } else {
+                        Err(CommandError::Internal(format!("provedor '{provider}' não suporta /connect")))
+                    }
                 }
             }
         }
@@ -1111,11 +1399,9 @@ impl QueryHandler for App {
                 Query::History => Ok(QueryResult::History(self.session.messages())),
                 Query::ListProviders => Ok(QueryResult::Providers(self.registry.ids())),
                 Query::ListModels => {
-                    let provider = self.registry.get(&self.provider_id).ok_or_else(|| {
-                        QueryError::Internal(format!(
-                            "provedor '{}' não registrado",
-                            self.provider_id
-                        ))
+                    let id = self.provider_id.lock().unwrap().clone();
+                    let provider = self.registry.get(&id).ok_or_else(|| {
+                        QueryError::Internal(format!("provedor '{}' não registrado", id))
                     })?;
                     Ok(QueryResult::Models(provider.list_models().await?))
                 }
@@ -1163,7 +1449,7 @@ mod prefix_tests {
     }
 
     fn registry(provider: Arc<dyn Provider>) -> ProviderRegistry {
-        let mut registry = ProviderRegistry::new();
+        let registry = ProviderRegistry::new();
         registry.register(provider);
         registry
     }
@@ -1474,6 +1760,55 @@ mod budget_tests {
         );
     }
 }
+impl App {
+    pub fn with_memory(self: Arc<Self>, root: std::path::PathBuf) -> Arc<Self> {
+        self.memory.attach(root);
+        self
+    }
+
+    fn memory_command(&self, action: tupi_kernel::MemoryAction) -> tupi_kernel::CommandOutcome {
+        match action {
+            tupi_kernel::MemoryAction::List => {
+                let (items, ids) = self.memory.list();
+                tupi_kernel::CommandOutcome::Memory {
+                    title: format!(
+                        " memória · {} fato(s) · {} pendência(s) ",
+                        items.len(),
+                        self.memory.pending_count()
+                    ),
+                    items,
+                    ids,
+                }
+            }
+            tupi_kernel::MemoryAction::Search(query) => {
+                let (items, ids) = self.memory.search(&query);
+                tupi_kernel::CommandOutcome::Memory {
+                    title: format!(" memória · busca · {} resultado(s) ", items.len()),
+                    items,
+                    ids,
+                }
+            }
+            tupi_kernel::MemoryAction::Pending => tupi_kernel::CommandOutcome::Memory {
+                title: " pendências ".to_string(),
+                items: self.memory.pending_lines(),
+                ids: Vec::new(),
+            },
+            tupi_kernel::MemoryAction::Forget(id) => {
+                let found = self.memory.forget(&id);
+                tupi_kernel::CommandOutcome::MemoryForgotten { id, found }
+            }
+            tupi_kernel::MemoryAction::Off => {
+                self.memory.set_enabled(false);
+                tupi_kernel::CommandOutcome::MemoryToggled { enabled: false }
+            }
+            tupi_kernel::MemoryAction::On => {
+                self.memory.set_enabled(true);
+                tupi_kernel::CommandOutcome::MemoryToggled { enabled: true }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,7 +1925,7 @@ mod tests {
     }
 
     fn registry(provider: Arc<dyn Provider>) -> ProviderRegistry {
-        let mut registry = ProviderRegistry::new();
+        let registry = ProviderRegistry::new();
         registry.register(provider);
         registry
     }
@@ -2852,5 +3187,57 @@ mod tests {
             !trimmed_turn_3,
             "turn 3 must grow append-only without re-trimming"
         );
+    }
+    struct PayloadProvider;
+
+    #[async_trait]
+    impl Provider for PayloadProvider {
+        fn id(&self) -> &str {
+            "payload"
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<ProviderStream, ProviderError> {
+            let events =
+                futures_util::stream::iter(vec![Ok(ProviderEvent::Text("ok".to_string()))]);
+            Ok(Box::pin(events))
+        }
+
+        fn last_payload(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({
+                "model": "teste",
+                "messages": [{"role": "user", "content": "oi"}],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turn_writes_the_last_user_message_and_payload() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::with_store(
+            registry(Arc::new(PayloadProvider)),
+            "payload",
+            "teste".to_string(),
+            bus,
+            None,
+        )
+        .with_debug_dir(dir.path().to_path_buf());
+
+        app.handle(Command::SendMessage { text: "oi".into() })
+            .await
+            .unwrap();
+        wait_for_end(&mut rx).await;
+
+        let text = std::fs::read_to_string(dir.path().join("last-prompt-message.md")).unwrap();
+        assert!(text.contains("# Última mensagem do usuário\n\noi"));
+        assert!(text.contains("\"model\": \"teste\""));
     }
 }

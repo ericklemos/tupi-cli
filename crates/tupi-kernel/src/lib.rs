@@ -8,7 +8,7 @@ mod tool;
 
 mod workflow;
 
-pub use command::{Command, CommandBus, CommandHandler, CommandOutcome};
+pub use command::{Command, CommandBus, CommandHandler, CommandOutcome, MemoryAction};
 pub use error::{CommandError, ProviderError, QueryError};
 pub use event::EventBus;
 pub use provider::{ChatRequest, Provider, ProviderEvent, ProviderStream};
@@ -29,6 +29,25 @@ mod tests {
         let registry = ProviderRegistry::new();
         assert!(registry.get("deepseek").is_none());
         assert!(registry.ids().is_empty());
+    }
+
+    #[test]
+    fn command_connect_and_event_notice_variants() {
+        let cmd = Command::Connect {
+            provider: "antigravity".into(),
+        };
+        match cmd {
+            Command::Connect { provider } => assert_eq!(provider, "antigravity"),
+            _ => panic!("esperava Command::Connect"),
+        }
+
+        let evt = Event::Notice {
+            message: "logando".into(),
+        };
+        match evt {
+            Event::Notice { message } => assert_eq!(message, "logando"),
+            _ => panic!("esperava Event::Notice"),
+        }
     }
 
     #[tokio::test]

@@ -1,19 +1,23 @@
-use std::path::Path;
-
-use redb::ReadableTable;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-pub const SCHEMA_VERSION: u64 = 2;
-pub const MODELS_TTL_SECS: u64 = 24 * 60 * 60;
+const SCHEMA_VERSION: u64 = 3;
 
 const META: redb::TableDefinition<&'static str, &'static [u8]> = redb::TableDefinition::new("meta");
 const MODELS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("models");
 const SETTINGS: redb::TableDefinition<&'static str, &'static [u8]> =
     redb::TableDefinition::new("settings");
+const PROVIDERS: redb::TableDefinition<&'static str, &'static [u8]> =
+    redb::TableDefinition::new("providers");
 
-#[derive(Debug, thiserror::Error)]
+pub const MODELS_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Error)]
 pub enum StoreError {
     #[error("erro de I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -43,12 +47,13 @@ impl CachedModels {
 
 #[derive(Debug)]
 pub struct Store {
-    db: redb::Database,
+    path: PathBuf,
+    lock: Mutex<()>,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
 
         if let Some(parent) = path
             .parent()
@@ -57,33 +62,60 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db = redb::Database::create(path)
-            .map_err(|error| StoreError::Database(error.to_string()))?;
-        let store = Self { db };
+        let store = Self {
+            path,
+            lock: Mutex::new(()),
+        };
         store.ensure_schema()?;
 
         Ok(store)
     }
 
+    fn with_db<T>(
+        &self,
+        f: impl FnOnce(&redb::Database) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.open_db_locked()?;
+        f(&db)
+    }
+
+    fn open_db_locked(&self) -> Result<redb::Database, StoreError> {
+        const MAX_ATTEMPTS: usize = 50;
+        for attempt in 0..MAX_ATTEMPTS {
+            match redb::Database::create(&self.path) {
+                Ok(db) => return Ok(db),
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt + 1 < MAX_ATTEMPTS => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(StoreError::Database(error.to_string())),
+            }
+        }
+        Err(StoreError::Database(
+            "banco local ocupado por outro processo".to_string(),
+        ))
+    }
+
     pub fn models(&self, provider_id: &str) -> Result<Option<CachedModels>, StoreError> {
         use redb::ReadableDatabase;
 
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
-        let table = tx
-            .open_table(MODELS)
-            .map_err(|error| StoreError::Table(error.to_string()))?;
+        self.with_db(|db| {
+            let tx = db
+                .begin_read()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            let table = tx
+                .open_table(MODELS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
 
-        let Some(raw) = table
-            .get(provider_id)
-            .map_err(|error| StoreError::Table(error.to_string()))?
-        else {
-            return Ok(None);
-        };
+            let Some(raw) = table
+                .get(provider_id)
+                .map_err(|error| StoreError::Table(error.to_string()))?
+            else {
+                return Ok(None);
+            };
 
-        Ok(serde_json::from_slice(raw.value()).ok())
+            Ok(serde_json::from_slice(raw.value()).ok())
+        })
     }
 
     pub fn save_models(
@@ -99,119 +131,198 @@ impl Store {
         let raw =
             serde_json::to_vec(&entry).map_err(|error| StoreError::Corrupt(error.to_string()))?;
 
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(MODELS)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-            table
-                .insert(provider_id, raw.as_slice())
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+        self.with_db(|db| {
+            let tx = db
+                .begin_write()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            {
+                let mut table = tx
+                    .open_table(MODELS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+                table
+                    .insert(provider_id, raw.as_slice())
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>, StoreError> {
         use redb::ReadableDatabase;
 
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
-        let table = tx
-            .open_table(SETTINGS)
-            .map_err(|error| StoreError::Table(error.to_string()))?;
+        self.with_db(|db| {
+            let tx = db
+                .begin_read()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            let table = tx
+                .open_table(SETTINGS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
 
-        let Some(raw) = table
-            .get(key)
-            .map_err(|error| StoreError::Table(error.to_string()))?
-        else {
-            return Ok(None);
-        };
+            let Some(raw) = table
+                .get(key)
+                .map_err(|error| StoreError::Table(error.to_string()))?
+            else {
+                return Ok(None);
+            };
 
-        let value = std::str::from_utf8(raw.value())
-            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
-        Ok(Some(value.to_string()))
+            let value = std::str::from_utf8(raw.value())
+                .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+            Ok(Some(value.to_string()))
+        })
     }
 
     pub fn save_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(SETTINGS)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-            table
-                .insert(key, value.as_bytes())
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+        self.with_db(|db| {
+            let tx = db
+                .begin_write()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            {
+                let mut table = tx
+                    .open_table(SETTINGS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+                table
+                    .insert(key, value.as_bytes())
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
+    }
+
+    pub fn provider_credentials(&self, provider_id: &str) -> Result<Option<String>, StoreError> {
+        use redb::ReadableDatabase;
+
+        self.with_db(|db| {
+            let tx = db
+                .begin_read()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            let table = tx
+                .open_table(PROVIDERS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+
+            let Some(raw) = table
+                .get(provider_id)
+                .map_err(|error| StoreError::Table(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+
+            let value = std::str::from_utf8(raw.value())
+                .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+            Ok(Some(value.to_string()))
+        })
+    }
+
+    pub fn save_provider_credentials(
+        &self,
+        provider_id: &str,
+        payload: &str,
+    ) -> Result<(), StoreError> {
+        self.with_db(|db| {
+            let tx = db
+                .begin_write()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            {
+                let mut table = tx
+                    .open_table(PROVIDERS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+                table
+                    .insert(provider_id, payload.as_bytes())
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    pub fn connected_providers(&self) -> Result<Vec<String>, StoreError> {
+        use redb::{ReadableDatabase, ReadableTable};
+
+        self.with_db(|db| {
+            let tx = db
+                .begin_read()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            let table = tx
+                .open_table(PROVIDERS)
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+
+            let mut providers = Vec::new();
+            let iter = table
+                .iter()
+                .map_err(|error| StoreError::Table(error.to_string()))?;
+            for entry in iter {
+                let (key, _) = entry.map_err(|error| StoreError::Table(error.to_string()))?;
+                providers.push(key.value().to_string());
+            }
+            Ok(providers)
+        })
     }
 
     fn ensure_schema(&self) -> Result<(), StoreError> {
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
+        use redb::ReadableTable;
 
-        {
-            let mut meta = tx
-                .open_table(META)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
+        self.with_db(|db| {
+            let tx = db
+                .begin_write()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
 
-            let current = match meta
-                .get("schema_version")
-                .map_err(|error| StoreError::Table(error.to_string()))?
             {
-                Some(raw) => Some(
-                    serde_json::from_slice::<u64>(raw.value())
-                        .map_err(|error| StoreError::Corrupt(error.to_string()))?,
-                ),
-                None => None,
-            };
+                let mut meta = tx
+                    .open_table(META)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
 
-            match current {
-                Some(found) if found > SCHEMA_VERSION => {
-                    return Err(StoreError::FutureSchema {
-                        found,
-                        supported: SCHEMA_VERSION,
-                    });
+                let current = match meta
+                    .get("schema_version")
+                    .map_err(|error| StoreError::Table(error.to_string()))?
+                {
+                    Some(raw) => Some(
+                        serde_json::from_slice::<u64>(raw.value())
+                            .map_err(|error| StoreError::Corrupt(error.to_string()))?,
+                    ),
+                    None => None,
+                };
+
+                match current {
+                    Some(found) if found > SCHEMA_VERSION => {
+                        return Err(StoreError::FutureSchema {
+                            found,
+                            supported: SCHEMA_VERSION,
+                        });
+                    }
+                    Some(found) if found < SCHEMA_VERSION => {
+                        let raw = serde_json::to_vec(&SCHEMA_VERSION)
+                            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+                        meta.insert("schema_version", raw.as_slice())
+                            .map_err(|error| StoreError::Table(error.to_string()))?;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let raw = serde_json::to_vec(&SCHEMA_VERSION)
+                            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+                        meta.insert("schema_version", raw.as_slice())
+                            .map_err(|error| StoreError::Table(error.to_string()))?;
+                    }
                 }
-                Some(found) if found < SCHEMA_VERSION => {
-                    let raw = serde_json::to_vec(&SCHEMA_VERSION)
-                        .map_err(|error| StoreError::Corrupt(error.to_string()))?;
-                    meta.insert("schema_version", raw.as_slice())
-                        .map_err(|error| StoreError::Table(error.to_string()))?;
-                }
-                Some(_) => {}
-                None => {
-                    let raw = serde_json::to_vec(&SCHEMA_VERSION)
-                        .map_err(|error| StoreError::Corrupt(error.to_string()))?;
-                    meta.insert("schema_version", raw.as_slice())
-                        .map_err(|error| StoreError::Table(error.to_string()))?;
-                }
+
+                tx.open_table(MODELS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+                tx.open_table(SETTINGS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
+                tx.open_table(PROVIDERS)
+                    .map_err(|error| StoreError::Table(error.to_string()))?;
             }
 
-            tx.open_table(MODELS)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-            tx.open_table(SETTINGS)
-                .map_err(|error| StoreError::Table(error.to_string()))?;
-        }
-
-        tx.commit()
-            .map_err(|error| StoreError::Transaction(error.to_string()))?;
-        Ok(())
+            tx.commit()
+                .map_err(|error| StoreError::Transaction(error.to_string()))?;
+            Ok(())
+        })
     }
 }
 
@@ -381,6 +492,53 @@ mod tests {
         assert_eq!(
             store.setting("show_prompts_messages").unwrap().as_deref(),
             Some("false")
+        );
+    }
+
+    #[test]
+    fn providers_round_trip_and_list_connected() {
+        let path = temp_path("providers");
+        let store = Store::open(&path).unwrap();
+        assert!(store.connected_providers().unwrap().is_empty());
+        assert_eq!(store.provider_credentials("antigravity").unwrap(), None);
+
+        store
+            .save_provider_credentials("antigravity", r#"{"refresh_token":"1//abc"}"#)
+            .unwrap();
+
+        assert_eq!(
+            store.connected_providers().unwrap(),
+            vec!["antigravity".to_string()]
+        );
+        assert_eq!(
+            store
+                .provider_credentials("antigravity")
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"refresh_token":"1//abc"}"#)
+        );
+    }
+
+    #[test]
+    fn two_live_stores_on_same_path_share_writes() {
+        let path = temp_path("multi-session");
+        let session_one = Store::open(&path).unwrap();
+        let session_two = Store::open(&path).unwrap();
+
+        session_one
+            .save_provider_credentials("antigravity", r#"{"project_id":"p1"}"#)
+            .unwrap();
+
+        assert_eq!(
+            session_two
+                .provider_credentials("antigravity")
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"project_id":"p1"}"#)
+        );
+        assert_eq!(
+            session_two.connected_providers().unwrap(),
+            vec!["antigravity".to_string()]
         );
     }
 }

@@ -261,18 +261,12 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    let facts = match state_dir.clone() {
-        Some(dir) => crate::facts::FactsTool::with_state_dir_and_store(
-            root_dir.clone(),
-            store.clone(),
-            dir,
-            DEFAULT_BUDGET_TOKENS,
-        ),
-        None => {
-            crate::facts::FactsTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
-        }
-    };
-    registry.register(Arc::new(facts));
+    // A memória é por repositório (.agents/tupi), não pelo diretório de estado.
+    registry.register(Arc::new(crate::facts::FactsTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
     let state = match state_dir {
         Some(dir) => crate::state::StateTool::with_state_dir_and_store(
             root_dir.clone(),

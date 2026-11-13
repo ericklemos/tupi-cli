@@ -4,6 +4,10 @@
 .env.*
 !.env.example
 .brain
+.agents/tupi/last-prompt-message.md
 .idea
+.agents/tupi/facts.jsonl
+.agents/tupi/pending.jsonl
+.agents/tupi/debug/
 docs/superpowers
 docs/plans

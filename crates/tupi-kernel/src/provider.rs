@@ -50,4 +50,9 @@ pub trait Provider: Send + Sync {
     async fn list_models(&self) -> Result<Vec<String>, ProviderError>;
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError>;
+
+    /// Corpo exato da última requisição enviada ao provedor, para depuração.
+    fn last_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
 }

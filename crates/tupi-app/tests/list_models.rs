@@ -88,7 +88,7 @@ impl Provider for FailingProvider {
 }
 
 fn registry(provider: Arc<dyn Provider>) -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
+    let registry = ProviderRegistry::new();
     registry.register(provider);
     registry
 }
@@ -263,6 +263,62 @@ async fn provider_failure_without_cache_reports_models_failed() {
         next_event(&mut rx).await,
         Event::ModelsFailed {
             message: "falha de rede: caiu".to_string()
+        }
+    );
+}
+
+struct FreshAntigravityProvider;
+
+#[async_trait::async_trait]
+impl Provider for FreshAntigravityProvider {
+    fn id(&self) -> &str {
+        "antigravity"
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(vec![
+            "gemini-4-hydrogen-high".into(),
+            "gemini-4-argon-high".into(),
+            "gemini-3.8-flash-high".into(),
+        ])
+    }
+
+    async fn stream_chat(&self, _request: ChatRequest) -> Result<ProviderStream, ProviderError> {
+        unreachable!("não deve ser chamado")
+    }
+}
+
+#[tokio::test]
+async fn legacy_antigravity_cache_is_invalidated_on_refresh() {
+    let store = Arc::new(Store::open(temp_store("legacy-ag")).unwrap());
+    store
+        .save_models(
+            "antigravity",
+            &["antigravity-gemini-3.8-flash".to_string()],
+            now_unix(),
+        )
+        .unwrap();
+
+    let bus = EventBus::new(8);
+    let mut rx = bus.subscribe();
+    let app = App::with_store(
+        registry(Arc::new(FreshAntigravityProvider)),
+        "antigravity",
+        "gemini-3.8-flash-high".into(),
+        bus,
+        Some(Arc::clone(&store)),
+    );
+
+    app.handle(Command::RefreshModels).await.unwrap();
+
+    assert_eq!(
+        next_event(&mut rx).await,
+        Event::ModelsLoaded {
+            models: vec![
+                "gemini-4-hydrogen-high".into(),
+                "gemini-4-argon-high".into(),
+                "gemini-3.8-flash-high".into(),
+            ]
         }
     );
 }

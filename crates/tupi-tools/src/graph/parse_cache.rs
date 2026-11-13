@@ -94,6 +94,16 @@ impl ParseCache {
 
     pub fn parse(&self, path: &Path, language: Language, content: &str) -> Option<Arc<Tree>> {
         let digest = blake3::hash(content.as_bytes());
+        self.parse_with_digest(path, language, content, digest)
+    }
+
+    pub fn parse_with_digest(
+        &self,
+        path: &Path,
+        language: Language,
+        content: &str,
+        digest: blake3::Hash,
+    ) -> Option<Arc<Tree>> {
         if let Some(tree) = self.get(path, digest) {
             return Some(tree);
         }

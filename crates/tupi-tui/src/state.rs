@@ -1,5 +1,10 @@
 pub use tupi_domain::WORKFLOWS_PREFIX;
-pub const COMMANDS: &[&str] = &["/models", "/enable-show-prompts-messages", WORKFLOWS_PREFIX];
+pub const COMMANDS: &[&str] = &[
+    "/models",
+    "/connect",
+    "/enable-show-prompts-messages",
+    WORKFLOWS_PREFIX,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -13,6 +18,7 @@ pub enum Status {
 pub struct Overlay {
     pub title: String,
     pub items: Vec<String>,
+    pub ids: Vec<String>,
     pub selected: usize,
 }
 
@@ -35,6 +41,10 @@ pub enum ChatEntry {
     Queued {
         content: String,
     },
+    /// Linha discreta de memória: recall injetado ou fato gravado.
+    Memory {
+        text: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +63,7 @@ pub struct ChatState {
     /// Nomes dos workflows disponíveis. Só viram sugestão depois de
     /// `/workflows/`; antes disso o namespace não existe.
     pub workflows: Vec<String>,
+    pending_memory: Vec<String>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
 }
@@ -77,6 +88,9 @@ impl ChatState {
 
     pub fn begin_assistant(&mut self) {
         self.streaming_index = None;
+        for text in self.pending_memory.drain(..) {
+            self.lines.push(ChatEntry::Memory { text });
+        }
         self.streaming_metrics = Some(crate::metrics::ReplyMetrics::start(
             std::time::Instant::now(),
         ));
@@ -129,6 +143,29 @@ impl ChatState {
             summary: compact_summary(summary),
             ok: None,
         });
+    }
+
+    pub fn push_memory(&mut self, text: &str, after: bool) {
+        if after {
+            self.lines.push(ChatEntry::Memory {
+                text: text.to_string(),
+            });
+            return;
+        }
+        if self.streaming_index.is_none() && self.status != Status::Streaming {
+            self.pending_memory.push(text.to_string());
+            return;
+        }
+        let at = self.streaming_index.unwrap_or(self.lines.len());
+        self.lines.insert(
+            at,
+            ChatEntry::Memory {
+                text: text.to_string(),
+            },
+        );
+        if let Some(index) = self.streaming_index.as_mut() {
+            *index += 1;
+        }
     }
 
     pub fn finish_tool(&mut self, call_id: &str, ok: bool) {
@@ -259,8 +296,30 @@ impl ChatState {
         self.overlay = Some(Overlay {
             title: title.into(),
             items,
+            ids: Vec::new(),
             selected: 0,
         });
+    }
+
+    pub fn open_overlay_with_ids(
+        &mut self,
+        title: impl Into<String>,
+        items: Vec<String>,
+        ids: Vec<String>,
+    ) {
+        self.overlay = Some(Overlay {
+            title: title.into(),
+            items,
+            ids,
+            selected: 0,
+        });
+    }
+
+    pub fn selected_id(&self) -> Option<&str> {
+        self.overlay
+            .as_ref()
+            .and_then(|overlay| overlay.ids.get(overlay.selected))
+            .map(String::as_str)
     }
 
     pub fn close_overlay(&mut self) {
@@ -397,6 +456,7 @@ mod tests {
             ChatEntry::Queued { content } => content,
             ChatEntry::Prompt { .. } => panic!("esperava mensagem"),
             ChatEntry::Tool { .. } => panic!("esperava mensagem"),
+            ChatEntry::Memory { .. } => panic!("esperava mensagem"),
         }
     }
 
@@ -683,6 +743,21 @@ mod tests {
             panic!("esperava métricas");
         };
         assert!(metrics.finished.is_some());
+    }
+
+    #[test]
+    fn memory_lines_land_before_the_streaming_answer() {
+        let mut state = ChatState::default();
+        state.push_user("oi");
+        state.begin_assistant();
+        state.append_token("resposta");
+
+        state.push_memory("memória · 1 fato", false);
+        assert!(matches!(state.lines[1], ChatEntry::Memory { .. }));
+        assert!(matches!(state.lines[2], ChatEntry::Message { .. }));
+
+        state.push_memory("memória · gravado", true);
+        assert!(matches!(state.lines.last(), Some(ChatEntry::Memory { .. })));
     }
 
     #[test]

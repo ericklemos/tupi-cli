@@ -9,7 +9,6 @@ use tupi_kernel::{Tool, ToolError, ToolSpec};
 
 use crate::budget::Section;
 use crate::exec::finish;
-use crate::facts::{default_state_dir, search_facts};
 use crate::store::ResponseStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -65,6 +64,16 @@ pub struct StateTool {
     store: Arc<ResponseStore>,
     state_dir: PathBuf,
     default_budget_tokens: usize,
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(dir).join("tupi");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/state/tupi");
+    }
+    std::env::temp_dir().join("tupi")
 }
 
 fn state_path(state_dir: &Path, root: &Path) -> PathBuf {
@@ -300,14 +309,13 @@ impl Tool for StateTool {
                     .map(str::trim)
                     .filter(|text| !text.is_empty())
                     .ok_or_else(|| ToolError::InvalidArguments("memory exige text".to_string()))?;
-                let facts = search_facts(&self.state_dir, &self.root(), query);
+                let scored = tupi_domain::memory::score(&self.root(), query, 10);
                 let mut body = String::new();
-                if facts.is_empty() {
+                if scored.is_empty() {
                     body.push_str("\nNÃO — nenhum fato corresponde.\n");
                 }
-                for fact in facts.iter().rev().take(10) {
-                    let text = fact.get("text").and_then(Value::as_str).unwrap_or_default();
-                    body.push_str(&format!("- {text}\n"));
+                for hit in scored {
+                    body.push_str(&format!("- {} {}\n", hit.fact.id, hit.fact.text));
                 }
                 ("### state — memória".to_string(), body)
             }

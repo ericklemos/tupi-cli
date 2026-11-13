@@ -48,7 +48,7 @@ impl Provider for SlowProvider {
 struct SlowProvider;
 
 fn registry(provider: Arc<dyn Provider>) -> ProviderRegistry {
-    let mut registry = ProviderRegistry::new();
+    let registry = ProviderRegistry::new();
     registry.register(provider);
     registry
 }
@@ -114,4 +114,36 @@ async fn set_model_while_streaming_is_busy() {
         .await;
 
     assert!(matches!(outcome, Err(CommandError::Busy)));
+}
+
+#[tokio::test]
+async fn set_model_persists_provider_and_model_in_store() {
+    let path = std::env::temp_dir().join(format!("tupi-set-model-{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = Arc::new(tupi_store::Store::open(&path).unwrap());
+
+    let bus = EventBus::new(16);
+    let app = App::with_store(
+        registry(Arc::new(EchoModelProvider)),
+        "echo",
+        "deepseek-flash".into(),
+        bus,
+        Some(Arc::clone(&store)),
+    );
+
+    app.handle(Command::SetModel {
+        model: "echo/gemini-4-hydrogen-high".into(),
+    })
+    .await
+    .unwrap();
+
+    drop(app);
+    drop(store);
+
+    let reopened = tupi_store::Store::open(&path).unwrap();
+    assert_eq!(
+        App::load_selected_model(&reopened),
+        Some(("echo".to_string(), "gemini-4-hydrogen-high".to_string()))
+    );
+    let _ = std::fs::remove_file(&path);
 }

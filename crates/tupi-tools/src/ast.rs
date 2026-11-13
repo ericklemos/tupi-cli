@@ -67,7 +67,14 @@ impl AstChunker {
         let Some(tree) = self.tree(path, content, language) else {
             return Vec::new();
         };
+        Self::snippets_from_tree(&tree, content, language)
+    }
 
+    pub(crate) fn snippets_from_tree(
+        tree: &Tree,
+        content: &str,
+        language: Language,
+    ) -> Vec<AstSnippet> {
         let bytes = content.as_bytes();
         let mut snippets = Vec::new();
         collect_snippets(tree.root_node(), bytes, &mut snippets, language);

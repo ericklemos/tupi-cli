@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tupi-domain.workspace = true
 tupi-kernel.workspace = true
+tupi-providers.workspace = true
 tupi-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,5 +26,4 @@ tokio.workspace = true
 tupi-domain.workspace = true
 tupi-kernel.workspace = true
 tupi-tools.workspace = true
-tupi-providers.workspace = true
 tempfile.workspace = true

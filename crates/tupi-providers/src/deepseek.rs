@@ -19,6 +19,7 @@ pub struct DeepSeekProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    last_payload: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 impl DeepSeekProvider {
@@ -32,6 +33,7 @@ impl DeepSeekProvider {
             client,
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            last_payload: std::sync::Mutex::new(None),
         }
     }
 
@@ -104,6 +106,13 @@ impl Provider for DeepSeekProvider {
         "deepseek"
     }
 
+    fn last_payload(&self) -> Option<serde_json::Value> {
+        self.last_payload
+            .lock()
+            .ok()
+            .and_then(|payload| payload.clone())
+    }
+
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
 
@@ -132,11 +141,16 @@ impl Provider for DeepSeekProvider {
     async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
+        let body = build_body(&request);
+        if let Ok(mut last) = self.last_payload.lock() {
+            *last = Some(body.clone());
+        }
+
         let response = self
             .client
             .post(url)
             .bearer_auth(&self.api_key)
-            .json(&build_body(&request))
+            .json(&body)
             .send()
             .await
             .map_err(|error| ProviderError::Network(error.to_string()))?;

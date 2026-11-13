@@ -71,7 +71,7 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
     let events = EventBus::new(64);
     let mut receiver = events.subscribe();
 
-    let mut providers = ProviderRegistry::new();
+    let providers = ProviderRegistry::new();
     providers.register(Arc::new(Scripted::new(vec![
         vec![
             Ok(ProviderEvent::Text("chamando".to_string())),
@@ -201,7 +201,7 @@ async fn a_provider_failure_is_recorded_with_kind_and_status() {
     let events = EventBus::new(64);
     let mut receiver = events.subscribe();
 
-    let mut providers = ProviderRegistry::new();
+    let providers = ProviderRegistry::new();
     providers.register(Arc::new(Scripted::new(vec![vec![Err(
         ProviderError::Http {
             status: 429,

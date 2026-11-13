@@ -7,13 +7,74 @@ use tupi_providers::deepseek;
 use tupi_tui::run::{BusSet, run};
 
 mod config;
+mod project_config;
 mod prompt_config;
 mod tool_config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dotenv_path = dotenvy::dotenv().ok();
-    let config = config::from_env(|key| std::env::var(key).ok())?;
+
+    let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
+    let mut store_error = None;
+    let mut store_error_kind = None;
+    let store = match tupi_store::Store::open(&store_path) {
+        Ok(store) => Some(std::sync::Arc::new(store)),
+        Err(error) => {
+            store_error = Some(error.to_string());
+            store_error_kind = Some(tupi_app::telemetry::store_error_kind(&error).to_string());
+            tracing::warn!(%error, "base local indisponível; seguindo sem cache");
+            None
+        }
+    };
+
+    let tupi_config_dir = state_dir();
+    let opencode_config_dir = data_dir(|key| std::env::var(key).ok())
+        .parent()
+        .map(|p| p.join("opencode"));
+
+    let mut loaded_from_store = false;
+    let antigravity_creds = store
+        .as_ref()
+        .and_then(|s| tupi_app::app::App::load_antigravity_credentials(s))
+        .map(|creds| {
+            loaded_from_store = true;
+            creds
+        })
+        .or_else(|| {
+            tupi_providers::antigravity::AntigravityCredentials::load_from_dirs(
+                &tupi_config_dir,
+                opencode_config_dir.as_deref(),
+            )
+        });
+
+    if !loaded_from_store
+        && let (Some(store_ref), Some(creds)) = (store.as_ref(), antigravity_creds.as_ref())
+        && let Err(error) = tupi_app::app::App::save_antigravity_credentials(store_ref, creds)
+    {
+        tracing::warn!(%error, "falha ao migrar credenciais Antigravity para o redb");
+    }
+
+    let config = match config::from_env(|key| std::env::var(key).ok()) {
+        Ok(cfg) => cfg,
+        Err(err) if antigravity_creds.is_some() => {
+            tracing::debug!(%err, "iniciando via Antigravity salvo sem chave DeepSeek");
+            config::Config {
+                api_key: String::new(),
+                model: std::env::var("TUPI_MODEL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| tupi_providers::antigravity::DEFAULT_MODEL.to_string()),
+                log_filter: std::env::var("TUPI_LOG")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "warn".to_string()),
+                provider: "antigravity".to_string(),
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
+
     let _log_guard = init_tracing(&config.log_filter);
 
     let telemetry = tupi_app::telemetry::Telemetry::from_env(state_dir().join("telemetry.jsonl"));
@@ -29,34 +90,39 @@ async fn main() -> anyhow::Result<()> {
         deepseek::register_all(&mut registry, &config.api_key);
     }
 
-    let tupi_config_dir = state_dir();
-    let opencode_config_dir = data_dir(|key| std::env::var(key).ok())
-        .parent()
-        .map(|p| p.join("opencode"));
-
-    if let Some(creds) = tupi_providers::antigravity::AntigravityCredentials::load_from_dirs(
-        &tupi_config_dir,
-        opencode_config_dir.as_deref(),
-    ) {
+    if let Some(creds) = antigravity_creds {
         tracing::debug!(project = %creds.project_id, "credenciais Antigravity carregadas");
-        tupi_providers::antigravity::register_all(&mut registry, creds);
+        tupi_app::app::App::register_antigravity_credentials(&registry, creds, store.clone());
     }
 
-    let provider = config.provider.clone();
-    let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
-    let mut store_error = None;
-    let mut store_error_kind = None;
-    let store = match tupi_store::Store::open(&store_path) {
-        Ok(store) => Some(std::sync::Arc::new(store)),
-        Err(error) => {
-            store_error = Some(error.to_string());
-            store_error_kind = Some(tupi_app::telemetry::store_error_kind(&error).to_string());
-            tracing::warn!(%error, "base local indisponível; seguindo sem cache");
-            None
-        }
+    let explicit_provider = std::env::var("TUPI_PROVIDER")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    let explicit_model = std::env::var("TUPI_MODEL")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_MODEL").ok())
+        .is_some_and(|v| !v.trim().is_empty());
+
+    let (provider, model) = if !explicit_provider
+        && !explicit_model
+        && let Some(store_ref) = store.as_ref()
+        && let Some((saved_provider, saved_model)) =
+            tupi_app::app::App::load_selected_model(store_ref)
+        && registry.get(&saved_provider).is_some()
+    {
+        (saved_provider, saved_model)
+    } else {
+        (config.provider.clone(), config.model.clone())
     };
+
     let root = tool_root()?;
     let root_label = root.display().to_string();
+    let project = project_config::load_or_create(&root);
+    tracing::debug!(
+        name = %project.name,
+        path = %project_config::project_path(&root).display(),
+        "configuração do projeto"
+    );
     let tokens = token::load_token(&root);
     tracing::debug!(
         max_tokens = tokens.max_tokens,
@@ -88,7 +154,8 @@ async fn main() -> anyhow::Result<()> {
     let prefix = format!("{prefix}\n\n{}", tupi_tools::prompt_section(&available));
     let workflows = std::sync::Arc::new(tupi_tools::Catalog::new(root.clone()));
     let mut tools = ToolRegistry::new();
-    tupi_tools::register_exposed(root, &mut tools, tool_limits.exposure());
+    let debug_dir = tupi_domain::memory::dir(&root).join("debug");
+    tupi_tools::register_exposed(root.clone(), &mut tools, tool_limits.exposure());
 
     let tool_names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
     let workflow_names: Vec<String> = available
@@ -105,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     telemetry.record(tupi_app::telemetry::TelemetryEvent::RunStarted(
         tupi_app::telemetry::RunStarted {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            model: config.model.clone(),
+            model: model.clone(),
             provider: provider.clone(),
             cwd,
             root: root_label,
@@ -130,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     let app = App::with_tools(
         registry,
         provider.clone(),
-        config.model.clone(),
+        model.clone(),
         events.clone(),
         store,
         tools,
@@ -140,8 +207,10 @@ async fn main() -> anyhow::Result<()> {
     .with_max_tool_steps(tool_limits.max_tool_steps)
     .with_context_budget(context_limits.budget)
     .with_context_target(context_limits.target)
-    .with_context_recent_results(context_limits.recent_results);
+    .with_context_recent_results(context_limits.recent_results)
+    .with_debug_dir(debug_dir);
     let app = app.with_workflows(workflows);
+    let app = app.with_memory(root.clone());
 
     let buses = BusSet {
         commands: CommandBus::new(app.clone()),
@@ -149,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
         events,
     };
 
-    let outcome = run(buses, config.model.clone(), provider).await;
+    let outcome = run(buses, model, provider).await;
     let reason = if outcome.is_ok() { "quit" } else { "error" };
     let error = outcome.as_ref().err().map(|error| error.to_string());
     telemetry.record(telemetry.run_finished(run_started_at, reason, error));

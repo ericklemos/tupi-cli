@@ -25,7 +25,7 @@ const SCROLL_STEP: u16 = 1;
 const SCROLL_WHEEL: u16 = 3;
 const SCROLL_PAGE: u16 = 10;
 
-pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::Result<()> {
+pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut key_events = EventStream::new();
     let mut events = buses.events.subscribe();
@@ -69,7 +69,44 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                 KeyCode::Esc => state.close_overlay(),
                                 KeyCode::Up => state.overlay_prev(),
                                 KeyCode::Down => state.overlay_next(),
+                                KeyCode::Char('d') => {
+                                    let id = state.selected_id().map(str::to_string);
+                                    let memory = state
+                                        .overlay
+                                        .as_ref()
+                                        .map(|overlay| overlay.title.contains("memória"))
+                                        .unwrap_or(false);
+                                    if memory
+                                        && let Some(id) = id
+                                    {
+                                        match buses
+                                            .commands
+                                            .dispatch(Command::Memory {
+                                                action: tupi_kernel::MemoryAction::Forget(id.clone()),
+                                            })
+                                            .await
+                                        {
+                                            Ok(CommandOutcome::MemoryForgotten { found, .. }) => {
+                                                state.close_overlay();
+                                                state.notice = Some(if found {
+                                                    format!("memória: esquecido {id}")
+                                                } else {
+                                                    format!("memória: {id} não encontrado")
+                                                });
+                                            }
+                                            Ok(_) => state.close_overlay(),
+                                            Err(error) => state.notice = Some(error.to_string()),
+                                        }
+                                    }
+                                }
                                 KeyCode::Enter => {
+                                    if state.overlay.as_ref().is_some_and(|overlay| {
+                                        overlay.title.contains("memória")
+                                            || overlay.title.contains("pendências")
+                                    }) {
+                                        state.close_overlay();
+                                        continue;
+                                    }
                                     if let Some(selected) = state.selected_item().map(str::to_string) {
                                         match buses
                                             .commands
@@ -77,7 +114,12 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                             .await
                                         {
                                             Ok(CommandOutcome::ModelChanged { model: changed }) => {
-                                                model = changed.clone();
+                                                if let Some((new_provider, new_model)) = changed.split_once('/') {
+                                                    provider = new_provider.to_string();
+                                                    model = new_model.to_string();
+                                                } else {
+                                                    model = changed.clone();
+                                                }
                                                 state.notice = Some(format!("modelo: {changed}"));
                                                 state.close_overlay();
                                             }
@@ -109,10 +151,31 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                         state.enqueue(&input);
                                     }
                                 } else if input.starts_with('/') {
-                                    if input == "/models" {
+                                    if input == "/connect" || input.starts_with("/connect ") {
+                                        let provider_name = input
+                                            .strip_prefix("/connect")
+                                            .map(str::trim)
+                                            .filter(|name| !name.is_empty())
+                                            .unwrap_or("antigravity");
                                         state.input.clear();
                                         state.refresh_suggestions();
-                                        // A listagem vai ao provedor; o comando só dispara a busca.
+                                        match buses
+                                            .commands
+                                            .dispatch(Command::Connect {
+                                                provider: provider_name.to_string(),
+                                            })
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                state.notice =
+                                                    Some(format!("iniciando conexão com {provider_name}…"))
+                                            }
+                                            Err(error) => state.fail(&error.to_string()),
+                                        }
+                                    } else if input == "/models" {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        // A listagem vai aos provedores; o comando só dispara a busca.
                                         // O resultado chega por evento, sem travar o desenho da TUI.
                                         match buses.commands.dispatch(Command::RefreshModels).await {
                                             Ok(_) => {
@@ -147,6 +210,34 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                                                     "prompts dos providers: mostrando".to_string()
                                                 } else {
                                                     "prompts dos providers: ocultos".to_string()
+                                                });
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => state.fail(&error.to_string()),
+                                        }
+                                    } else if let Some(action) = parse_memory_invocation(&input) {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        match buses
+                                            .commands
+                                            .dispatch(Command::Memory { action })
+                                            .await
+                                        {
+                                            Ok(CommandOutcome::Memory { title, items, ids }) => {
+                                                state.open_overlay_with_ids(title, items, ids)
+                                            }
+                                            Ok(CommandOutcome::MemoryToggled { enabled }) => {
+                                                state.notice = Some(if enabled {
+                                                    "memória: ligada".to_string()
+                                                } else {
+                                                    "memória: desligada".to_string()
+                                                });
+                                            }
+                                            Ok(CommandOutcome::MemoryForgotten { id, found }) => {
+                                                state.notice = Some(if found {
+                                                    format!("memória: esquecido {id}")
+                                                } else {
+                                                    format!("memória: {id} não encontrado")
                                                 });
                                             }
                                             Ok(_) => {}
@@ -302,9 +393,15 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                     }) if Some(request_id) == request => {
                         state.finish_tool(&call_id, ok);
                     }
+                    Ok(Event::Memory { text, after }) => {
+                        state.push_memory(&text, after);
+                    }
+                    Ok(Event::Notice { message }) => {
+                        state.notice = Some(message);
+                    }
                     Ok(Event::ModelsLoaded { models }) => {
                         state.notice = None;
-                        state.open_overlay(format!(" modelos · {provider} "), models);
+                        state.open_overlay(" modelos ", models);
                     }
                     Ok(Event::ModelsFailed { message }) => {
                         state.fail(&message);
@@ -313,7 +410,7 @@ pub async fn run(buses: BusSet, mut model: String, provider: String) -> anyhow::
                     Err(RecvError::Lagged(_)) => {
                         state.notice = Some("eventos perdidos: a interface ficou para trás".to_string());
                     }
-                    Err(RecvError::Closed) => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -341,6 +438,32 @@ async fn start_turn(bus: &CommandBus, state: &mut ChatState, text: String) -> Op
         Err(error) => {
             state.notice = Some(error.to_string());
             None
+        }
+    }
+}
+
+fn parse_memory_invocation(input: &str) -> Option<tupi_kernel::MemoryAction> {
+    let rest = input
+        .strip_prefix("/memory")
+        .or_else(|| input.strip_prefix("/memória"))
+        .or_else(|| input.strip_prefix("/memoria"))?
+        .trim();
+    match rest {
+        "" => Some(tupi_kernel::MemoryAction::List),
+        "pending" | "pendencias" | "pendências" => Some(tupi_kernel::MemoryAction::Pending),
+        "off" => Some(tupi_kernel::MemoryAction::Off),
+        "on" => Some(tupi_kernel::MemoryAction::On),
+        _ => {
+            if let Some(query) = rest
+                .strip_prefix("search ")
+                .or_else(|| rest.strip_prefix("busca "))
+            {
+                Some(tupi_kernel::MemoryAction::Search(query.trim().to_string()))
+            } else {
+                rest.strip_prefix("forget ")
+                    .or_else(|| rest.strip_prefix("esquece "))
+                    .map(|id| tupi_kernel::MemoryAction::Forget(id.trim().to_string()))
+            }
         }
     }
 }
@@ -373,17 +496,29 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &ChatState, model: &str, provider
     // Cresce com o texto, mas deixa o transcript respirar.
     let max_rows = (area.height / 3).clamp(1, 6);
     let input_rows = input_rows.min(max_rows).max(1);
+    let max_notice_rows = (area.height / 4).clamp(1, 3) as usize;
+    let details_height = if let Some(notice) = &state.notice {
+        notice_lines(notice, area.width, max_notice_rows)
+            .len()
+            .clamp(1, max_notice_rows) as u16
+    } else {
+        1
+    };
     let composer_height = if compact {
         input_rows
     } else {
         input_rows.saturating_add(2)
     }
-    .min(area.height.saturating_sub(2).max(1));
+    .min(
+        area.height
+            .saturating_sub(details_height.saturating_add(1))
+            .max(1),
+    );
 
     let [history_area, composer_area, details_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(composer_height),
-        Constraint::Length(1),
+        Constraint::Length(details_height),
     ])
     .areas(area);
 
@@ -638,6 +773,57 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
     }
 }
 
+fn sanitize_notice(notice: &str) -> String {
+    let mut out = String::with_capacity(notice.len());
+    let mut last_space = false;
+    for ch in notice.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' || ch.is_control() {
+            if !last_space && !out.is_empty() {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = ch.is_whitespace();
+        }
+    }
+    out.trim().to_string()
+}
+
+fn notice_lines(notice: &str, width: u16, max_rows: usize) -> Vec<Line<'static>> {
+    let cleaned = sanitize_notice(notice);
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let mut wrapped = wrap_text(&cleaned, inner_width);
+    let max_rows = max_rows.max(1);
+    if wrapped.len() > max_rows {
+        wrapped.truncate(max_rows);
+        if let Some(last) = wrapped.last_mut() {
+            let mut trimmed = String::new();
+            let limit = inner_width.saturating_sub(1);
+            let mut used = 0usize;
+            for ch in last.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + w > limit {
+                    break;
+                }
+                trimmed.push(ch);
+                used += w;
+            }
+            trimmed.push('…');
+            *last = trimmed;
+        }
+    }
+    wrapped
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(line, Style::default().fg(Color::Yellow)),
+            ])
+        })
+        .collect()
+}
+
 fn draw_details(
     frame: &mut ratatui::Frame<'_>,
     state: &ChatState,
@@ -649,14 +835,11 @@ fn draw_details(
         return;
     }
 
+    frame.render_widget(Clear, area);
+
     if let Some(notice) = &state.notice {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(notice.clone(), Style::default().fg(Color::Yellow)),
-            ])),
-            area,
-        );
+        let lines = notice_lines(notice, area.width, area.height as usize);
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
@@ -766,7 +949,7 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, state: &ChatState) {
         .collect();
 
     let body = if lines.is_empty() {
-        Paragraph::new(" nenhum modelo retornado ")
+        Paragraph::new(" nada para mostrar ")
     } else {
         Paragraph::new(lines)
     };
@@ -862,6 +1045,25 @@ fn transcript_rows_at(
                     Span::raw(" "),
                     Span::styled(mark.to_string(), Style::default().fg(color)),
                 ]));
+                continue;
+            }
+            ChatEntry::Memory { text } => {
+                for line in wrap_text(text, content_width.saturating_sub(4)) {
+                    rows.push(Line::from(vec![
+                        Span::styled(
+                            "  ◆ ",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            line,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                }
                 continue;
             }
             ChatEntry::Prompt { content } => {
@@ -1010,6 +1212,29 @@ fn transcript_layout_at(
                     Span::styled(mark.to_string(), Style::default().fg(color)),
                 ]));
                 owners.push(Some(index));
+                continue;
+            }
+            ChatEntry::Memory { text } => {
+                let mut first = true;
+                for line in wrap_text(text, content_width.saturating_sub(4)) {
+                    let prefix = if first { "  ◆ " } else { "    " };
+                    rows.push(Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            line,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                    owners.push(Some(index));
+                    first = false;
+                }
                 continue;
             }
             ChatEntry::Prompt { content } => {
@@ -1838,5 +2063,19 @@ mod tests {
             handler.0.lock().unwrap().as_slice(),
             [Command::SendMessage { text }] if text == "próxima"
         ));
+    }
+
+    #[test]
+    fn notice_lines_sanitizes_control_chars_and_wraps_cleanly() {
+        let raw = "erro HTTP 400:\n{\n  \"error\": {\n    \"message\": \"role function is not supported neste endpoint\"\n  }\n}";
+        let lines = notice_lines(raw, 40, 2);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let text = row_text(line);
+            assert!(!text.contains('\n'));
+            assert!(!text.contains('\r'));
+            assert!(text.width() <= 40);
+        }
+        assert!(row_text(lines.last().unwrap()).ends_with('…'));
     }
 }

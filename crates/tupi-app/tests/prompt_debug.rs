@@ -30,7 +30,7 @@ impl Provider for Scripted {
 }
 
 fn app(provider: Arc<dyn Provider>, store: Option<Arc<Store>>, bus: EventBus) -> Arc<App> {
-    let mut registry = ProviderRegistry::new();
+    let registry = ProviderRegistry::new();
     registry.register(provider);
     App::with_tools(
         registry,

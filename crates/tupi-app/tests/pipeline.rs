@@ -148,7 +148,7 @@ fn calls_event(calls: Vec<ToolCall>) -> Result<ProviderEvent, ProviderError> {
 }
 
 fn app(provider: Arc<dyn Provider>, bus: EventBus, tools: ToolRegistry) -> Arc<App> {
-    let mut registry = ProviderRegistry::new();
+    let registry = ProviderRegistry::new();
     registry.register(provider);
     App::with_tools(
         registry,

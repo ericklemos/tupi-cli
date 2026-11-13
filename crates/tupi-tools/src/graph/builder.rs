@@ -49,9 +49,10 @@ impl GraphBuilder {
         path: &Path,
         content: &str,
         language: Language,
+        digest: blake3::Hash,
     ) -> Option<Arc<tree_sitter::Tree>> {
         match &self.cache {
-            Some(cache) => cache.parse(path, language, content),
+            Some(cache) => cache.parse_with_digest(path, language, content, digest),
             None => parse(content, language).map(Arc::new),
         }
     }
@@ -59,11 +60,7 @@ impl GraphBuilder {
     pub fn build(&self, root: &Path) -> Result<ProjectCodeGraph, ToolError> {
         let files = collect_files(root)?;
         let mut graph = ProjectCodeGraph::new();
-        let mut parsed = Vec::new();
-        let chunker = match &self.cache {
-            Some(cache) => AstChunker::with_cache(cache.clone()),
-            None => AstChunker::new(),
-        };
+        let mut parsed = Vec::with_capacity(files.len());
 
         for path in files {
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -73,14 +70,24 @@ impl GraphBuilder {
             let Some(language) = Language::from_path(&path) else {
                 continue;
             };
-            graph
-                .file_hashes
-                .insert(path.clone(), blake3::hash(content.as_bytes()));
+            let file_hash = blake3::hash(content.as_bytes());
+            graph.file_hashes.insert(path.clone(), file_hash);
             graph
                 .resolver
                 .register_file(&relative, &crate_name_for(&relative));
 
-            let snippets = chunker.snippets(&path, &content);
+            // Parse once per file and reuse both the tree and the file hash.
+            let tree = self.parse_tree(&path, &content, language, file_hash);
+            let snippets = tree
+                .as_deref()
+                .map(|t| AstChunker::snippets_from_tree(t, &content, language))
+                .unwrap_or_default();
+
+            let relative_str = relative.to_string_lossy();
+            let is_test_path =
+                relative_str.contains("/tests/") || relative_str.starts_with("tests/");
+            let mut lines_cache: Option<Vec<&str>> = None;
+
             for snippet in snippets {
                 let is_callable =
                     snippet.signature.contains("fn ") || snippet.signature.contains("fun ");
@@ -90,11 +97,13 @@ impl GraphBuilder {
                 } else {
                     snippet.signature.trim_start().starts_with("pub")
                 };
-                let is_test = relative.to_string_lossy().contains("/tests/")
-                    || relative.to_string_lossy().starts_with("tests/")
-                    || has_test_attribute(&content, snippet.start_line)
+                let is_test = is_test_path
                     || snippet.code.contains("#[cfg(test)]")
-                    || snippet.code.contains("@Test");
+                    || snippet.code.contains("@Test")
+                    || {
+                        let lines = lines_cache.get_or_insert_with(|| content.lines().collect());
+                        has_test_attribute(lines, snippet.start_line)
+                    };
                 let is_container = snippet.signature.contains("struct ")
                     || snippet.signature.contains("class ")
                     || snippet.signature.contains("enum ")
@@ -108,7 +117,7 @@ impl GraphBuilder {
                 graph.graph.add_node(SymbolNode {
                     name: snippet.symbol_name,
                     qualified: snippet.qualified_name.clone(),
-                    relative: relative.to_string_lossy().to_string(),
+                    relative: relative_str.to_string(),
                     start_line: snippet.start_line,
                     end_line: snippet.end_line,
                     signature: snippet.signature,
@@ -117,59 +126,70 @@ impl GraphBuilder {
                     is_test,
                     language,
                     kind,
-                    id: SectionId::new(&relative.to_string_lossy(), &snippet.qualified_name),
+                    id: SectionId::new(relative_str.as_ref(), &snippet.qualified_name),
                     hash: blake3::hash(snippet.code.as_bytes()),
                 });
             }
 
             parsed.push(ParsedFile {
-                tree: self.parse_tree(&path, &content, language),
+                tree,
                 relative,
                 content,
                 language,
             });
         }
 
-        let container_indices: Vec<(NodeIndex, String, String)> = graph
-            .graph
-            .node_indices()
-            .filter_map(|idx| {
-                let node = graph.graph.node_weight(idx)?;
-                if node.kind == SectionKind::Container {
-                    Some((idx, node.name.clone(), node.relative.clone()))
-                } else {
-                    None
+        // O(N) container index by name (previously O(M * K) linear search per member).
+        let belongs_to_edges: Vec<(NodeIndex, NodeIndex, usize)> = {
+            let mut containers_by_name: HashMap<&str, Vec<NodeIndex>> = HashMap::new();
+            for idx in graph.graph.node_indices() {
+                if let Some(node) = graph.graph.node_weight(idx)
+                    && node.kind == SectionKind::Container
+                {
+                    containers_by_name
+                        .entry(node.name.as_str())
+                        .or_default()
+                        .push(idx);
                 }
-            })
-            .collect();
+            }
 
-        for member_idx in graph.graph.node_indices().collect::<Vec<_>>() {
-            let Some(member) = graph.graph.node_weight(member_idx) else {
-                continue;
-            };
-            if member.kind != SectionKind::Member {
-                continue;
-            }
-            if let Some((container_name, _)) = member.qualified.rsplit_once("::") {
-                let target = container_indices
-                    .iter()
-                    .find(|(_, name, rel)| name == container_name && rel == &member.relative)
-                    .or_else(|| {
-                        container_indices
-                            .iter()
-                            .find(|(_, name, _)| name == container_name)
-                    });
-                if let Some(&(container_idx, _, _)) = target {
-                    graph.graph.add_edge(
-                        member_idx,
-                        container_idx,
-                        RelationEdge {
-                            line: member.start_line,
-                            kind: RelationKind::BelongsTo,
-                        },
-                    );
+            let mut edges = Vec::new();
+            for member_idx in graph.graph.node_indices() {
+                let Some(member) = graph.graph.node_weight(member_idx) else {
+                    continue;
+                };
+                if member.kind != SectionKind::Member {
+                    continue;
+                }
+                if let Some((container_name, _)) = member.qualified.rsplit_once("::")
+                    && let Some(candidates) = containers_by_name.get(container_name)
+                {
+                    let target = candidates
+                        .iter()
+                        .copied()
+                        .find(|&idx| {
+                            graph
+                                .graph
+                                .node_weight(idx)
+                                .is_some_and(|c| c.relative == member.relative)
+                        })
+                        .or_else(|| candidates.first().copied());
+                    if let Some(container_idx) = target {
+                        edges.push((member_idx, container_idx, member.start_line));
+                    }
                 }
             }
+            edges
+        };
+        for (member_idx, container_idx, line) in belongs_to_edges {
+            graph.graph.add_edge(
+                member_idx,
+                container_idx,
+                RelationEdge {
+                    line,
+                    kind: RelationKind::BelongsTo,
+                },
+            );
         }
 
         for file in &parsed {
@@ -187,136 +207,178 @@ impl GraphBuilder {
             graph.scopes.insert(file.relative.clone(), scope);
         }
 
-        for file in &parsed {
-            let Some(tree) = &file.tree else {
-                continue;
-            };
-            let calls = collect_calls(
-                &self.queries,
-                file.language,
-                &tree.root_node(),
-                &file.content,
-            );
-            let bindings = collect_bindings(&file.content);
-            let callers = graph
-                .graph
-                .node_indices()
-                .filter(|&index| {
-                    graph.graph.node_weight(index).is_some_and(|node| {
-                        node.relative == file.relative.to_string_lossy() && node.is_callable
-                    })
-                })
-                .collect::<Vec<_>>();
+        // O(N) indices replace O(F * N) caller scans and O(C * N) full-graph definition scans,
+        // reducing call-resolution complexity from O(C * N) to O(C + N).
+        let (call_edges, dropped_names) = {
+            use petgraph::visit::EdgeRef;
 
-            for call in calls {
-                let Some(caller) = callers.iter().copied().find(|&index| {
-                    graph.graph.node_weight(index).is_some_and(|node| {
-                        node.start_line <= call.line && node.end_line >= call.line
-                    })
-                }) else {
+            let lang_slot = |language: Language| match language {
+                Language::Rust => 0usize,
+                Language::Kotlin => 1usize,
+            };
+            let mut callers_by_file: HashMap<&str, Vec<NodeIndex>> = HashMap::new();
+            let mut defs_by_name: [HashMap<&str, Vec<NodeIndex>>; 2] =
+                [HashMap::new(), HashMap::new()];
+            for index in graph.graph.node_indices() {
+                let Some(node) = graph.graph.node_weight(index) else {
                     continue;
                 };
+                if node.is_callable {
+                    callers_by_file
+                        .entry(node.relative.as_str())
+                        .or_default()
+                        .push(index);
+                }
+                defs_by_name[lang_slot(node.language)]
+                    .entry(node.name.as_str())
+                    .or_default()
+                    .push(index);
+            }
 
-                if call.receiver.as_deref() == Some("self")
-                    && let Some(container) = graph.container_of(caller)
-                {
-                    if let Some(target) = graph
-                        .members_of(container)
-                        .into_iter()
-                        .find(|&idx| graph.graph[idx].name == call.name)
+            let default_scope = FileScope::default();
+            let mut call_edges: Vec<(NodeIndex, NodeIndex, usize)> = Vec::new();
+            let mut dropped_names: Vec<String> = Vec::new();
+
+            for file in &parsed {
+                let Some(tree) = &file.tree else {
+                    continue;
+                };
+                let file_rel = file.relative.to_string_lossy();
+                let callers = callers_by_file
+                    .get(file_rel.as_ref())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if callers.is_empty() {
+                    continue;
+                }
+
+                let calls = collect_calls(
+                    &self.queries,
+                    file.language,
+                    &tree.root_node(),
+                    &file.content,
+                );
+                if calls.is_empty() {
+                    continue;
+                }
+
+                let scope = graph.scopes.get(&file.relative).unwrap_or(&default_scope);
+                let lang_defs = &defs_by_name[lang_slot(file.language)];
+                let mut bindings: Option<HashMap<String, Vec<(usize, String)>>> = None;
+
+                for call in calls {
+                    let Some(caller) = callers.iter().copied().find(|&index| {
+                        graph.graph.node_weight(index).is_some_and(|node| {
+                            node.start_line <= call.line && node.end_line >= call.line
+                        })
+                    }) else {
+                        continue;
+                    };
+
+                    if call.receiver.as_deref() == Some("self")
+                        && let Some(container) = graph.container_of(caller)
+                        && let Some(target) = graph
+                            .graph
+                            .edges_directed(container, petgraph::Direction::Incoming)
+                            .filter(|edge| edge.weight().kind == RelationKind::BelongsTo)
+                            .map(|edge| edge.source())
+                            .find(|&idx| graph.graph[idx].name == call.name)
                     {
-                        graph.graph.add_edge(
-                            caller,
-                            target,
-                            RelationEdge {
-                                line: call.line,
-                                kind: RelationKind::Call,
-                            },
-                        );
+                        call_edges.push((caller, target, call.line));
                         continue;
                     }
-                }
 
-                let scope = graph
-                    .scopes
-                    .get(&file.relative)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut definitions: Vec<NodeIndex> = graph
-                    .graph
-                    .node_indices()
-                    .filter(|&index| {
-                        graph.graph.node_weight(index).is_some_and(|node| {
-                            node.name == call.name && node.language == file.language
-                        })
-                    })
-                    .collect();
-                if definitions.is_empty()
-                    && let Some(binding) = scope.imports.get(&call.name)
-                    && binding.item != call.name
-                {
-                    let target_file = match &binding.target {
-                        ImportTarget::File(file) => Some(file.as_path()),
-                        ImportTarget::External => None,
-                    };
-                    definitions = graph
-                        .graph
-                        .node_indices()
-                        .filter(|&index| {
-                            graph.graph.node_weight(index).is_some_and(|node| {
-                                node.name == binding.item
-                                    && node.language == file.language
-                                    && target_file.is_none_or(|target| {
-                                        Path::new(node.relative.as_str()) == target
-                                    })
-                            })
-                        })
-                        .collect();
-                }
-                if let Some(receiver) = &call.receiver
-                    && let Some(ty) = binding_type_at(&bindings, receiver, call.line)
-                {
-                    let typed: Vec<NodeIndex> = definitions
-                        .iter()
-                        .copied()
-                        .filter(|&index| {
-                            graph.graph.node_weight(index).is_some_and(|node| {
-                                node.qualified.starts_with(&format!("{ty}::"))
-                                    || node.qualified.contains(&format!("::{ty}::"))
-                            })
-                        })
-                        .collect();
-                    if !typed.is_empty() {
-                        definitions = typed;
-                    }
-                }
-
-                let resolution = pick_target(
-                    &call.name,
-                    &file.relative,
-                    &scope,
-                    &graph.resolver,
-                    call.path.as_deref(),
-                    &definitions,
-                    &graph,
-                );
-                match resolution {
-                    Resolution::Resolved(target) => {
-                        graph.graph.add_edge(
-                            caller,
-                            target,
-                            RelationEdge {
-                                line: call.line,
-                                kind: RelationKind::Call,
-                            },
+                    let mut definitions: std::borrow::Cow<'_, [NodeIndex]> =
+                        std::borrow::Cow::Borrowed(
+                            lang_defs
+                                .get(call.name.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
                         );
+                    if definitions.is_empty()
+                        && let Some(binding) = scope.imports.get(&call.name)
+                        && binding.item != call.name
+                    {
+                        let target_file = match &binding.target {
+                            ImportTarget::File(file) => Some(file.as_path()),
+                            ImportTarget::External => None,
+                        };
+                        if let Some(candidates) = lang_defs.get(binding.item.as_str()) {
+                            if let Some(target) = target_file {
+                                definitions = std::borrow::Cow::Owned(
+                                    candidates
+                                        .iter()
+                                        .copied()
+                                        .filter(|&index| {
+                                            graph.graph.node_weight(index).is_some_and(|node| {
+                                                Path::new(node.relative.as_str()) == target
+                                            })
+                                        })
+                                        .collect(),
+                                );
+                            } else {
+                                definitions = std::borrow::Cow::Borrowed(candidates.as_slice());
+                            }
+                        }
                     }
-                    Resolution::Ambiguous { .. } => {
-                        *graph.dropped.entry(call.name.clone()).or_default() += 1;
+                    if let Some(receiver) = &call.receiver {
+                        let bindings =
+                            bindings.get_or_insert_with(|| collect_bindings(&file.content));
+                        if let Some(ty) = binding_type_at(bindings, receiver, call.line) {
+                            let prefix = format!("{ty}::");
+                            let infix = format!("::{ty}::");
+                            let typed: Vec<NodeIndex> = definitions
+                                .iter()
+                                .copied()
+                                .filter(|&index| {
+                                    graph.graph.node_weight(index).is_some_and(|node| {
+                                        node.qualified.starts_with(&prefix)
+                                            || node.qualified.contains(&infix)
+                                    })
+                                })
+                                .collect();
+                            if !typed.is_empty() {
+                                definitions = std::borrow::Cow::Owned(typed);
+                            }
+                        }
                     }
-                    Resolution::Unknown => {}
+
+                    let resolution = pick_target(
+                        &call.name,
+                        &file.relative,
+                        scope,
+                        &graph.resolver,
+                        call.path.as_deref(),
+                        &definitions,
+                        &graph,
+                    );
+                    match resolution {
+                        Resolution::Resolved(target) => {
+                            call_edges.push((caller, target, call.line));
+                        }
+                        Resolution::Ambiguous { .. } => {
+                            dropped_names.push(call.name);
+                        }
+                        Resolution::Unknown => {}
+                    }
                 }
             }
+
+            (call_edges, dropped_names)
+        };
+
+        for (caller, target, line) in call_edges {
+            graph.graph.add_edge(
+                caller,
+                target,
+                RelationEdge {
+                    line,
+                    kind: RelationKind::Call,
+                },
+            );
+        }
+        for name in dropped_names {
+            *graph.dropped.entry(name).or_default() += 1;
         }
 
         graph.rebuild_defs();
@@ -582,8 +644,7 @@ fn clean_type(ty: &str) -> String {
     ty.split('<').next().unwrap_or(ty).trim().to_string()
 }
 
-fn has_test_attribute(content: &str, start_line: usize) -> bool {
-    let lines: Vec<&str> = content.lines().collect();
+fn has_test_attribute(lines: &[&str], start_line: usize) -> bool {
     let check_range = start_line.saturating_sub(5)..start_line;
     for line_idx in check_range {
         if let Some(line) = lines.get(line_idx) {

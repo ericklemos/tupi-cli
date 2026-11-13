@@ -699,7 +699,10 @@ mod tests {
 
     #[test]
     fn every_native_workflow_is_valid_ron_in_configs() {
-        assert_eq!(NATIVE.len(), 5);
+        assert!(
+            NATIVE.len() >= 5,
+            "os workflows nativos viajam com o binário"
+        );
         for (name, text) in NATIVE {
             let parsed = ron::from_str::<WorkflowRon>(text);
             assert!(

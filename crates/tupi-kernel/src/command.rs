@@ -6,6 +6,16 @@ use tupi_domain::RequestId;
 use crate::CommandError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Ações do comando `/memory`.
+pub enum MemoryAction {
+    List,
+    Search(String),
+    Forget(String),
+    Pending,
+    Off,
+    On,
+}
+
 pub enum Command {
     SendMessage {
         text: String,
@@ -25,6 +35,14 @@ pub enum Command {
     },
     /// `/new`: descarta o histórico e recomeça a conversa do zero.
     NewSession,
+    /// `/connect <provedor>`: inicia o fluxo de conexão/login do provedor.
+    Connect {
+        provider: String,
+    },
+    /// `/memory ...`: audita e cura a memória do repositório.
+    Memory {
+        action: MemoryAction,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +59,18 @@ pub enum CommandOutcome {
     },
     /// `/new` aceito: o histórico foi descartado e a próxima mensagem abre um turno novo.
     SessionReset,
+    Memory {
+        title: String,
+        items: Vec<String>,
+        ids: Vec<String>,
+    },
+    MemoryToggled {
+        enabled: bool,
+    },
+    MemoryForgotten {
+        id: String,
+        found: bool,
+    },
     Noop,
 }
 

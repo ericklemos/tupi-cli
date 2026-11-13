@@ -1,4 +1,5 @@
 pub mod context;
+pub mod memory;
 pub mod tokens;
 mod usage;
 
@@ -130,6 +131,9 @@ pub enum Event {
     ModelsFailed {
         message: String,
     },
+    Notice {
+        message: String,
+    },
     ToolStarted {
         request_id: RequestId,
         call_id: String,
@@ -143,6 +147,12 @@ pub enum Event {
         name: String,
         ok: bool,
         summary: String,
+    },
+    /// Linha discreta de memória: recall injetado ou fato gravado.
+    Memory {
+        text: String,
+        /// true: entra no fim do turno; antes da resposta.
+        after: bool,
     },
 }
 
