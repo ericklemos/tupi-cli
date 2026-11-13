@@ -16,17 +16,12 @@ async fn main() -> anyhow::Result<()> {
     let dotenv_path = dotenvy::dotenv().ok();
 
     let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
-    let mut store_error = None;
-    let mut store_error_kind = None;
-    let store = match tupi_store::Store::open(&store_path) {
-        Ok(store) => Some(std::sync::Arc::new(store)),
-        Err(error) => {
-            store_error = Some(error.to_string());
-            store_error_kind = Some(tupi_app::telemetry::store_error_kind(&error).to_string());
-            tracing::warn!(%error, "base local indisponível; seguindo sem cache");
-            None
-        }
-    };
+    let store = std::sync::Arc::new(tupi_store::Store::open(&store_path).map_err(|error| {
+        anyhow::anyhow!(
+            "falha ao abrir banco local redb em {}: {error}",
+            store_path.display()
+        )
+    })?);
 
     let tupi_config_dir = state_dir();
     let opencode_config_dir = data_dir(|key| std::env::var(key).ok())
@@ -34,9 +29,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.join("opencode"));
 
     let mut loaded_from_store = false;
-    let antigravity_creds = store
-        .as_ref()
-        .and_then(|s| tupi_app::app::App::load_antigravity_credentials(s))
+    let antigravity_creds = tupi_app::app::App::load_antigravity_credentials(&store)
         .map(|creds| {
             loaded_from_store = true;
             creds
@@ -49,8 +42,8 @@ async fn main() -> anyhow::Result<()> {
         });
 
     if !loaded_from_store
-        && let (Some(store_ref), Some(creds)) = (store.as_ref(), antigravity_creds.as_ref())
-        && let Err(error) = tupi_app::app::App::save_antigravity_credentials(store_ref, creds)
+        && let Some(creds) = antigravity_creds.as_ref()
+        && let Err(error) = tupi_app::app::App::save_antigravity_credentials(&store, creds)
     {
         tracing::warn!(%error, "falha ao migrar credenciais Antigravity para o redb");
     }
@@ -92,22 +85,15 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(creds) = antigravity_creds {
         tracing::debug!(project = %creds.project_id, "credenciais Antigravity carregadas");
-        tupi_app::app::App::register_antigravity_credentials(&registry, creds, store.clone());
+        tupi_app::app::App::register_antigravity_credentials(
+            &registry,
+            creds,
+            Some(std::sync::Arc::clone(&store)),
+        );
     }
 
-    let explicit_provider = std::env::var("TUPI_PROVIDER")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
-    let explicit_model = std::env::var("TUPI_MODEL")
-        .ok()
-        .or_else(|| std::env::var("DEEPSEEK_MODEL").ok())
-        .is_some_and(|v| !v.trim().is_empty());
-
-    let (provider, model) = if !explicit_provider
-        && !explicit_model
-        && let Some(store_ref) = store.as_ref()
-        && let Some((saved_provider, saved_model)) =
-            tupi_app::app::App::load_selected_model(store_ref)
+    let (provider, model) = if let Some((saved_provider, saved_model)) =
+        tupi_app::app::App::load_selected_model(&store)
         && registry.get(&saved_provider).is_some()
     {
         (saved_provider, saved_model)
@@ -187,10 +173,10 @@ async fn main() -> anyhow::Result<()> {
             tools: tool_names,
             workflow_count: workflow_names.len(),
             workflows: workflow_names,
-            store_opened: store.is_some(),
+            store_opened: true,
             store_path: store_path.display().to_string(),
-            store_error,
-            store_error_kind,
+            store_error: None,
+            store_error_kind: None,
         },
     ));
 
@@ -199,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         provider.clone(),
         model.clone(),
         events.clone(),
-        store,
+        Some(store),
         tools,
         prefix,
     )

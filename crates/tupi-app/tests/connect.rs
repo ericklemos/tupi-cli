@@ -64,3 +64,52 @@ fn antigravity_credentials_survive_store_reopen_and_register() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn new_app_session_loads_connected_antigravity_and_lists_models() {
+    let path =
+        std::env::temp_dir().join(format!("tupi-connect-models-{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let creds = tupi_providers::antigravity::AntigravityCredentials {
+        access_token: "ya29.saved".into(),
+        refresh_token: "1//refresh".into(),
+        expires_at: u64::MAX,
+        project_id: "proj-123".into(),
+        email: Some("dev@example.com".into()),
+    };
+
+    let store = std::sync::Arc::new(tupi_store::Store::open(&path).unwrap());
+    App::save_antigravity_credentials(&store, &creds).unwrap();
+    // Even if a broken empty cache existed, RefreshModels must ignore it.
+    store.save_models("antigravity", &[], u64::MAX / 2).unwrap();
+
+    let bus = EventBus::new(8);
+    let mut rx = bus.subscribe();
+    let app = App::with_tools(
+        ProviderRegistry::new(),
+        "antigravity",
+        "gemini-3.8-flash-high".into(),
+        bus,
+        Some(std::sync::Arc::clone(&store)),
+        ToolRegistry::new(),
+        String::new(),
+    );
+
+    app.handle(Command::RefreshModels).await.unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match event {
+        tupi_domain::Event::ModelsLoaded { models } => {
+            assert!(!models.is_empty());
+            assert!(models.contains(&"gemini-4-hydrogen-high".to_string()));
+            assert!(models.contains(&"gemini-4-argon-high".to_string()));
+        }
+        other => panic!("esperava ModelsLoaded, recebeu {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

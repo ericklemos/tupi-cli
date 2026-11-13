@@ -251,6 +251,8 @@ impl App {
             )
             .is_some_and(|value| crate::debug::enabled(Some(value.as_str())));
 
+        Self::sync_connected_providers(&registry, store.as_ref());
+
         Arc::new(Self {
             session: Arc::new(SessionStore::new(SESSION_ID)),
             registry,
@@ -1225,6 +1227,7 @@ impl CommandHandler for App {
 
                             let models = if let Some(entry) = cached.as_ref()
                                 && entry.is_fresh(now_unix, MODELS_TTL_SECS)
+                                && !entry.models.is_empty()
                                 && !Self::is_legacy_antigravity_cache(id, &entry.models)
                             {
                                 entry.models.clone()
@@ -1303,26 +1306,35 @@ impl CommandHandler for App {
 
                             match flow_res {
                                 Ok(creds) => {
-                                    let mut saved = false;
+                                    let mut save_error: Option<String> = None;
                                     if let Some(store_ref) = store.as_ref() {
                                         let store_clone = Arc::clone(store_ref);
                                         let creds_clone = creds.clone();
                                         match tokio::task::spawn_blocking(move || {
-                                            Self::save_antigravity_credentials(
-                                                &store_clone,
-                                                &creds_clone,
-                                            )
+                                            Self::save_antigravity_credentials(&store_clone, &creds_clone)?;
+                                            if Self::load_selected_model(&store_clone).is_none() {
+                                                Self::save_selected_model(
+                                                    &store_clone,
+                                                    "antigravity",
+                                                    tupi_providers::antigravity::DEFAULT_MODEL,
+                                                )?;
+                                            }
+                                            Ok::<(), tupi_store::StoreError>(())
                                         })
                                         .await
                                         {
-                                            Ok(Ok(())) => saved = true,
+                                            Ok(Ok(())) => {}
                                             Ok(Err(error)) => {
                                                 tracing::warn!(%error, "falha ao salvar credenciais Antigravity no redb");
+                                                save_error = Some(error.to_string());
                                             }
                                             Err(error) => {
                                                 tracing::warn!(%error, "falha na tarefa de salvamento Antigravity");
+                                                save_error = Some(error.to_string());
                                             }
                                         }
+                                    } else {
+                                        save_error = Some("banco local redb indisponível".to_string());
                                     }
 
                                     Self::register_antigravity_credentials(
@@ -1346,14 +1358,14 @@ impl CommandHandler for App {
                                         .await;
                                     }
 
-                                    let message = if saved {
-                                        "Antigravity conectado e salvo! Digite /models para selecionar o modelo."
+                                    let message = if let Some(err) = save_error {
+                                        format!("Antigravity conectado, mas falhou ao salvar no redb: {err}")
                                     } else {
-                                        "Antigravity conectado com sucesso! Digite /models para selecionar o modelo."
+                                        "Antigravity conectado e salvo! Digite /models para selecionar o modelo.".to_string()
                                     };
 
                                     events.publish(Event::Notice {
-                                        message: message.to_string(),
+                                        message,
                                     });
                                 }
                                 Err(err) => {

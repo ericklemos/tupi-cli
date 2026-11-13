@@ -81,11 +81,18 @@ impl Store {
     }
 
     fn open_db_locked(&self) -> Result<redb::Database, StoreError> {
-        const MAX_ATTEMPTS: usize = 50;
+        const MAX_ATTEMPTS: usize = 100;
         for attempt in 0..MAX_ATTEMPTS {
             match redb::Database::create(&self.path) {
                 Ok(db) => return Ok(db),
-                Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt + 1 < MAX_ATTEMPTS => {
+                Err(error)
+                    if attempt + 1 < MAX_ATTEMPTS
+                        && (matches!(error, redb::DatabaseError::DatabaseAlreadyOpen)
+                            || error
+                                .to_string()
+                                .to_ascii_lowercase()
+                                .contains("already open")) =>
+                {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(StoreError::Database(error.to_string())),
