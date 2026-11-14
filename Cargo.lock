@@ -3326,6 +3326,7 @@ name = "tupi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dotenvy",
  "ron",
  "serde",
@@ -3343,6 +3344,7 @@ dependencies = [
  "tupi-store",
  "tupi-tools",
  "tupi-tui",
+ "tupi-web",
 ]
 
 [[package]]

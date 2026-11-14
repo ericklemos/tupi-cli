@@ -141,7 +141,7 @@ pub(crate) async fn summary(State(state): State<AppState>) -> Json<SummaryDto> {
                 )
             })
             .collect();
-        ranked.sort_by(|left, right| right.0.cmp(&left.0));
+        ranked.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
         ranked.truncate(10);
         let top_symbols = ranked
             .into_iter()

@@ -29,6 +29,76 @@ pub(crate) struct AppState {
 }
 
 pub(crate) fn router(ctx: Arc<DashboardContext>) -> Router {
+    use axum::extract::Request;
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::middleware::Next;
+    use axum::response::{IntoResponse, Response};
+
+    fn authority_host(authority: &str) -> &str {
+        let host = match authority.rsplit_once('@') {
+            Some((_, host)) => host,
+            None => authority,
+        };
+        if host.starts_with('[') {
+            return match host.find(']') {
+                Some(end) => &host[..=end],
+                None => host,
+            };
+        }
+        match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        }
+    }
+
+    fn origin_host(origin: &str) -> &str {
+        let origin = origin.trim();
+        let origin = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .unwrap_or(origin);
+        authority_host(origin.trim_end_matches('/'))
+    }
+
+    fn is_loopback_host(host: &str) -> bool {
+        matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    }
+
+    async fn guard(request: Request, next: Next) -> Response {
+        if let Some(host) = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            && !is_loopback_host(authority_host(host))
+        {
+            return (StatusCode::FORBIDDEN, "host fora de loopback").into_response();
+        }
+        if let Some(origin) = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            && !is_loopback_host(origin_host(origin))
+        {
+            return (StatusCode::FORBIDDEN, "origem fora de loopback").into_response();
+        }
+        if let Some(site) = request
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            && !matches!(site, "same-origin" | "none")
+        {
+            return (StatusCode::FORBIDDEN, "requisicao cross-site").into_response();
+        }
+
+        let mut response = next.run(request).await;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+    }
+
     let hub = crate::events::EventHub::new(&ctx.events, 200);
     Router::new()
         .route("/", get(crate::assets::index))
@@ -46,6 +116,7 @@ pub(crate) fn router(ctx: Arc<DashboardContext>) -> Router {
         .route("/api/state", get(crate::inspect_api::state))
         .route("/api/telemetry/recent", get(crate::inspect_api::telemetry_recent))
         .route("/api/events", get(crate::events::events))
+        .layer(axum::middleware::from_fn(guard))
         .with_state(AppState { ctx, hub })
 }
 
@@ -310,5 +381,90 @@ mod tests {
         let handle = crate::start_server(Arc::clone(&ctx), 0).await.unwrap();
         assert!(handle.url().starts_with("http://127.0.0.1:"));
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn host_outside_loopback_is_forbidden() {
+        let (ctx, _tmp) = test_context();
+        let app = crate::build_router(ctx);
+        for host in ["evil.tld", "evil.tld:7788", "127.0.0.1.evil.tld"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/history")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "host aceito: {host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_host_answers_with_no_store() {
+        let (ctx, _tmp) = test_context();
+        let app = crate::build_router(ctx);
+        for host in ["127.0.0.1:7788", "localhost", "[::1]:9000"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/history")
+                        .header("host", host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "host recusado: {host}");
+            assert_eq!(
+                res.headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "resposta cacheavel para {host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_site_and_foreign_origin_are_forbidden() {
+        let (ctx, _tmp) = test_context();
+        let app = crate::build_router(ctx);
+        for (name, value) in [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-site", "same-site"),
+            ("origin", "null"),
+            ("origin", "https://evil.tld"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/memory")
+                        .header(name, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{name}: {value}");
+        }
+
+        let same = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory")
+                    .header("origin", "http://127.0.0.1:7788")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same.status(), StatusCode::OK);
     }
 }

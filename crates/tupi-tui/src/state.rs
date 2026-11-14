@@ -1,5 +1,6 @@
 pub use tupi_domain::WORKFLOWS_PREFIX;
 pub const COMMANDS: &[&str] = &[
+    "/dashboard",
     "/models",
     "/connect",
     "/enable-show-prompts-messages",

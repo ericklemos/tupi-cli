@@ -3,19 +3,22 @@
 //! O servidor escuta apenas em `127.0.0.1` e serve a API JSON consumida pelo
 //! frontend embutido em `assets/`.
 
-mod routes;
+mod assets;
+pub mod browser;
+pub use browser::open_browser;
+mod events;
 mod graph_api;
 mod inspect_api;
-mod events;
-mod assets;
+mod routes;
+
+#[cfg(test)]
+mod assets_tests;
+#[cfg(test)]
+mod events_tests;
 #[cfg(test)]
 mod graph_api_tests;
 #[cfg(test)]
 mod inspect_api_tests;
-#[cfg(test)]
-mod events_tests;
-#[cfg(test)]
-mod assets_tests;
 
 use std::sync::Arc;
 

@@ -1,3 +1,4 @@
 {
-  "name": "tupi-cli"
+  "name": "tupi-cli",
+  "dashboard_web_port": 7788
 }

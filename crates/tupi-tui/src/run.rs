@@ -25,7 +25,36 @@ const SCROLL_STEP: u16 = 1;
 const SCROLL_WHEEL: u16 = 3;
 const SCROLL_PAGE: u16 = 10;
 
-pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyhow::Result<()> {
+/// Sobe (ou reabre) o dashboard web da sessão a partir da TUI.
+#[async_trait::async_trait]
+pub trait DashboardLauncher: Send + Sync {
+    /// Devolve a URL do dashboard, subindo o servidor se necessário.
+    async fn open(&self) -> Result<String, String>;
+}
+
+/// Mensagem mostrada em `/dashboard` quando o launcher existe ou falta.
+pub async fn dashboard_notice(
+    dashboard: Option<&std::sync::Arc<dyn DashboardLauncher>>,
+) -> String {
+    match dashboard {
+        Some(launcher) => match launcher.open().await {
+            Ok(url) => format!("dashboard: {url}"),
+            Err(error) => format!("dashboard: {error}"),
+        },
+        None => "dashboard indisponível nesta sessão; use --web ao iniciar".to_string(),
+    }
+}
+
+pub async fn run(buses: BusSet, model: String, provider: String) -> anyhow::Result<()> {
+    run_with_dashboard(buses, model, provider, None).await
+}
+
+pub async fn run_with_dashboard(
+    buses: BusSet,
+    mut model: String,
+    mut provider: String,
+    dashboard: Option<std::sync::Arc<dyn DashboardLauncher>>,
+) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut key_events = EventStream::new();
     let mut events = buses.events.subscribe();
@@ -233,6 +262,11 @@ pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyh
                                             Ok(_) => {}
                                             Err(error) => state.fail(&error.to_string()),
                                         }
+                                    } else if input == "/dashboard" {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        state.notice =
+                                            Some(dashboard_notice(dashboard.as_ref()).await);
                                     } else if let Some(action) = parse_memory_invocation(&input) {
                                         state.input.clear();
                                         state.refresh_suggestions();

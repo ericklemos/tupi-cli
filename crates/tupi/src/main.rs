@@ -4,7 +4,7 @@ use anyhow::Context;
 use tupi_app::App;
 use tupi_kernel::{CommandBus, EventBus, ProviderRegistry, QueryBus, ToolRegistry};
 use tupi_providers::deepseek;
-use tupi_tui::run::{BusSet, run};
+use tupi_tui::run::BusSet;
 
 mod agents_config;
 mod config;
@@ -15,6 +15,7 @@ mod tool_config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = parse_cli_options(&std::env::args().collect::<Vec<_>>())?;
     let dotenv_path = dotenvy::dotenv().ok();
 
     let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
@@ -110,6 +111,16 @@ async fn main() -> anyhow::Result<()> {
         models = project.models.len(),
         path = %project_config::project_path(&root).display(),
         "configuração do projeto"
+    );
+    let docs_folders = project.docs_folders(&root);
+    tracing::debug!(
+        count = docs_folders.len(),
+        folders = %docs_folders
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "pastas de documentação do projeto"
     );
     let tokens = token::load_token(&root);
     tracing::debug!(
@@ -239,13 +250,43 @@ async fn main() -> anyhow::Result<()> {
     let app = app.with_workflows(workflows);
     let app = app.with_memory(root.clone());
 
+    let web_port = resolve_web_port(cli.web_port, project.dashboard_web_port);
+    let dashboard = std::sync::Arc::new(DashboardController {
+        ctx: std::sync::Arc::new(tupi_web::DashboardContext {
+            root: root.clone(),
+            state_dir: state_dir(),
+            graph: tupi_tools::graph::GraphCache::shared(&root),
+            events: events.clone(),
+            queries: QueryBus::new(app.clone()),
+            telemetry: telemetry.clone(),
+            model: model.clone(),
+            provider: provider.clone(),
+        }),
+        port: web_port,
+        handle: tokio::sync::Mutex::new(None),
+    });
+
     let buses = BusSet {
         commands: CommandBus::new(app.clone()),
         queries: QueryBus::new(app.clone()),
         events,
     };
 
-    let outcome = run(buses, model, provider).await;
+    if cli.web
+        && let Err(error) = tupi_tui::run::DashboardLauncher::open(dashboard.as_ref()).await
+    {
+        tracing::warn!(%error, "falha ao subir o dashboard");
+    }
+
+    let launcher: std::sync::Arc<dyn tupi_tui::run::DashboardLauncher> = dashboard.clone();
+    let outcome = tupi_tui::run::run_with_dashboard(
+        buses,
+        model,
+        provider,
+        Some(launcher),
+    )
+    .await;
+    dashboard.shutdown().await;
     let reason = if outcome.is_ok() { "quit" } else { "error" };
     let error = outcome.as_ref().err().map(|error| error.to_string());
     telemetry.record(telemetry.run_finished(run_started_at, reason, error));
@@ -413,3 +454,126 @@ mod tests {
     }
 }
 mod token;
+
+/// Opções de linha de comando do binário.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CliOptions {
+    web: bool,
+    web_port: u16,
+}
+
+fn parse_cli_options(args: &[String]) -> anyhow::Result<CliOptions> {
+    let mut options = CliOptions::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--web" => options.web = true,
+            "--web-port" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--web-port exige um número de porta"))?;
+                options.web_port = value.parse::<u16>().map_err(|error| {
+                    anyhow::anyhow!("porta inválida para --web-port: {value} ({error})")
+                })?;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+/// Mantém o servidor do dashboard vivo durante a sessão e o reabre sob demanda.
+/// Porta efetiva do dashboard: a flag explícita vence; senão, o projeto define.
+fn resolve_web_port(cli_port: u16, project_port: Option<u16>) -> u16 {
+    if cli_port > 0 {
+        cli_port
+    } else {
+        project_port.unwrap_or(0)
+    }
+}
+
+struct DashboardController {
+    ctx: std::sync::Arc<tupi_web::DashboardContext>,
+    port: u16,
+    handle: tokio::sync::Mutex<Option<tupi_web::DashboardHandle>>,
+}
+
+impl DashboardController {
+    async fn open(&self) -> Result<String, String> {
+        let mut handle = self.handle.lock().await;
+        if handle.is_none() {
+            let started = tupi_web::start_server(std::sync::Arc::clone(&self.ctx), self.port)
+                .await
+                .map_err(|error| error.to_string())?;
+            tupi_web::browser::open_browser(started.url());
+            *handle = Some(started);
+        }
+        Ok(handle
+            .as_ref()
+            .map(|handle| handle.url().to_string())
+            .unwrap_or_default())
+    }
+
+    async fn shutdown(&self) {
+        if let Some(handle) = self.handle.lock().await.take() {
+            handle.shutdown().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl tupi_tui::run::DashboardLauncher for DashboardController {
+    async fn open(&self) -> Result<String, String> {
+        DashboardController::open(self).await
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::parse_cli_options;
+
+    #[test]
+    fn parse_cli_options_handles_web_flags_and_rejects_invalid_port() {
+        let default = parse_cli_options(&["tupi".to_string()]).unwrap();
+        assert!(!default.web);
+        assert_eq!(default.web_port, 0);
+
+        let enabled = parse_cli_options(&[
+            "tupi".to_string(),
+            "--web".to_string(),
+            "--web-port".to_string(),
+            "7788".to_string(),
+        ])
+        .unwrap();
+        assert!(enabled.web);
+        assert_eq!(enabled.web_port, 7788);
+
+        assert!(
+            parse_cli_options(&["tupi".to_string(), "--web-port".to_string(), "abc".to_string()])
+                .is_err()
+        );
+        assert!(parse_cli_options(&["tupi".to_string(), "--web-port".to_string()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod web_port_tests {
+    use super::resolve_web_port;
+
+    #[test]
+    fn cli_port_wins_over_the_project_configuration() {
+        assert_eq!(resolve_web_port(7788, Some(9000)), 7788);
+    }
+
+    #[test]
+    fn the_project_port_applies_when_the_flag_is_absent() {
+        assert_eq!(resolve_web_port(0, Some(9000)), 9000);
+    }
+
+    #[test]
+    fn without_any_port_the_os_picks_one() {
+        assert_eq!(resolve_web_port(0, None), 0);
+    }
+}
