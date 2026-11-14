@@ -107,6 +107,29 @@ mod tests {
         .unwrap();
         assert_eq!(config.model, "antigravity-claude-sonnet-4-6");
     }
+    #[test]
+    fn embedding_is_enabled_only_with_folders_and_without_off() {
+        let folders = vec![std::path::PathBuf::from("docs")];
+        assert!(super::docs_embedding_enabled(&folders, None));
+        assert!(super::docs_embedding_enabled(&folders, Some("auto")));
+        assert!(!super::docs_embedding_enabled(&folders, Some("off")));
+        assert!(!super::docs_embedding_enabled(&[], None));
+    }
+    #[test]
+    fn real_embedding_model_loads_with_1024_dims() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let path = home
+            .join(".tupi/models/LiquidAI/LFM2.5-Embedding-350M-GGUF/LFM2.5-Embedding-350M-Q8_0.gguf");
+        if !path.exists() {
+            return;
+        }
+        let embedder = tupi_infer::LlamaEmbedder::load(&path).expect("modelo carrega");
+        let vectors = tupi_kernel::embed::Embedder::embed_documents(&embedder, &["um texto"])
+            .expect("embedding");
+        assert_eq!(vectors[0].len(), 1024);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -224,4 +247,8 @@ mod context_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_context(dir.path()), ContextConfig::default());
     }
+}
+
+pub fn docs_embedding_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
+    !folders.is_empty() && !matches!(value.map(str::trim), Some("off" | "0" | "false"))
 }

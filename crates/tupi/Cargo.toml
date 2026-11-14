@@ -17,6 +17,7 @@ tupi-tui.workspace = true
 tupi-web.workspace = true
 tupi-store.workspace = true
 tupi-tools.workspace = true
+tupi-infer = { workspace = true, features = ["local-models"] }
 anyhow.workspace = true
 async-trait.workspace = true
 dotenvy.workspace = true

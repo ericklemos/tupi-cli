@@ -75,3 +75,4 @@ mod tests {
     }
 }
 pub mod pipeline;
+pub mod embed;

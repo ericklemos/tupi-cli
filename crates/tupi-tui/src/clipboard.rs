@@ -28,6 +28,116 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// Sequência OSC 52 que coloca `text` na área de transferência do terminal.
+pub fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+struct Helper {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(not(target_os = "macos"))]
+const COPY_HELPERS: &[Helper] = &[
+    Helper {
+        program: "wl-copy",
+        args: &[],
+    },
+    Helper {
+        program: "xclip",
+        args: &["-selection", "clipboard"],
+    },
+    Helper {
+        program: "xsel",
+        args: &["--clipboard", "--input"],
+    },
+];
+
+#[cfg(not(target_os = "macos"))]
+const PASTE_HELPERS: &[Helper] = &[
+    Helper {
+        program: "wl-paste",
+        args: &["--no-newline"],
+    },
+    Helper {
+        program: "xclip",
+        args: &["-selection", "clipboard", "-o"],
+    },
+    Helper {
+        program: "xsel",
+        args: &["--clipboard", "--output"],
+    },
+];
+
+#[cfg(target_os = "macos")]
+const COPY_HELPERS: &[Helper] = &[Helper {
+    program: "pbcopy",
+    args: &[],
+}];
+
+#[cfg(target_os = "macos")]
+const PASTE_HELPERS: &[Helper] = &[Helper {
+    program: "pbpaste",
+    args: &[],
+}];
+
+/// Entrega `text` ao clipboard do sistema pelo primeiro helper disponível.
+/// OSC 52 sozinho é ignorado por vários terminais; o helper cobre esses casos.
+pub fn copy_to_system(text: &str) -> bool {
+    use std::io::Write;
+
+    for helper in COPY_HELPERS {
+        let Ok(mut child) = std::process::Command::new(helper.program)
+            .args(helper.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if written && child.wait().is_ok_and(|status| status.success()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lê o clipboard do sistema pelo primeiro helper disponível.
+pub fn paste_from_system() -> Option<String> {
+    for helper in PASTE_HELPERS {
+        let Ok(output) = std::process::Command::new(helper.program)
+            .args(helper.args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::{COPY_HELPERS, PASTE_HELPERS};
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn wayland_helpers_come_before_x11() {
+        assert_eq!(COPY_HELPERS[0].program, "wl-copy");
+        assert_eq!(PASTE_HELPERS[0].program, "wl-paste");
+        assert_eq!(PASTE_HELPERS[1].program, "xclip");
+    }
+}
+
 pub fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", encode_base64(text.as_bytes()))
 }
@@ -52,5 +162,10 @@ mod tests {
     #[test]
     fn base64_encodes_utf8_bytes() {
         assert_eq!(osc52("✓"), "\x1b]52;c;4pyT\x07");
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_cr_to_lf() {
+        assert_eq!(normalize_paste("a\r\nb\rc\nd"), "a\nb\nc\nd");
     }
 }

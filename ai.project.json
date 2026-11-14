@@ -1,9 +1,12 @@
 {
   "name": "tupi-cli",
   "dashboard_web_port": 7788,
+  "docs_folders": [
+    "./docs"
+  ],
   "models": {
     "deepseek/deepseek-flash": {
-      "context_windows": 200000
+      "context_window": 200000
     }
   }
 }

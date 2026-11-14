@@ -26,3 +26,4 @@ pub(crate) mod why;
 pub(crate) mod workflow;
 pub(crate) mod write;
 pub(crate) mod write_many;
+pub(crate) mod docs;

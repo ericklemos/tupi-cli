@@ -219,6 +219,7 @@ pub struct SddTool {
     mode_cell: Option<Arc<AtomicU8>>,
     response_store: Arc<ResponseStore>,
     default_budget_tokens: usize,
+    docs_enabled: bool,
     pub(crate) executor: Option<Arc<dyn Fn(&SddPlan) -> Result<String, String> + Send + Sync>>,
 }
 
@@ -235,12 +236,17 @@ impl SddTool {
             mode_cell,
             response_store: Arc::new(ResponseStore::new(Duration::from_secs(600), 1024 * 1024)),
             default_budget_tokens,
+            docs_enabled: false,
             executor: None,
         }
     }
 
     pub fn with_response_store(mut self, response_store: Arc<ResponseStore>) -> Self {
         self.response_store = response_store;
+        self
+    }
+    pub fn with_docs(mut self, enabled: bool) -> Self {
+        self.docs_enabled = enabled;
         self
     }
 
@@ -360,6 +366,12 @@ fn validate_slug(raw: &str) -> Result<String, ToolError> {
         )));
     }
     Ok(slug.to_string())
+}
+
+pub(crate) fn has_doc_citation(text: &str) -> bool {
+    regex::Regex::new(r"[A-Za-z0-9_./-]+:\d+-\d+")
+        .map(|pattern| pattern.is_match(text))
+        .unwrap_or(false)
 }
 
 fn status_label_plan(status: SddPlanStatus) -> &'static str {
@@ -527,7 +539,7 @@ impl Tool for SddTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "sdd".to_string(),
-            description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade no banco local + espelho .agents/tupi/sdd/<slug>.md).".to_string(),
+            description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade no banco local + espelho .agents/tupi/sdd/<slug>.md). Antes de upsert_spec, consulte a tool docs e registre as fontes como caminho:inicio-fim em goal, constraints, nuances e details.".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -620,6 +632,7 @@ impl Tool for SddTool {
             .max(1);
         let rk = self.repo_key();
 
+        let plan_action = matches!(&params.action, SddAction::UpsertSpec | SddAction::Close);
         let sections = match params.action {
             SddAction::UpsertSpec => {
                 self.require_sdd_mode("upsert_spec")?;
@@ -975,7 +988,11 @@ impl Tool for SddTool {
             }
         };
 
-        Ok(self.render_budgeted(sections, budget_tokens))
+        let mut out = self.render_budgeted(sections, budget_tokens);
+        if plan_action && self.docs_enabled && !has_doc_citation(&out) {
+            out.push_str("\n> aviso: nenhuma fonte de documentação citada; consulte docs.\n");
+        }
+        Ok(out)
     }
 
     fn describe_call(&self, arguments: &Value) -> String {
@@ -1203,5 +1220,30 @@ mod tests {
                 .as_deref(),
             Some("first")
         );
+    }
+    #[test]
+    fn plan_without_citation_warns_when_docs_is_enabled() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemorySddStore::default());
+        let tool = SddTool::new(
+            dir.path().to_path_buf(),
+            store,
+            Some(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()))),
+            2000,
+        )
+        .with_docs(true);
+
+        let out = tool
+            .call(serde_json::json!({
+                "action": "upsert_spec",
+                "slug": "cobranca",
+                "title": "Cobranca",
+                "goal": "Refazer a cobranca"
+            }))
+            .unwrap();
+
+        assert!(out.contains("aviso"), "{out}");
+        assert!(has_doc_citation("docs/cobranca.md:10-20"));
+        assert!(!has_doc_citation("sem fonte"));
     }
 }

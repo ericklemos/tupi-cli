@@ -75,16 +75,39 @@ pub async fn run_with_dashboard(
 
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match key.code {
-                                KeyCode::Char('c') => {
+                                KeyCode::Char('c' | 'C') => {
                                     if let Some(text) = state
                                         .selection
                                         .and_then(|selection| selected_text(&state, selection))
+                                        .filter(|text| !text.is_empty())
                                     {
                                         terminal.copy(&text)?;
                                         state.notice = Some("copiado".to_string());
                                         continue;
                                     }
                                     break;
+                                }
+                                KeyCode::Char('v' | 'V') => {
+                                    if !state.overlay_open() {
+                                        match crate::clipboard::paste_from_system() {
+                                            Some(text) if !text.is_empty() => {
+                                                state
+                                                    .input
+                                                    .push_str(&crate::clipboard::normalize_paste(&text));
+                                                state.refresh_suggestions();
+                                            }
+                                            Some(_) => {
+                                                state.notice = Some("clipboard vazio".to_string())
+                                            }
+                                            None => {
+                                                state.notice = Some(
+                                                    "clipboard: nenhum leitor (instale wl-clipboard)"
+                                                        .to_string(),
+                                                )
+                                            }
+                                        }
+                                    }
+                                    continue;
                                 }
                                 KeyCode::Char('q') => break,
                                 _ => {}
@@ -347,8 +370,12 @@ pub async fn run_with_dashboard(
                             KeyCode::Home => state.scroll = u16::MAX,
                             KeyCode::End => state.scroll = 0,
                             KeyCode::Char(character) => {
-                                state.input.push(character);
-                                state.refresh_suggestions();
+                                // Ctrl+letra é atalho, não texto; AltGr chega como
+                                // CONTROL+ALT e precisa continuar digitando.
+                                if !is_shortcut_char(key) {
+                                    state.input.push(character);
+                                    state.refresh_suggestions();
+                                }
                             }
                             _ => {}
                         }
@@ -386,6 +413,14 @@ pub async fn run_with_dashboard(
                         MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
                         _ => {}
                     },
+                    CrosstermEvent::Paste(text) => {
+                        // Bracketed paste: o terminal entrega o texto inteiro de
+                        // uma vez, sem virar Enter nem atalho.
+                        if !state.overlay_open() {
+                            state.input.push_str(&crate::clipboard::normalize_paste(&text));
+                            state.refresh_suggestions();
+                        }
+                    }
                     CrosstermEvent::Resize(_, _) => {
                         state.selection = None;
                     }
@@ -545,6 +580,35 @@ enum ToggleAction {
     Dispatch,
     BusyNotice,
     Ignore,
+}
+
+fn is_shortcut_char(key: crossterm::event::KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::is_shortcut_char;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn ctrl_letter_is_a_shortcut_but_altgr_types() {
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let ctrl_shift_v = KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let altgr_at = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let plain = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+
+        assert!(is_shortcut_char(ctrl_v));
+        assert!(is_shortcut_char(ctrl_shift_v));
+        assert!(!is_shortcut_char(altgr_at));
+        assert!(!is_shortcut_char(plain));
+    }
 }
 
 fn should_toggle_mode(state: &ChatState, key: crossterm::event::KeyEvent) -> ToggleAction {

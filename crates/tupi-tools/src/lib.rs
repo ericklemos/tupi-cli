@@ -61,6 +61,10 @@ pub struct ToolsOptions {
     /// Executor disparado ao fechar um plano SDD.
     pub sdd_executor:
         Option<Arc<dyn Fn(&crate::sdd::SddPlan) -> Result<String, String> + Send + Sync>>,
+    /// Pastas com documentação declarada no projeto. Vazio desliga o RAG.
+    pub docs_folders: Vec<std::path::PathBuf>,
+    /// Slot do embedder local; None mantém a busca lexical.
+    pub embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
 }
 
 impl Default for ToolsOptions {
@@ -73,6 +77,8 @@ impl Default for ToolsOptions {
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
+            docs_folders: Vec::new(),
+            embedder: None,
         }
     }
 }
@@ -88,6 +94,8 @@ impl ToolsOptions {
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
+            docs_folders: Vec::new(),
+            embedder: None,
         }
     }
 }
@@ -141,7 +149,7 @@ pub fn register_with(
         SearchTool::new(
             root_dir.clone(),
             store.clone(),
-            ledger,
+            ledger.clone(),
             DEFAULT_BUDGET_TOKENS,
         )
         .with_parse_cache(parse_cache)
@@ -273,9 +281,19 @@ pub fn register_with(
         mode_cell,
         DEFAULT_BUDGET_TOKENS,
     )
-    .with_response_store(store.clone());
+    .with_response_store(store.clone()).with_docs(!options.docs_folders.is_empty());
     sdd_tool.executor = options.sdd_executor.clone();
     registry.register(Arc::new(sdd_tool));
+    if !options.docs_folders.is_empty() {
+        registry.register(Arc::new(crate::tools::docs::DocsTool::new(
+            root_dir.clone(),
+            options.docs_folders.clone(),
+            store.clone(),
+            ledger.clone(),
+            options.embedder.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )));
+    }
     let state = match state_dir {
         Some(dir) => crate::state::StateTool::with_state_dir_and_store(
             root_dir.clone(),
@@ -326,7 +344,12 @@ fn start_watcher(root: &std::path::Path, cache: Arc<crate::graph::GraphCache>) {
 mod agent_tools;
 
 /// Tools expostas ao modelo quando a configuração não pede um perfil próprio.
-pub const CORE_TOOLS: &[&str] = &["edit", "exec", "map", "read", "read_many", "search"];
+///
+/// `write`/`patch` ficam aqui porque `edit` só cobre símbolo Rust: sem eles
+/// `.md`, `.toml` e `.json` seriam somente leitura no modo exec.
+pub const CORE_TOOLS: &[&str] = &[
+    "edit", "exec", "map", "patch", "read", "read_many", "search", "write",
+];
 
 /// Quais tools do catálogo ficam visíveis ao modelo.
 #[derive(Debug, Clone, Copy)]
@@ -345,7 +368,7 @@ impl Exposure<'_> {
         match self {
             // A tool de recuperação é a saída de emergência de todo
             // truncamento: sem ela no núcleo, o corpo omitido fica inalcançável.
-            Self::Core => CORE_TOOLS.contains(&name) || name == "sdd" || name == "peek",
+            Self::Core => CORE_TOOLS.contains(&name) || matches!(name, "sdd" | "peek" | "docs"),
             Self::All => true,
             Self::Only(names) => names.iter().any(|wanted| wanted == name),
         }
@@ -484,5 +507,42 @@ mod tests {
                 "não deveria permitir {forbidden} em SDD: {sdd_names:?}"
             );
         }
+    }
+    #[test]
+    fn docs_is_registered_only_when_folders_are_declared() {
+        let dir = tempdir().unwrap();
+        let mut with = tupi_kernel::ToolRegistry::new();
+        let mut options = ToolsOptions::default();
+        options.docs_folders = vec![dir.path().join("docs")];
+        register_with(dir.path().to_path_buf(), &mut with, options);
+        assert!(with.has("docs"));
+
+        let mut without = tupi_kernel::ToolRegistry::new();
+        register_with(dir.path().to_path_buf(), &mut without, ToolsOptions::default());
+        assert!(!without.has("docs"));
+    }
+
+    #[test]
+    fn docs_is_core_and_only_in_sdd_mode() {
+        use tupi_kernel::AgentMode;
+        let dir = tempdir().unwrap();
+        let mut registry = tupi_kernel::ToolRegistry::new();
+        let mut options = ToolsOptions::default();
+        options.docs_folders = vec![dir.path().join("docs")];
+        register_with(dir.path().to_path_buf(), &mut registry, options);
+
+        let sdd: Vec<_> = registry
+            .specs_for_mode(AgentMode::Sdd)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        let exec: Vec<_> = registry
+            .specs_for_mode(AgentMode::Execution)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert!(sdd.contains(&"docs".to_string()), "{sdd:?}");
+        assert!(!exec.contains(&"docs".to_string()), "{exec:?}");
+        assert!(Exposure::Core.admits("docs"));
     }
 }

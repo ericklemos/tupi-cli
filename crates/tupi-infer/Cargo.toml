@@ -1,0 +1,22 @@
+[package]
+name = "tupi-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-kernel.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+llama-cpp-2 = { version = "0.1.161", optional = true }
+
+[features]
+default = []
+local-models = ["dep:llama-cpp-2"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

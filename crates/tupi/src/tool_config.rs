@@ -157,6 +157,10 @@ mod tests {
         assert!(exposed.specs().len() < all.specs().len());
         assert!(exposed.has("read"));
         assert!(exposed.has("edit"));
+        // `edit` só cobre símbolo Rust: sem write/patch, .md/.toml/.json ficam
+        // somente leitura no modo exec (o perfil default do TUI).
+        assert!(exposed.has("write"));
+        assert!(exposed.has("patch"));
         assert!(exposed.has("search"));
         assert!(exposed.has("map"));
         // Todo truncamento manda o modelo chamar a tool de recuperação; ela

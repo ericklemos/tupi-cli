@@ -19,7 +19,8 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             cursor::Hide,
-            crossterm::event::EnableMouseCapture
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
         ) {
             let _ = terminal::disable_raw_mode();
             return Err(error);
@@ -33,7 +34,8 @@ impl TerminalGuard {
                     stdout,
                     LeaveAlternateScreen,
                     cursor::Show,
-                    crossterm::event::DisableMouseCapture
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::DisableBracketedPaste
                 );
                 let _ = terminal::disable_raw_mode();
                 return Err(error);
@@ -54,8 +56,20 @@ impl TerminalGuard {
         use std::io::Write;
 
         let sequence = crate::clipboard::osc52(text);
-        self.terminal.backend_mut().write_all(sequence.as_bytes())?;
-        self.terminal.backend_mut().flush()
+        let escaped = self
+            .terminal
+            .backend_mut()
+            .write_all(sequence.as_bytes())
+            .and_then(|()| self.terminal.backend_mut().flush())
+            .is_ok();
+
+        // OSC 52 é ignorado por vários terminais; o helper do sistema cobre
+        // esses casos. Se ao menos um caminho funcionou, a cópia valeu.
+        if crate::clipboard::copy_to_system(text) || escaped {
+            return Ok(());
+        }
+
+        Err(io::Error::other("clipboard indisponível"))
     }
 }
 
@@ -66,7 +80,8 @@ impl Drop for TerminalGuard {
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             cursor::Show,
-            crossterm::event::DisableMouseCapture
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste
         );
         let _ = self.terminal.show_cursor();
     }

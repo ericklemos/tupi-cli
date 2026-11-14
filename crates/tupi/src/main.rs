@@ -291,6 +291,25 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
     }
+    tool_options.docs_folders = docs_folders.clone();
+    let embedder_slot = std::sync::Arc::new(tupi_kernel::embed::EmbedderSlot::empty());
+    if config::docs_embedding_enabled(
+        &docs_folders,
+        std::env::var("TUPI_RAG_EMBEDDING").ok().as_deref(),
+    ) {
+        let slot = std::sync::Arc::clone(&embedder_slot);
+        let base = data_dir(|key| std::env::var(key).ok());
+        tokio::spawn(async move {
+            match tupi_infer::ensure_embedding_model(&base, &tupi_infer::HttpFetcher).await {
+                Ok(path) => match tupi_infer::LlamaEmbedder::load(&path) {
+                    Ok(embedder) => slot.set(std::sync::Arc::new(embedder)),
+                    Err(error) => tracing::warn!(%error, "embedder nao carregou"),
+                },
+                Err(error) => tracing::warn!(%error, "download do embedder falhou"),
+            }
+        });
+    }
+    tool_options.embedder = Some(embedder_slot);
     tupi_tools::register_exposed_with(
         root.clone(),
         &mut tools,

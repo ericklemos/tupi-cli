@@ -108,6 +108,10 @@ pub trait Tool: Send + Sync {
     fn sdd_allowed(&self) -> bool {
         false
     }
+    /// Fail-open: tools que só fazem sentido no planejamento retornam false.
+    fn execution_allowed(&self) -> bool {
+        true
+    }
 
     fn spec_for_mode(&self, _mode: crate::AgentMode) -> ToolSpec {
         self.spec()
@@ -137,6 +141,7 @@ impl ToolRegistry {
             crate::AgentMode::Execution => self
                 .tools
                 .iter()
+                .filter(|tool| tool.execution_allowed())
                 .map(|tool| tool.spec_for_mode(mode))
                 .collect(),
             crate::AgentMode::Sdd => self
