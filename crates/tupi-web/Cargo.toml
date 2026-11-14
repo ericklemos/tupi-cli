@@ -1,0 +1,25 @@
+[package]
+name = "tupi-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-domain.workspace = true
+tupi-kernel.workspace = true
+tupi-app.workspace = true
+tupi-tools.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+petgraph.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tower.workspace = true
+tempfile.workspace = true

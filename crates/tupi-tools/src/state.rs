@@ -41,7 +41,25 @@ pub struct StateParams {
     pub budget_tokens: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StateEntry {
+    pub kind: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Entry {
     kind: String,
     #[serde(default)]
@@ -66,7 +84,7 @@ pub struct StateTool {
     default_budget_tokens: usize,
 }
 
-fn default_state_dir() -> PathBuf {
+pub fn default_state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(dir).join("tupi");
     }
@@ -87,6 +105,22 @@ fn read_entries(path: &Path) -> Vec<Entry> {
     content
         .lines()
         .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+        .collect()
+}
+
+pub fn read_entries_for_root(root: &Path, state_dir: &Path) -> Vec<StateEntry> {
+    read_entries(&state_path(state_dir, root))
+        .into_iter()
+        .map(|entry| StateEntry {
+            kind: entry.kind,
+            id: entry.id,
+            text: entry.text,
+            path: entry.path,
+            symbol: entry.symbol,
+            tags: entry.tags,
+            status: entry.status,
+            at: entry.at,
+        })
         .collect()
 }
 

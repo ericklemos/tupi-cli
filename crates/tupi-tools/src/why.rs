@@ -156,6 +156,10 @@ impl Tool for WhyTool {
             .unwrap_or("?");
         format!("why: {symbol}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

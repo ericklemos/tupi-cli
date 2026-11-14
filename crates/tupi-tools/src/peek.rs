@@ -145,6 +145,10 @@ impl Tool for PeekTool {
             parts.join(" · ")
         }
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

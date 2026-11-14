@@ -85,6 +85,13 @@ async fn set_model_changes_model_for_next_request() {
         panic!("esperava Started");
     };
 
+    // Trocar de modelo recalcula a janela de contexto e publica o teto
+    // antes de qualquer turno.
+    match rx.recv().await.unwrap() {
+        Event::ContextBudget { .. } => {}
+        other => panic!("esperava ContextBudget, veio {other:?}"),
+    }
+
     assert_eq!(
         rx.recv().await.unwrap(),
         Event::Token {

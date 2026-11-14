@@ -85,6 +85,10 @@ impl Tool for EnvTool {
             .unwrap_or(ALLOWED.len());
         format!("env: {count} variável(is)")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

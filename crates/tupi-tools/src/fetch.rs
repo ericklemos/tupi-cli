@@ -132,6 +132,10 @@ impl Tool for FetchTool {
         let url = arguments.get("url").and_then(Value::as_str).unwrap_or("?");
         format!("fetch: {url}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

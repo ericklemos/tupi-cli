@@ -28,6 +28,12 @@ pub enum Command {
     },
     RefreshModels,
     ToggleShowPrompts,
+    /// Alterna entre os modos Execution e Sdd.
+    ToggleMode,
+    /// Define explicitamente o modo do agente.
+    SetMode {
+        mode: tupi_domain::AgentMode,
+    },
     /// `/workflows/<nome> [pedido]`: os passos entram na conversa como turno.
     RunWorkflow {
         name: String,
@@ -56,6 +62,9 @@ pub enum CommandOutcome {
     },
     ShowPrompts {
         enabled: bool,
+    },
+    ModeChanged {
+        mode: tupi_domain::AgentMode,
     },
     /// `/new` aceito: o histórico foi descartado e a próxima mensagem abre um turno novo.
     SessionReset,

@@ -6,9 +6,11 @@ use tupi_kernel::{CommandBus, EventBus, ProviderRegistry, QueryBus, ToolRegistry
 use tupi_providers::deepseek;
 use tupi_tui::run::{BusSet, run};
 
+mod agents_config;
 mod config;
 mod project_config;
 mod prompt_config;
+mod sdd_store;
 mod tool_config;
 
 #[tokio::main]
@@ -70,7 +72,6 @@ async fn main() -> anyhow::Result<()> {
 
     let _log_guard = init_tracing(&config.log_filter);
 
-    let telemetry = tupi_app::telemetry::Telemetry::from_env(state_dir().join("telemetry.jsonl"));
     let run_started_at = std::time::Instant::now();
 
     if let Some(path) = dotenv_path {
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let project = project_config::load_or_create(&root);
     tracing::debug!(
         name = %project.name,
+        models = project.models.len(),
         path = %project_config::project_path(&root).display(),
         "configuração do projeto"
     );
@@ -129,6 +131,26 @@ async fn main() -> anyhow::Result<()> {
         path = %config::context_path(&root).display(),
         "configuração de compactação de contexto"
     );
+    let context_profile = {
+        let base = tupi_app::app::context::ContextLimits {
+            budget: context_limits.budget,
+            target: context_limits.target,
+            recent_results: context_limits.recent_results,
+        };
+        let mut profile = tupi_app::app::context::ContextProfile::new(base);
+        for (key, entry) in &project.models {
+            profile = profile.with_model(key.clone(), entry.context_window);
+        }
+        profile
+    };
+    let resolved_context = context_profile.resolve(&provider, &model);
+    tracing::debug!(
+        provider = %provider,
+        model = %model,
+        budget = resolved_context.budget,
+        target = resolved_context.target,
+        "janela de contexto do modelo"
+    );
     let prompt = prompt_config::load_prompt(&root);
     tracing::debug!(
         path = %prompt_config::prompt_path(&root).display(),
@@ -137,11 +159,28 @@ async fn main() -> anyhow::Result<()> {
     let prefix = tupi_app::prompt::compose(&prompt.system);
     let available = tupi_tools::catalog(&root);
     tracing::debug!(count = available.len(), "workflows disponíveis");
-    let prefix = format!("{prefix}\n\n{}", tupi_tools::prompt_section(&available));
+    let workflows_section = tupi_tools::prompt_section(&available);
+    let agents_section = agents_config::load_agents_section(&root);
+    tracing::debug!(
+        path = %agents_config::agents_path(&root).display(),
+        loaded = agents_section.is_some(),
+        "instruções do projeto (AGENTS.md)"
+    );
+    let prefix = compose_startup_prefix(&prefix, &workflows_section, agents_section.as_deref());
     let workflows = std::sync::Arc::new(tupi_tools::Catalog::new(root.clone()));
     let mut tools = ToolRegistry::new();
-    let debug_dir = tupi_domain::memory::dir(&root).join("debug");
-    tupi_tools::register_exposed(root.clone(), &mut tools, tool_limits.exposure());
+    let debug_dir = debug_dir(&root);
+    let telemetry = tupi_app::telemetry::Telemetry::from_env(telemetry_default_path(&root));
+    let mode_cell = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+        tupi_kernel::AgentMode::Execution.as_u8(),
+    ));
+    let repo_key = tupi_tools::repo_key(&root);
+    let mut tool_options = tupi_tools::ToolsOptions::default();
+    tool_options.sdd_store = Some(std::sync::Arc::new(sdd_store::RedbSddStore::new(
+        std::sync::Arc::clone(&store),
+    )));
+    tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
+    tupi_tools::register_exposed_with(root.clone(), &mut tools, tool_limits.exposure(), tool_options);
 
     let tool_names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
     let workflow_names: Vec<String> = available
@@ -167,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
             log_filter: config.log_filter.clone(),
             max_tokens: tokens.max_tokens as usize,
             max_tool_steps: tool_limits.max_tool_steps,
-            context_budget: context_limits.budget,
+            context_budget: resolved_context.budget,
             prompt_chars,
             tool_count: tool_names.len(),
             tools: tool_names,
@@ -194,7 +233,9 @@ async fn main() -> anyhow::Result<()> {
     .with_context_budget(context_limits.budget)
     .with_context_target(context_limits.target)
     .with_context_recent_results(context_limits.recent_results)
+    .with_context_profile(context_profile)
     .with_debug_dir(debug_dir);
+    let app = app.with_repo_key(repo_key).with_mode_cell(mode_cell);
     let app = app.with_workflows(workflows);
     let app = app.with_memory(root.clone());
 
@@ -211,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
     outcome?;
     Ok(())
 }
+
 
 fn tool_root() -> anyhow::Result<PathBuf> {
     let root = std::env::current_dir().context("não foi possível obter o diretório atual")?;
@@ -275,6 +317,32 @@ fn state_dir() -> PathBuf {
         .join("tupi")
 }
 
+fn debug_dir(root: &std::path::Path) -> PathBuf {
+    tupi_domain::memory::dir(root).join("debug")
+}
+
+fn telemetry_default_path(root: &std::path::Path) -> PathBuf {
+    debug_dir(root).join("telemetry.jsonl")
+}
+
+fn compose_startup_prefix(
+    system_prompt: &str,
+    workflows_section: &str,
+    agents_section: Option<&str>,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !system_prompt.is_empty() {
+        parts.push(system_prompt);
+    }
+    if !workflows_section.is_empty() {
+        parts.push(workflows_section);
+    }
+    if let Some(section) = agents_section.filter(|section| !section.is_empty()) {
+        parts.push(section);
+    }
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +375,41 @@ mod tests {
         });
 
         assert_eq!(dir, PathBuf::from("C:\\Users\\ana\\.tupi"));
+    }
+
+    #[test]
+    fn telemetry_defaults_to_repo_debug_dir() {
+        let path = telemetry_default_path(std::path::Path::new("/repo"));
+        assert_eq!(
+            path,
+            PathBuf::from("/repo/.agents/tupi/debug/telemetry.jsonl")
+        );
+    }
+
+    #[test]
+    fn compose_startup_prefix_includes_agents_after_workflows() {
+        let out = compose_startup_prefix(
+            "BASE",
+            "## Workflows\n\nDisponíveis: feature.",
+            Some("## Instruções do projeto (AGENTS.md)\n\nRegras."),
+        );
+        assert_eq!(
+            out,
+            "BASE\n\n## Workflows\n\nDisponíveis: feature.\n\n## Instruções do projeto (AGENTS.md)\n\nRegras."
+        );
+    }
+
+    #[test]
+    fn compose_startup_prefix_skips_empty_sections() {
+        assert_eq!(compose_startup_prefix("BASE", "", None), "BASE");
+        assert_eq!(
+            compose_startup_prefix(
+                "BASE",
+                "",
+                Some("## Instruções do projeto (AGENTS.md)\n\nRegras.")
+            ),
+            "BASE\n\n## Instruções do projeto (AGENTS.md)\n\nRegras."
+        );
     }
 }
 mod token;

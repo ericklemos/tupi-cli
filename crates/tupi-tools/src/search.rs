@@ -52,11 +52,15 @@ struct Candidate {
 
 struct Pending {
     path: PathBuf,
+    relative: String,
     id: String,
     file_hash: blake3::Hash,
     text: String,
     complete: bool,
     omitted: bool,
+    record_ledger: bool,
+    visit_level: crate::backtrack::VisitLevel,
+    via: String,
 }
 
 struct Rendered {
@@ -72,6 +76,8 @@ pub struct SearchTool {
     ledger: Arc<DeliveryLedger>,
     default_budget_tokens: usize,
     chunker: AstChunker,
+    graph: Option<Arc<crate::graph::GraphCache>>,
+    backtrack: Arc<crate::backtrack::BacktrackGraph>,
 }
 
 impl SearchTool {
@@ -88,11 +94,23 @@ impl SearchTool {
             ledger,
             default_budget_tokens,
             chunker: AstChunker::new(),
+            graph: None,
+            backtrack: Arc::new(crate::backtrack::BacktrackGraph::default()),
         }
     }
 
     pub fn with_parse_cache(mut self, cache: Arc<crate::graph::ParseCache>) -> Self {
         self.chunker = AstChunker::with_cache(cache);
+        self
+    }
+
+    pub fn with_backtrack(mut self, backtrack: Arc<crate::backtrack::BacktrackGraph>) -> Self {
+        self.backtrack = backtrack;
+        self
+    }
+
+    pub fn with_graph_cache(mut self, graph: Arc<crate::graph::GraphCache>) -> Self {
+        self.graph = Some(graph);
         self
     }
 
@@ -128,58 +146,107 @@ impl SearchTool {
                 .push(found.line_number);
         }
 
+        let root = self
+            .root_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.root_dir.clone());
         let chunker = &self.chunker;
-        let mut candidates = Vec::new();
+        let mut files: Vec<(PathBuf, String, String, blake3::Hash)> =
+            Vec::with_capacity(by_file.len());
+        let mut matched_hashes: HashMap<String, blake3::Hash> =
+            HashMap::with_capacity(by_file.len());
+        let mut snippets: Vec<AstSnippet> = Vec::new();
+        let mut file_indices: Vec<usize> = Vec::new();
         for (path, lines) in by_file {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            for snippet in chunker.snippets_at_lines(&path, &content, &lines) {
-                candidates.push(Candidate {
-                    path: path.clone(),
-                    content: content.clone(),
-                    snippet,
-                });
+            let mut file_snippets = chunker.snippets_at_lines(&path, &content, &lines);
+            if file_snippets.is_empty() {
+                continue;
             }
+            file_snippets.sort_by_key(|snippet| snippet.start_line);
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let file_hash = ledger::content_hash(&content);
+            matched_hashes.insert(relative.clone(), file_hash);
+            let file_idx = files.len();
+            files.push((path, content, relative, file_hash));
+            file_indices.resize(file_indices.len() + file_snippets.len(), file_idx);
+            snippets.extend(file_snippets);
         }
-        candidates.sort_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then_with(|| a.snippet.start_line.cmp(&b.snippet.start_line))
-        });
 
-        if candidates.is_empty() {
+        if snippets.is_empty() {
             return Ok(format!(
                 "Termos encontrados, porém nenhum bloco de código pôde ser delimitado para `{}`.",
                 params.query.trim()
             ));
         }
 
-        let snippets: Vec<AstSnippet> = candidates
-            .iter()
-            .map(|candidate| candidate.snippet.clone())
-            .collect();
-        let ranked = LexicalRanker::new().rank_indices(&terms, &snippets);
-        let total = candidates.len();
+        let mut ranked = LexicalRanker::new().rank_indices(&terms, &snippets);
+        if !repeat_allowed {
+            ranked.sort_by(|&(idx_a, score_a), &(idx_b, score_b)| {
+                let (_, _, ref rel_a, ref hash_a) = files[file_indices[idx_a]];
+                let (_, _, ref rel_b, ref hash_b) = files[file_indices[idx_b]];
+                let tier_a =
+                    match self
+                        .backtrack
+                        .visit_level(rel_a, &snippets[idx_a].qualified_name, hash_a)
+                    {
+                        crate::backtrack::VisitLevel::BodySeen => 2u8,
+                        crate::backtrack::VisitLevel::SignatureSeen => 1u8,
+                        crate::backtrack::VisitLevel::Unseen
+                        | crate::backtrack::VisitLevel::Frontier => 0u8,
+                    };
+                let tier_b =
+                    match self
+                        .backtrack
+                        .visit_level(rel_b, &snippets[idx_b].qualified_name, hash_b)
+                    {
+                        crate::backtrack::VisitLevel::BodySeen => 2u8,
+                        crate::backtrack::VisitLevel::SignatureSeen => 1u8,
+                        crate::backtrack::VisitLevel::Unseen
+                        | crate::backtrack::VisitLevel::Frontier => 0u8,
+                    };
+                tier_a
+                    .cmp(&tier_b)
+                    .then_with(|| score_b.total_cmp(&score_a))
+                    .then_with(|| idx_a.cmp(&idx_b))
+            });
+        }
+
+        let total = snippets.len();
+        let query_label = format!("search: {}", params.query.trim());
+        let cut_label = format!("search(cortado): {}", params.query.trim());
+        for &(index, _) in ranked.iter().skip(max_results) {
+            let (_, _, ref relative, file_hash) = files[file_indices[index]];
+            self.backtrack.record_visit(
+                relative,
+                &snippets[index].qualified_name,
+                file_hash,
+                crate::backtrack::VisitLevel::Frontier,
+                Some(&cut_label),
+            );
+        }
+
+        let query_seen = !repeat_allowed
+            && self
+                .backtrack
+                .was_query_seen(&terms, params.path.as_deref(), &matched_hashes);
+
         let selected: Vec<(usize, f32)> = ranked.into_iter().take(max_results).collect();
 
-        let root = self
-            .root_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.root_dir.clone());
         let mut rendered = Vec::with_capacity(selected.len());
         let mut full_bodies = 0usize;
         let mut full_tokens = 0usize;
         let mut signature_only = 0usize;
 
         for (position, (index, score)) in selected.iter().enumerate() {
-            let candidate = &candidates[*index];
-            let snippet = &candidate.snippet;
-            let relative = candidate
-                .path
-                .strip_prefix(&root)
-                .unwrap_or(&candidate.path)
-                .display();
+            let (path, content, relative, file_hash) = &files[file_indices[*index]];
+            let snippet = &snippets[*index];
 
             let heading = format!(
                 "#### {}. `{}` (`{}:{}-{}`)",
@@ -202,10 +269,27 @@ impl SearchTool {
 
             if !wants_full {
                 signature_only += 1;
-                let body = if snippet.signature.is_empty() {
-                    String::new()
+                let prior =
+                    self.backtrack
+                        .visit_level(relative, &snippet.qualified_name, file_hash);
+                let marker = if !repeat_allowed {
+                    match prior {
+                        crate::backtrack::VisitLevel::BodySeen => " *(já entregue nesta sessão)*",
+                        crate::backtrack::VisitLevel::SignatureSeen => " *(assinatura já vista)*",
+                        crate::backtrack::VisitLevel::Unseen
+                        | crate::backtrack::VisitLevel::Frontier => "",
+                    }
                 } else {
-                    format!("`{}`\n\n", compact_signature(&snippet.signature))
+                    ""
+                };
+                let body = if snippet.signature.is_empty() {
+                    if marker.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n\n", marker.trim_start())
+                    }
+                } else {
+                    format!("`{}`{marker}\n\n", compact_signature(&snippet.signature))
                 };
                 rendered.push(Rendered {
                     section: Section {
@@ -213,16 +297,51 @@ impl SearchTool {
                         body,
                         priority: (score * 200.0) as u8,
                     },
-                    pending: None,
+                    pending: Some(Pending {
+                        path: path.clone(),
+                        relative: relative.clone(),
+                        id: snippet.qualified_name.clone(),
+                        file_hash: *file_hash,
+                        text: String::new(),
+                        complete: false,
+                        omitted: false,
+                        record_ledger: false,
+                        visit_level: crate::backtrack::VisitLevel::SignatureSeen,
+                        via: query_label.clone(),
+                    }),
                 });
                 continue;
             }
 
-            full_bodies += 1;
-            full_tokens += code_tokens + estimate_tokens(&heading);
             let (code, capped) = capped_body(snippet);
             let mut body = format!("```rust\n{code}\n```\n");
-            let pending = self.apply_ledger(candidate, &mut body, capped, repeat_allowed);
+            let candidate = Candidate {
+                path: path.clone(),
+                content: content.clone(),
+                snippet: snippet.clone(),
+            };
+            let pending = self.apply_ledger(
+                &candidate,
+                relative,
+                &query_label,
+                &mut body,
+                capped,
+                repeat_allowed,
+            );
+            let is_pointer = pending.as_ref().is_some_and(|p| p.omitted);
+            if is_pointer {
+                if let Some(hint) = self
+                    .backtrack
+                    .backtrack_hint(relative, &snippet.qualified_name)
+                    && let Some(line) = hint.format_line()
+                {
+                    body.push_str(&line);
+                }
+                full_tokens += estimate_tokens(&body) + estimate_tokens(&heading);
+            } else {
+                full_bodies += 1;
+                full_tokens += code_tokens + estimate_tokens(&heading);
+            }
 
             rendered.push(Rendered {
                 section: Section {
@@ -246,8 +365,15 @@ impl SearchTool {
             Some(self.store.insert(selection.omitted_body()))
         };
         self.settle(&rendered, &selection);
+        self.backtrack
+            .record_query(&terms, params.path.as_deref(), matched_hashes);
 
         let mut out = format!("### Resultados da busca\n{completeness}\n\n");
+        if query_seen {
+            out.push_str(
+                "> **Backtrack**: busca equivalente já realizada nesta sessão; priorizando pontos ainda não abertos.\n\n",
+            );
+        }
         if signature_only > 0 {
             out.push_str(&format!(
                 "> {signature_only} resultado(s) só com assinatura.\n\n"
@@ -260,6 +386,8 @@ impl SearchTool {
     fn apply_ledger(
         &self,
         candidate: &Candidate,
+        relative: &str,
+        via: &str,
         body: &mut String,
         capped: bool,
         repeat_allowed: bool,
@@ -273,11 +401,15 @@ impl SearchTool {
 
         let draft = Pending {
             path: candidate.path.clone(),
+            relative: relative.to_string(),
             id: id.clone(),
             file_hash,
             text: span_text.to_string(),
             complete,
             omitted: false,
+            record_ledger: true,
+            visit_level: crate::backtrack::VisitLevel::BodySeen,
+            via: via.to_string(),
         };
 
         if repeat_allowed {
@@ -345,6 +477,7 @@ impl SearchTool {
             }
         }
 
+        let graph = self.graph.as_ref().map(|cache| cache.get());
         for rendered in rendered {
             let Some(pending) = &rendered.pending else {
                 continue;
@@ -356,7 +489,15 @@ impl SearchTool {
             if handled.remove(&key).is_none() {
                 continue;
             }
-            if pending.omitted {
+            if !pending.record_ledger {
+                self.backtrack.record_visit(
+                    &pending.relative,
+                    &pending.id,
+                    pending.file_hash,
+                    pending.visit_level,
+                    Some(&pending.via),
+                );
+            } else if pending.omitted {
                 self.ledger.note_omitted(&pending.path, &pending.id);
             } else {
                 self.ledger.record(Delivery {
@@ -368,6 +509,41 @@ impl SearchTool {
                     complete: pending.complete,
                     handle: None,
                 });
+                self.backtrack.record_visit(
+                    &pending.relative,
+                    &pending.id,
+                    pending.file_hash,
+                    pending.visit_level,
+                    Some(&pending.via),
+                );
+                if let Some(graph) = &graph
+                    && let Some(def) = graph
+                        .defs
+                        .iter()
+                        .find(|def| def.relative == pending.relative && def.qualified == pending.id)
+                {
+                    let mut neighbor_refs = Vec::new();
+                    for callee in graph.callees_for(def) {
+                        neighbor_refs.push(crate::backtrack::NeighborRef {
+                            relative: callee.relative.clone(),
+                            symbol: callee.qualified.clone(),
+                            line: callee.start_line,
+                        });
+                    }
+                    for caller in graph.callers_for(def) {
+                        neighbor_refs.push(crate::backtrack::NeighborRef {
+                            relative: caller.relative.clone(),
+                            symbol: caller.qualified.clone(),
+                            line: caller.start_line,
+                        });
+                    }
+                    self.backtrack.record_neighbors(
+                        &pending.relative,
+                        &pending.id,
+                        pending.file_hash,
+                        &neighbor_refs,
+                    );
+                }
             }
         }
     }
@@ -480,6 +656,10 @@ impl Tool for SearchTool {
         } else {
             parts.join(" · ")
         }
+    }
+
+    fn sdd_allowed(&self) -> bool {
+        true
     }
 }
 
@@ -826,5 +1006,94 @@ mod tests {
             label,
             "query=onde valida token · path=src · detail=signatures"
         );
+    }
+
+    #[test]
+    fn search_deprioritizes_already_delivered_symbols_and_gives_auto_body_to_fresh_hits() {
+        let dir = tempdir().unwrap();
+        for name in ["handler_a", "handler_b", "handler_c"] {
+            write(
+                dir.path(),
+                &format!("{name}.rs"),
+                &format!("pub fn {name}() -> u8 {{\n    99\n}}\n"),
+            );
+        }
+        let tool = tool_for(dir.path());
+        let first = tool.search(params("handler")).unwrap();
+        assert!(first.contains("1. `handler_a`"), "{first}");
+        assert!(first.contains("2. `handler_b`"), "{first}");
+
+        let second = tool.search(params("handler")).unwrap();
+        assert!(second.contains("1. `handler_c`"), "{second}");
+        assert!(second.contains("99"), "{second}");
+        assert!(second.contains("Já entregue nesta sessão"), "{second}");
+    }
+
+    #[test]
+    fn search_marks_previously_seen_signatures_and_repeated_exhausted_queries() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.rs", "pub fn alpha_one() -> u8 {\n    1\n}\n");
+        let tool = tool_for(dir.path());
+
+        let first = tool
+            .search(SearchParams {
+                detail: Some(SearchDetail::Signatures),
+                ..params("alpha")
+            })
+            .unwrap();
+        assert!(!first.contains("assinatura já vista"), "{first}");
+
+        let second = tool
+            .search(SearchParams {
+                detail: Some(SearchDetail::Signatures),
+                ..params("alpha")
+            })
+            .unwrap();
+        assert!(second.contains("assinatura já vista"), "{second}");
+        assert!(second.contains("> **Backtrack**:"), "{second}");
+    }
+
+    #[test]
+    fn read_outline_marks_symbols_as_signature_seen_for_subsequent_search() {
+        use crate::read::{ReadParams, ReadTool};
+
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.rs", "pub fn alpha_one() -> u8 {\n    1\n}\n");
+        write(dir.path(), "b.rs", "pub fn alpha_two() -> u8 {\n    2\n}\n");
+
+        let store = Arc::new(ResponseStore::new(
+            std::time::Duration::from_secs(60),
+            1024 * 1024,
+        ));
+        let ledger = Arc::new(DeliveryLedger::new(64, 1 << 20));
+        let backtrack = Arc::new(crate::backtrack::BacktrackGraph::default());
+
+        let read = ReadTool::new(
+            dir.path().to_path_buf(),
+            store.clone(),
+            ledger.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_backtrack(backtrack.clone());
+        read.read(ReadParams {
+            path: "a.rs".to_string(),
+            symbol: None,
+            budget_tokens: None,
+            repeat: None,
+            rev: None,
+        })
+        .unwrap();
+
+        let search = SearchTool::new(
+            dir.path().to_path_buf(),
+            store,
+            ledger,
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_backtrack(backtrack);
+
+        let out = search.search(params("alpha")).unwrap();
+        assert!(out.contains("1. `alpha_two`"), "{out}");
+        assert!(out.contains("2. `alpha_one`"), "{out}");
     }
 }

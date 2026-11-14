@@ -69,13 +69,21 @@ impl SpanResolver {
 
     /// Resolve nome simples ou qualificado. Ambiguidade nunca é escolhida.
     pub fn resolve(&self, table: &SymbolTable, symbol: &str) -> ResolveOutcome {
+        let (symbol, line) = match symbol.rsplit_once('@') {
+            Some((head, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => {
+                (head.trim(), line.parse::<usize>().ok())
+            }
+            _ => (symbol.trim(), None),
+        };
         let (container, name) = split_qualified(symbol);
 
         let matching: Vec<SymbolSpan> = table
             .spans
             .iter()
             .filter(|span| {
-                span.name == name && container_matches(span.container.as_deref(), container)
+                span.name == name
+                    && container_matches(span.container.as_deref(), container)
+                    && line.is_none_or(|line| span.start_line == line)
             })
             .cloned()
             .collect();
@@ -119,13 +127,15 @@ impl SpanResolver {
 
 /// `impl Foo::new — linha 12`, or `fn verify — linha 3`.
 pub fn render_candidate(span: &SymbolSpan) -> String {
-    match &span.container {
-        Some(container) => format!(
-            "impl {container}::{} — linha {}",
-            span.name, span.start_line
-        ),
-        None => format!("{} {} — linha {}", span.kind, span.name, span.start_line),
-    }
+    let kind = display_kind(&span.kind);
+    let qualified = match &span.container {
+        Some(container) => format!("{container}::{}", span.name),
+        None if span.name == kind || span.name.starts_with(&format!("{kind} ")) => {
+            span.name.clone()
+        }
+        None => format!("{kind} {}", span.name),
+    };
+    format!("{qualified}@{}", span.start_line)
 }
 
 fn render_bodyless(item: &Bodyless) -> String {
@@ -436,5 +446,31 @@ mod tests {
         assert!(hash_matches(content, &prefix[..8]));
         assert!(!hash_matches(content, "deadbeef"));
         assert!(!hash_matches(content, "abc"));
+    }
+
+    #[test]
+    fn a_line_suffix_disambiguates_two_impls_of_the_same_type() {
+        let content =
+            "impl Cache {\n    fn rows(&self) {}\n}\n\nimpl Cache {\n    fn rows(&self) {}\n}\n";
+        let table = symbols_of(content);
+        let resolver = SpanResolver::new();
+
+        match resolver.resolve(&table, "impl Cache@5") {
+            ResolveOutcome::Found(found) => assert_eq!(found.start_line, 5),
+            ResolveOutcome::Ambiguous(_) => panic!("o sufixo @linha deveria desambiguar"),
+            ResolveOutcome::NotFound { .. } => panic!("esperava encontrar a segunda impl"),
+            ResolveOutcome::NoBody { .. } => panic!("impl tem bloco"),
+        }
+        assert!(matches!(
+            resolver.resolve(&table, "impl Cache"),
+            ResolveOutcome::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn a_candidate_is_copyable_and_does_not_repeat_the_kind() {
+        let table = symbols_of("impl Cache {\n    fn rows(&self) {}\n}\n");
+        let span = span(&table, "impl Cache");
+        assert_eq!(render_candidate(span), "impl Cache@1");
     }
 }

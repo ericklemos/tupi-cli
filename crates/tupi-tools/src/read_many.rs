@@ -278,6 +278,10 @@ impl Tool for ReadManyTool {
         }
         out
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +491,7 @@ mod tests {
                 "websearch",
                 "research",
                 "ledger",
+                "sdd",
                 "state",
                 "env",
                 "peek",

@@ -143,7 +143,7 @@ pub(crate) async fn execute(
                 result: text,
                 result_chars: clipped.chars,
                 result_bytes: clipped.bytes,
-                truncated: clipped.truncated,
+                truncated: crate::telemetry::truncated(content, clipped.truncated),
                 summary,
                 error,
             },

@@ -82,8 +82,6 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     decorate_code_blocks(lines, width)
 }
 
-/// Per-message render cache. Invalidate one message while it streams, and
-/// every message when the transcript width changes.
 #[derive(Debug, Default)]
 pub struct Cache {
     width: usize,
@@ -116,6 +114,10 @@ impl Cache {
         &self.entries[index].lines
     }
 }
+
+/// Per-message render cache. Invalidate one message while it streams, and
+/// every message when the transcript width changes.
+
 
 fn owned_line(line: Line<'_>) -> Line<'static> {
     let style = line.style;

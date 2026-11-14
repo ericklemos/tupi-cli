@@ -47,11 +47,18 @@ pub enum ChatEntry {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub budget: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct ChatState {
     pub lines: Vec<ChatEntry>,
     pub input: String,
     pub status: Status,
+    pub mode: tupi_kernel::AgentMode,
     pub scroll: u16,
     pub notice: Option<String>,
     pub overlay: Option<Overlay>,
@@ -60,6 +67,7 @@ pub struct ChatState {
     pub selection: Option<crate::selection::Selection>,
     pub(crate) view: std::cell::Cell<Option<crate::selection::TranscriptView>>,
     pub(crate) render_cache: std::cell::RefCell<crate::markdown::Cache>,
+    pub context: Option<ContextUsage>,
     /// Nomes dos workflows disponíveis. Só viram sugestão depois de
     /// `/workflows/`; antes disso o namespace não existe.
     pub workflows: Vec<String>,
@@ -69,6 +77,14 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    pub fn apply_mode_changed(&mut self, mode: tupi_kernel::AgentMode) {
+        // O modo muda por atalho; fechar o SDD é decisão do planejamento
+        // (tool `sdd(action="close")`), anunciada pelo app via Event::Notice.
+        // Aqui só espelhamos o modo e descartamos aviso preso de outra troca.
+        self.mode = mode;
+        self.notice = None;
+    }
+
     pub fn push_user(&mut self, text: &str) {
         self.lines.push(ChatEntry::Message {
             role: tupi_domain::Role::User,
@@ -258,6 +274,21 @@ impl ChatState {
             }
         }
     }
+
+    pub fn set_context(&mut self, tokens: u64, budget: u64) {
+        self.context = Some(ContextUsage { tokens, budget });
+    }
+
+    /// Troca só o teto de contexto, preservando a ocupação já conhecida.
+    ///
+    /// Sem `ContextUsage` anterior não há o que mostrar: a troca de modelo
+    /// fora de um turno não inventa ocupação.
+    pub fn set_context_budget(&mut self, budget: u64) {
+        if let Some(context) = self.context.as_mut() {
+            context.budget = budget;
+        }
+    }
+
 
     fn finish_metrics(&mut self, now: std::time::Instant) {
         if let Some(index) = self.streaming_index
@@ -783,5 +814,72 @@ mod tests {
             2,
             "pendentes saem do transcript ao disparar"
         );
+    }
+
+    #[test]
+    fn set_context_replaces_previous_occupancy() {
+        let mut state = ChatState::default();
+        assert_eq!(state.context, None);
+
+        state.set_context(1_001, 32_000);
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 1_001,
+                budget: 32_000,
+            })
+        );
+
+        state.set_context(1_201, 32_000);
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 1_201,
+                budget: 32_000,
+            })
+        );
+    }
+
+    #[test]
+    fn context_budget_updates_the_ceiling_without_inventing_occupancy() {
+        let mut state = ChatState::default();
+        state.set_context_budget(8_000);
+        assert_eq!(state.context, None);
+
+        state.set_context(1_001, 32_000);
+        state.set_context_budget(8_000);
+        assert_eq!(
+            state.context,
+            Some(ContextUsage {
+                tokens: 1_001,
+                budget: 8_000,
+            })
+        );
+    }
+
+    #[test]
+    fn mode_changed_event_updates_chat_state_without_clearing_transcript() {
+        let mut state = ChatState::default();
+        assert_eq!(state.mode, tupi_kernel::AgentMode::Execution);
+        state.push_user("oi");
+        assert_eq!(state.lines.len(), 1);
+
+        state.apply_mode_changed(tupi_kernel::AgentMode::Sdd);
+        assert_eq!(state.mode, tupi_kernel::AgentMode::Sdd);
+        assert_eq!(state.lines.len(), 1);
+
+        // O atalho alterna o modo; quem fecha o SDD é o app, no planejamento,
+        // quando a tool `sdd(action="close")` roda. Trocar de modo não pode
+        // anunciar um fechamento que não aconteceu.
+        state.apply_mode_changed(tupi_kernel::AgentMode::Execution);
+        assert_eq!(state.mode, tupi_kernel::AgentMode::Execution);
+        assert_eq!(state.lines.len(), 1);
+        assert!(state.notice.is_none(), "troca manual de modo não fecha o SDD");
+
+        // Nem um aviso de fechamento real pode sobreviver à volta para o SDD.
+        state.notice = Some("SDD fechado — modo execução".to_string());
+        state.apply_mode_changed(tupi_kernel::AgentMode::Sdd);
+        assert_eq!(state.mode, tupi_kernel::AgentMode::Sdd);
+        assert!(state.notice.is_none(), "aviso de fechamento ficou preso no modo SDD");
     }
 }

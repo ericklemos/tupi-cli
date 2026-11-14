@@ -202,7 +202,7 @@ fn clean_gemini_schema(schema: &Value) -> Value {
 }
 
 pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
-    let mut system_instruction = None;
+    let mut system_parts: Vec<Value> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     let mut call_names_by_id: HashMap<String, String> = HashMap::new();
 
@@ -218,10 +218,9 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
     for msg in &request.messages {
         match msg.role {
             Role::System => {
-                system_instruction = Some(json!({
-                    "role": "user",
-                    "parts": [{ "text": msg.content }]
-                }));
+                if !msg.content.is_empty() {
+                    system_parts.push(json!({ "text": msg.content }));
+                }
             }
             Role::User => {
                 contents.push(json!({
@@ -295,8 +294,11 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
         "contents": contents,
     });
 
-    if let Some(sys) = system_instruction {
-        request_payload["systemInstruction"] = sys;
+    if !system_parts.is_empty() {
+        request_payload["systemInstruction"] = json!({
+            "role": "user",
+            "parts": system_parts
+        });
     }
 
     if !request.tools.is_empty() {
@@ -332,6 +334,7 @@ pub struct AntigravityChunk {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub prompt_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
 }
 
@@ -390,6 +393,7 @@ pub fn extract_chunk(payload: &str) -> Result<AntigravityChunk, ProviderError> {
 
     if let Some(usage) = response.get("usageMetadata") {
         chunk.prompt_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
+        chunk.cached_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
         chunk.completion_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
     }
 
@@ -638,6 +642,7 @@ struct StreamState {
     pending: VecDeque<String>,
     ready_events: VecDeque<ProviderEvent>,
     accumulated_calls: Vec<ToolCall>,
+    last_usage: Option<(Option<u64>, Option<u64>, Option<u64>)>,
     done: bool,
 }
 
@@ -831,6 +836,7 @@ impl Provider for AntigravityProvider {
             pending: VecDeque::new(),
             ready_events: VecDeque::new(),
             accumulated_calls: Vec::new(),
+            last_usage: None,
             done: false,
         };
 
@@ -853,12 +859,15 @@ impl Provider for AntigravityProvider {
                             if let Some(text) = chunk.text {
                                 state.ready_events.push_back(ProviderEvent::Text(text));
                             }
-                            if chunk.prompt_tokens.is_some() || chunk.completion_tokens.is_some() {
-                                state.ready_events.push_back(ProviderEvent::Usage {
-                                    prompt_tokens: chunk.prompt_tokens,
-                                    cached_tokens: None,
-                                    completion_tokens: chunk.completion_tokens,
-                                });
+                            if chunk.prompt_tokens.is_some()
+                                || chunk.cached_tokens.is_some()
+                                || chunk.completion_tokens.is_some()
+                            {
+                                state.last_usage = Some((
+                                    chunk.prompt_tokens,
+                                    chunk.cached_tokens,
+                                    chunk.completion_tokens,
+                                ));
                             }
                             continue;
                         }
@@ -867,6 +876,18 @@ impl Provider for AntigravityProvider {
                 }
 
                 if state.done {
+                    if let Some((prompt_tokens, cached_tokens, completion_tokens)) =
+                        state.last_usage.take()
+                    {
+                        return Some((
+                            Ok(ProviderEvent::Usage {
+                                prompt_tokens,
+                                cached_tokens,
+                                completion_tokens,
+                            }),
+                            state,
+                        ));
+                    }
                     if !state.accumulated_calls.is_empty() {
                         let calls = std::mem::take(&mut state.accumulated_calls);
                         return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
@@ -1338,6 +1359,33 @@ mod tests {
     }
 
     #[test]
+    fn body_preserves_multiple_system_messages_in_order() {
+        let request = ChatRequest::new(
+            "gemini-3.8-flash-high",
+            vec![
+                Message::new(Role::System, "instrucao principal"),
+                Message::new(Role::System, "memoria relevante"),
+                Message::user("oi"),
+                Message::new(Role::System, "freio de passos"),
+            ],
+        );
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        let parts = body["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .expect("systemInstruction.parts");
+        let texts: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "instrucao principal",
+                "memoria relevante",
+                "freio de passos"
+            ]
+        );
+    }
+
+    #[test]
     fn body_serializes_tools_as_function_declarations_and_cleans_schema() {
         let spec = ToolSpec {
             name: "read_file".into(),
@@ -1450,11 +1498,12 @@ mod tests {
 
     #[test]
     fn chunk_extracts_usage_metadata() {
-        let payload = r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":45}}}"#;
+        let payload = r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":45,"cachedContentTokenCount":30}}}"#;
         let chunk = extract_chunk(payload).unwrap();
         assert_eq!(chunk.text, Some("ok".into()));
         assert_eq!(chunk.prompt_tokens, Some(120));
         assert_eq!(chunk.completion_tokens, Some(45));
+        assert_eq!(chunk.cached_tokens, Some(30));
     }
 
     #[test]
@@ -1755,6 +1804,65 @@ mod tests {
                     cached_tokens: None,
                     completion_tokens: Some(5),
                 }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_only_final_usage_across_multiple_chunks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ola\"}]}}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":2}}}\n\n",
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" mundo\"}]}}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":5,\"cachedContentTokenCount\":400}}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let creds = AntigravityCredentials {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: u64::MAX,
+            project_id: "proj-1".into(),
+            email: None,
+        };
+        let provider = AntigravityProvider::new(creds).with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Text("ola".to_string()),
+                ProviderEvent::Text(" mundo".to_string()),
+                ProviderEvent::Usage {
+                    prompt_tokens: Some(1000),
+                    cached_tokens: Some(400),
+                    completion_tokens: Some(5),
+                },
             ]
         );
     }

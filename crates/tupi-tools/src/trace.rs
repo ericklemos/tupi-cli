@@ -125,6 +125,10 @@ impl Tool for TraceTool {
         let to = arguments.get("to").and_then(Value::as_str).unwrap_or("?");
         format!("trace: {from} -> {to}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

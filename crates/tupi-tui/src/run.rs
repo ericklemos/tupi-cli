@@ -135,6 +135,24 @@ pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyh
                             continue;
                         }
 
+                        match should_toggle_mode(&state, key) {
+                            ToggleAction::Dispatch => {
+                                match buses.commands.dispatch(Command::ToggleMode).await {
+                                    Ok(CommandOutcome::ModeChanged { mode }) => {
+                                        state.apply_mode_changed(mode);
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => state.notice = Some(error.to_string()),
+                                }
+                                continue;
+                            }
+                            ToggleAction::BusyNotice => {
+                                state.notice = Some("aguarde o turno terminar para trocar de modo".to_string());
+                                continue;
+                            }
+                            ToggleAction::Ignore => {}
+                        }
+
                         match key.code {
                             KeyCode::Tab => state.accept_suggestion(),
                             KeyCode::Enter if !state.input.trim().is_empty() => {
@@ -357,6 +375,16 @@ pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyh
                         state.finish_assistant();
                         request = drain_queue(&buses.commands, &mut state).await;
                     }
+                    Ok(Event::ContextUpdated {
+                        request_id,
+                        tokens,
+                        budget,
+                    }) if Some(request_id) == request => {
+                        state.set_context(tokens, budget);
+                    }
+                    Ok(Event::ContextBudget { budget }) => {
+                        state.set_context_budget(budget);
+                    }
                     Ok(Event::ContextTrimmed {
                         request_id,
                         estimate,
@@ -405,6 +433,9 @@ pub async fn run(buses: BusSet, mut model: String, mut provider: String) -> anyh
                     }
                     Ok(Event::ModelsFailed { message }) => {
                         state.fail(&message);
+                    }
+                    Ok(Event::ModeChanged { mode }) => {
+                        state.apply_mode_changed(mode);
                     }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {
@@ -475,6 +506,29 @@ async fn drain_queue(bus: &CommandBus, state: &mut ChatState) -> Option<RequestI
 
 fn scroll_up(state: &mut ChatState, rows: u16) {
     state.scroll = state.scroll.saturating_add(rows);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToggleAction {
+    Dispatch,
+    BusyNotice,
+    Ignore,
+}
+
+fn should_toggle_mode(state: &ChatState, key: crossterm::event::KeyEvent) -> ToggleAction {
+    if state.overlay_open() {
+        return ToggleAction::Ignore;
+    }
+    let is_shift_tab = key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT));
+    if !is_shift_tab {
+        return ToggleAction::Ignore;
+    }
+    if state.processing() {
+        ToggleAction::BusyNotice
+    } else {
+        ToggleAction::Dispatch
+    }
 }
 
 fn scroll_down(state: &mut ChatState, rows: u16) {
@@ -831,6 +885,18 @@ fn draw_details(
     provider: &str,
     area: Rect,
 ) {
+    fn format_compact_tokens(tokens: u64) -> String {
+        if tokens < 1_000 {
+            return tokens.to_string();
+        }
+        let tenths = tokens / 100;
+        if tenths.is_multiple_of(10) {
+            format!("{}k", tenths / 10)
+        } else {
+            format!("{}.{}k", tenths / 10, tenths % 10)
+        }
+    }
+
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -849,8 +915,17 @@ fn draw_details(
         Status::Busy => Color::Red,
     };
 
+    let (mode_badge, mode_color) = match state.mode {
+        tupi_kernel::AgentMode::Sdd => ("[SDD]", Color::Cyan),
+        tupi_kernel::AgentMode::Execution => ("[EXEC]", Color::DarkGray),
+    };
+
     let left = Line::from(vec![
         Span::styled(" ● ", Style::default().fg(state_color)),
+        Span::styled(
+            format!("{mode_badge} "),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(model.to_string(), Style::default().fg(Color::Gray)),
         Span::styled(
             format!("  ·  {provider}  ·  {}", status_label(state.status)),
@@ -858,8 +933,80 @@ fn draw_details(
         ),
     ]);
 
-    let hints = "arraste para selecionar · ctrl+c copia · ctrl+q sai";
-    let hint_width = hints.width() as u16 + 1;
+    let full_hints = "shift+tab: modo · arraste para selecionar · ctrl+c copia · ctrl+q sai";
+    let short_hints = "ctrl+c copia · ctrl+q sai";
+
+    if let Some(ctx) = state.context {
+        let percent = (ctx.budget > 0)
+            .then(|| ((ctx.tokens as f64 / ctx.budget as f64) * 100.0).round() as u64);
+        let ctx_color = match percent {
+            Some(p) if p >= 90 => Color::Red,
+            Some(p) if p >= 75 => Color::Yellow,
+            _ => Color::Gray,
+        };
+        let value = match percent {
+            Some(p) => format!(
+                "{}/{} ({p}%)",
+                format_compact_tokens(ctx.tokens),
+                format_compact_tokens(ctx.budget)
+            ),
+            None => format!("{} tokens", format_compact_tokens(ctx.tokens)),
+        };
+
+        let left_width = left.width() as u16;
+        let ctx_width = ("ctx ".width() + value.width()) as u16;
+        let full_width = full_hints.width() as u16 + 5 + ctx_width;
+        let short_width = short_hints.width() as u16 + 5 + ctx_width;
+
+        let (right_line, right_width) = if area.width >= left_width + 2 + full_width {
+            (
+                Line::from(vec![
+                    Span::styled(
+                        format!("{full_hints}  ·  "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(value, Style::default().fg(ctx_color)),
+                ]),
+                full_width + 1,
+            )
+        } else if area.width >= left_width + 2 + short_width {
+            (
+                Line::from(vec![
+                    Span::styled(
+                        format!("{short_hints}  ·  "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(value, Style::default().fg(ctx_color)),
+                ]),
+                short_width + 1,
+            )
+        } else if area.width > ctx_width + 10 {
+            (
+                Line::from(vec![
+                    Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(value, Style::default().fg(ctx_color)),
+                ]),
+                ctx_width + 1,
+            )
+        } else {
+            frame.render_widget(Paragraph::new(left), area);
+            return;
+        };
+
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(10), Constraint::Length(right_width)]).areas(area);
+
+        frame.render_widget(Paragraph::new(left), left_area);
+        frame.render_widget(
+            Paragraph::new(right_line).alignment(Alignment::Right),
+            right_area,
+        );
+        return;
+    }
+
+    let hint_width = full_hints.width() as u16 + 1;
 
     if area.width > hint_width + 20 {
         let [left_area, right_area] =
@@ -867,7 +1014,7 @@ fn draw_details(
 
         frame.render_widget(Paragraph::new(left), left_area);
         frame.render_widget(
-            Paragraph::new(hints)
+            Paragraph::new(full_hints)
                 .alignment(Alignment::Right)
                 .style(Style::default().fg(Color::DarkGray)),
             right_area,
@@ -2077,5 +2224,125 @@ mod tests {
             assert!(text.width() <= 40);
         }
         assert!(row_text(lines.last().unwrap()).ends_with('…'));
+    }
+
+    #[test]
+    fn draw_details_shows_context_in_bottom_right() {
+        let mut state = ChatState::default();
+        state.set_context(12_450, 32_000);
+
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "gemini-4", "antigravity", frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..100).map(|x| buffer[(x, 0)].symbol()).collect();
+        let trimmed = row.trim_end();
+        assert!(
+            trimmed.ends_with("ctx 12.4k/32k (39%)"),
+            "esperava contexto alinhado à direita, veio: {trimmed:?}"
+        );
+        assert!(row.contains("gemini-4"));
+    }
+
+    #[test]
+    fn draw_details_prioritizes_context_over_hints_when_narrow() {
+        let mut state = ChatState::default();
+        state.set_context(28_800, 32_000);
+
+        let backend = ratatui::backend::TestBackend::new(65, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "modelo", "prov", frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..65).map(|x| buffer[(x, 0)].symbol()).collect();
+        let trimmed = row.trim_end();
+        assert!(
+            trimmed.ends_with("ctx 28.8k/32k (90%)"),
+            "esperava contexto visível mesmo em tela estreita, veio: {trimmed:?}"
+        );
+        let col = (0..65u16)
+            .find(|&x| buffer[(x, 0)].symbol() == "9" && buffer[(x + 1, 0)].symbol() == "0")
+            .unwrap();
+        assert_eq!(buffer[(col, 0)].fg, Color::Red);
+    }
+
+    #[test]
+    fn draw_details_formats_unbounded_context_and_yellow_threshold() {
+        let mut state = ChatState::default();
+        state.set_context(12_450, 0);
+
+        let backend = ratatui::backend::TestBackend::new(80, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "modelo", "prov", frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(row.trim_end().ends_with("ctx 12.4k tokens"), "{row:?}");
+
+        state.set_context(24_000, 32_000);
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "modelo", "prov", frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let col = (0..80u16)
+            .find(|&x| buffer[(x, 0)].symbol() == "7" && buffer[(x + 1, 0)].symbol() == "5")
+            .unwrap();
+        assert_eq!(buffer[(col, 0)].fg, Color::Yellow);
+    }
+
+    #[test]
+    fn draw_details_renders_sdd_badge_when_in_sdd_mode() {
+        let mut state = ChatState::default();
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_details(frame, &state, "modelo", "prov", frame.area()))
+            .unwrap();
+        let exec_row: String = (0..100).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+        assert!(exec_row.contains("[EXEC]"), "{exec_row:?}");
+
+        state.apply_mode_changed(tupi_kernel::AgentMode::Sdd);
+        terminal
+            .draw(|frame| draw_details(frame, &state, "modelo", "prov", frame.area()))
+            .unwrap();
+        let sdd_row: String = (0..100).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+        assert!(sdd_row.contains("[SDD]"), "{sdd_row:?}");
+    }
+
+    #[test]
+    fn shift_tab_helper_blocks_toggle_when_processing_or_overlay_open() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = ChatState::default();
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        let plain_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::Dispatch);
+        assert_eq!(should_toggle_mode(&state, shift_tab), ToggleAction::Dispatch);
+        assert_eq!(should_toggle_mode(&state, plain_tab), ToggleAction::Ignore);
+
+        state.begin_assistant();
+        assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::BusyNotice);
+
+        state.finish_assistant();
+        state.open_overlay("modelos", vec!["a".into()]);
+        assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::Ignore);
     }
 }

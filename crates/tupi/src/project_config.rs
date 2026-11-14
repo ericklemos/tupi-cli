@@ -6,11 +6,27 @@ use thiserror::Error;
 pub const PROJECT_FILE: &str = "ai.project.json";
 const FALLBACK_NAME: &str = "project";
 
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Janela de contexto do modelo, em tokens. Ausente ou zero mantém o
+    /// default de `configs/context.ron`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+}
+
+/// Configuração do projeto.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// Nome do projeto.
     pub name: String,
+    /// Janelas de contexto por modelo. A chave é `provider/modelo`, com
+    /// fallback para apenas o nome do modelo.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelConfig>,
 }
+
 
 #[derive(Debug, Error)]
 pub enum ProjectConfigError {
@@ -94,8 +110,10 @@ pub fn load_or_create(root: &Path) -> ProjectConfig {
 fn fallback(root: &Path) -> ProjectConfig {
     ProjectConfig {
         name: fallback_name(root),
+        models: Default::default(),
     }
 }
+
 
 fn fallback_name(root: &Path) -> String {
     root.file_name()

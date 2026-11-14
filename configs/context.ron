@@ -3,9 +3,9 @@
 // turnos antigos até o alvo, preservando o prefixo cacheado do provedor.
 // budget: 0 desliga a poda e mantém o histórico inteiro.
 (
-    budget: 32000,
+    budget: 64000,
     // Alvo do corte amortizado. Omitido ou 0 equivale a 2/5 do teto.
-    target: 16000,
+    target: 32000,
     // Quantos resultados de tool recentes ficam inteiros antes de encurtar.
-    recent_results: 3,
+    recent_results: 6,
 )

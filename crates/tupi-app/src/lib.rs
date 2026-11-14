@@ -2,6 +2,7 @@ pub mod app;
 pub mod debug;
 pub mod memory;
 pub mod prompt;
+pub mod sdd;
 pub mod store;
 pub mod telemetry;
 pub mod workflow;

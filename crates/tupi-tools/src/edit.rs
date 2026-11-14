@@ -92,7 +92,7 @@ impl EditTool {
             ResolveOutcome::Ambiguous(candidates) => {
                 let rendered: Vec<String> = candidates.iter().map(render_candidate).collect();
                 return Err(ToolError::Ambiguous(format!(
-                    "`{}` aparece {} vezes: {}. Reenvie qualificado.",
+                    "`{}` aparece {} vezes: {}. Reenvie com `nome@linha`.",
                     params.symbol,
                     candidates.len(),
                     rendered.join(", ")
@@ -144,35 +144,38 @@ impl EditTool {
             ToolError::Other(format!("falha ao escrever {}: {error}", path.display()))
         })?;
 
-        let on_disk = std::fs::read_to_string(&path).map_err(|error| {
-            ToolError::Other(format!(
-                "a escrita foi feita, mas a verificação não releu {}: {error}",
-                path.display()
-            ))
-        })?;
+        // Depois da escrita, qualquer divergência restaura o original: um edit
+        // rejeitado nunca pode deixar o arquivo alterado.
+        let on_disk = match std::fs::read_to_string(&path) {
+            Ok(on_disk) => on_disk,
+            Err(error) => {
+                let _ = atomic_write(&path, &original);
+                return Err(ToolError::Other(format!(
+                    "a escrita foi feita, mas a verificação não releu {}: {error}; o arquivo foi restaurado",
+                    path.display()
+                )));
+            }
+        };
         if blake3::hash(on_disk.as_bytes()) != blake3::hash(new_content.as_bytes()) {
+            let _ = atomic_write(&path, &original);
             return Err(ToolError::Other(format!(
-                "verificação pós-escrita falhou: o hash em disco não é o esperado ({})",
+                "verificação pós-escrita falhou: o hash em disco não é o esperado ({}); o arquivo foi restaurado",
                 path.display()
             )));
         }
-        let verified_table = resolver.table(&path, &on_disk)?;
-        let verified = match resolver.resolve(&verified_table, &params.symbol) {
-            ResolveOutcome::Found(span) => span,
-            _ => {
-                return Err(ToolError::Other(
-                    "verificação pós-escrita falhou: o símbolo não re-resolve no arquivo novo"
-                        .to_string(),
-                ));
-            }
-        };
-        let disk_body = &on_disk[verified.body_range.clone()];
-        if disk_body != params.new_body {
+        let verified = resolver
+            .table(&path, &on_disk)?
+            .spans
+            .into_iter()
+            .find(|span| on_disk[span.body_range.clone()].trim() == params.new_body.trim());
+        let Some(verified) = verified else {
+            let _ = atomic_write(&path, &original);
             return Err(ToolError::Other(
-                "verificação pós-escrita falhou: o corpo em disco difere do corpo enviado"
+                "verificação pós-escrita falhou: o bloco em disco não é o enviado; o arquivo foi restaurado"
                     .to_string(),
             ));
-        }
+        };
+        let disk_body = &on_disk[verified.body_range.clone()];
 
         let root = self
             .root_dir
@@ -279,6 +282,31 @@ fn splice(
         ));
     }
 
+    let resolver = SpanResolver::new();
+    let signature = signature.map(str::trim_end);
+    if let Some(signature) = signature {
+        if signature.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "'signature' vazia; nada foi escrito".to_string(),
+            ));
+        }
+        // O cabeçalho novo tem que descrever o mesmo item: trocar o tipo do
+        // símbolo (struct -> impl) produz um arquivo que parseia mas deixa de
+        // conter o alvo, e o erro só apareceria depois da escrita.
+        let probe = format!("{} {{}}\n", signature.trim_end_matches('{').trim_end());
+        let probe_table = resolver.table(Path::new("signature.rs"), &probe)?;
+        let identity = probe_table
+            .spans
+            .first()
+            .map(|probe| (probe.kind.clone(), probe.name.clone()));
+        if identity.as_ref() != Some(&(span.kind.clone(), span.name.clone())) {
+            return Err(ToolError::InvalidArguments(format!(
+                "'signature' mudaria o item; o alvo é '{}'. Nada foi escrito.",
+                render_candidate(span)
+            )));
+        }
+    }
+
     let mut spliced = String::with_capacity(
         content.len() - span.body_range.len() + new_body.len() + signature.map_or(0, str::len) + 1,
     );
@@ -286,19 +314,31 @@ fn splice(
     spliced.push_str(new_body);
     spliced.push_str(&content[span.body_range.end..]);
 
+    let mut body_start = span.body_range.start;
     if let Some(signature) = signature {
-        let signature = signature.trim_end();
-        if signature.is_empty() {
-            return Err(ToolError::InvalidArguments(
-                "`signature` vazia; nada foi escrito".to_string(),
-            ));
-        }
         let mut with_head = String::with_capacity(spliced.len() + signature.len() + 1);
         with_head.push_str(&spliced[..span.head_range.start]);
         with_head.push_str(signature);
         with_head.push(' ');
         with_head.push_str(&spliced[span.body_range.start..]);
         spliced = with_head;
+        body_start = span.head_range.start + signature.len() + 1;
+    }
+
+    // Um 'new_body' que fecha o item e deixa outro código fora dele parseia
+    // sem erro e mudaria o arquivo inteiro. O bloco gravado tem que ser
+    // exatamente o corpo do item que começa em 'body_start'.
+    let spliced_table = resolver.table(Path::new("splice.rs"), &spliced)?;
+    let exact = spliced_table.spans.iter().any(|candidate| {
+        candidate.body_range.start >= body_start
+            && candidate.body_range.end <= body_start + new_body.len()
+            && spliced[candidate.body_range.clone()].trim() == new_body.trim()
+    });
+    if !exact {
+        return Err(ToolError::InvalidArguments(
+            "'new_body' precisa ser exatamente o bloco do símbolo; ele fecharia o item e deixaria outro código fora. Nada foi escrito."
+                .to_string(),
+        ));
     }
 
     Ok(spliced)
@@ -652,5 +692,47 @@ mod tests {
             })),
             "path=auth.rs · symbol=Auth::verify"
         );
+    }
+
+    #[test]
+    fn a_signature_that_would_change_the_item_kind_is_refused() {
+        let dir = fixture();
+        let before = fs::read_to_string(dir.path().join("auth.rs")).unwrap();
+        let mut request = params(&dir, "verify", "{\n    1\n}");
+        request.signature = Some("impl verify".into());
+
+        let error = tool_for(dir.path()).edit(request).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("auth.rs")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_body_that_smuggles_a_second_item_is_refused() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("cache.rs"),
+            "struct Entry {\n    text: String,\n}\n",
+        )
+        .unwrap();
+        let content = fs::read(dir.path().join("cache.rs")).unwrap();
+
+        let error = tool_for(dir.path())
+            .edit(EditParams {
+                path: "cache.rs".into(),
+                symbol: "Entry".into(),
+                expected_hash: hash_prefix(&content),
+                new_body: "{\n    text: String,\n}\n\npub struct Cache {\n    width: usize,\n}"
+                    .into(),
+                signature: None,
+                budget_tokens: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        assert_eq!(fs::read(dir.path().join("cache.rs")).unwrap(), content);
     }
 }

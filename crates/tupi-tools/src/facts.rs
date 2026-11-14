@@ -196,6 +196,10 @@ impl Tool for FactsTool {
             .unwrap_or("?");
         format!("ledger: {action}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 fn render_fact(fact: &memory::Fact) -> String {

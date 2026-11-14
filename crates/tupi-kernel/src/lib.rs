@@ -19,6 +19,8 @@ pub use tool::{
 };
 pub use workflow::WorkflowIndex;
 
+pub use tupi_domain::AgentMode;
+
 #[cfg(test)]
 mod tests {
     use super::*;

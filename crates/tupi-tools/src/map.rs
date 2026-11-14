@@ -231,6 +231,10 @@ impl Tool for MapTool {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
         format!("map: {path} ({depth})")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

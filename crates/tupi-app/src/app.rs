@@ -165,6 +165,200 @@ struct StreamHandle {
     in_flight_count: Arc<AtomicUsize>,
 }
 
+pub mod context {
+    //! Janela de contexto por modelo.
+    //!
+    //! `configs/context.ron` define o default global; `ai.project.json` pode
+    //! declarar, por modelo, uma `context_window` que substitui esse teto. A
+    //! chave é `provider/modelo`, com fallback para apenas o nome do modelo.
+
+    use std::collections::BTreeMap;
+
+    /// Tetos de contexto efetivos de um modelo.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ContextLimits {
+        /// Teto de tokens estimados do contexto enviado ao modelo.
+        pub budget: usize,
+        /// Alvo da poda amortizada. Zero pede o padrão de 2/5 do teto.
+        pub target: usize,
+        /// Quantos resultados de tool recentes ficam inteiros na poda.
+        pub recent_results: usize,
+    }
+
+    impl ContextLimits {
+        /// Default global, o mesmo que `configs/context.ron` entrega.
+        pub fn global() -> Self {
+            Self {
+                budget: tupi_domain::context::DEFAULT_CONTEXT_TOKENS,
+                target: 0,
+                recent_results: tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
+            }
+        }
+    }
+
+    impl Default for ContextLimits {
+        fn default() -> Self {
+            Self::global()
+        }
+    }
+
+    /// Entrada `models.<chave>` de `ai.project.json`.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ModelContext {
+        /// Janela de contexto do modelo, em tokens. Zero ou ausente usa o
+        /// default global.
+        pub context_window: Option<usize>,
+    }
+
+    /// Default global somado às janelas declaradas por modelo.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ContextProfile {
+        /// Default vindo de `configs/context.ron`.
+        pub base: ContextLimits,
+        /// Janelas declaradas por `provider/modelo` ou apenas `modelo`.
+        pub models: BTreeMap<String, ModelContext>,
+    }
+
+    impl ContextProfile {
+        /// Perfil com o default global e nenhuma entrada por modelo.
+        pub fn new(base: ContextLimits) -> Self {
+            Self {
+                base,
+                models: BTreeMap::new(),
+            }
+        }
+
+        /// Declara a janela de um modelo. Ausente ou zero mantém o default.
+        pub fn with_model(mut self, key: impl Into<String>, context_window: Option<usize>) -> Self {
+            self.models.insert(key.into(), ModelContext { context_window });
+            self
+        }
+
+        /// Tetos efetivos de `provider` + `model`.
+        ///
+        /// Precedência: `provider/modelo` exato, depois apenas `modelo`, depois
+        /// o default global. `recent_results` sempre vem da base.
+        pub fn resolve(&self, provider: &str, model: &str) -> ContextLimits {
+            let window = self
+                .lookup(&format!("{provider}/{model}"))
+                .or_else(|| self.lookup(model));
+
+            match window {
+                Some(window) if window > 0 => ContextLimits {
+                    budget: window,
+                    target: target_for(window, self.base),
+                    recent_results: self.base.recent_results,
+                },
+                _ => self.base,
+            }
+        }
+
+        fn lookup(&self, key: &str) -> Option<usize> {
+            self.models.get(key).and_then(|entry| entry.context_window)
+        }
+    }
+
+    /// Alvo proporcional ao default, sem nunca exceder o teto efetivo.
+    fn target_for(window: usize, base: ContextLimits) -> usize {
+        let target = if base.budget == 0 || base.target == 0 {
+            window.saturating_mul(2) / 5
+        } else {
+            ((window as u128) * (base.target as u128) / (base.budget as u128)) as usize
+        };
+
+        target.min(window)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn base(budget: usize, target: usize, recent_results: usize) -> ContextLimits {
+            ContextLimits {
+                budget,
+                target,
+                recent_results,
+            }
+        }
+
+        #[test]
+        fn an_exact_provider_model_entry_wins_over_the_model_fallback() {
+            let profile = ContextProfile::new(base(64_000, 32_000, 6))
+                .with_model("deepseek/deepseek-flash", Some(128_000))
+                .with_model("deepseek-flash", Some(8_000));
+
+            let limits = profile.resolve("deepseek", "deepseek-flash");
+
+            assert_eq!(limits.budget, 128_000);
+            assert_eq!(limits.target, 64_000);
+            assert_eq!(limits.recent_results, 6);
+        }
+
+        #[test]
+        fn a_model_only_entry_applies_to_every_provider() {
+            let profile = ContextProfile::new(base(64_000, 32_000, 6))
+                .with_model("outro/modelo", Some(1_000))
+                .with_model("deepseek-flash", Some(16_000));
+
+            let limits = profile.resolve("deepseek", "deepseek-flash");
+
+            assert_eq!(limits.budget, 16_000);
+            assert_eq!(limits.target, 8_000);
+        }
+
+        #[test]
+        fn without_an_entry_the_base_is_kept() {
+            let profile = ContextProfile::new(base(64_000, 32_000, 6));
+
+            assert_eq!(
+                profile.resolve("deepseek", "deepseek-flash"),
+                base(64_000, 32_000, 6)
+            );
+        }
+
+        #[test]
+        fn a_zero_window_keeps_the_base() {
+            let profile =
+                ContextProfile::new(base(64_000, 32_000, 6)).with_model("deepseek-flash", Some(0));
+
+            assert_eq!(
+                profile.resolve("deepseek", "deepseek-flash"),
+                base(64_000, 32_000, 6)
+            );
+        }
+
+        #[test]
+        fn a_zero_budget_base_falls_back_to_two_fifths() {
+            let profile =
+                ContextProfile::new(base(0, 0, 6)).with_model("deepseek-flash", Some(10_000));
+
+            let limits = profile.resolve("deepseek", "deepseek-flash");
+
+            assert_eq!(limits.budget, 10_000);
+            assert_eq!(limits.target, 4_000);
+        }
+
+        #[test]
+        fn a_zero_target_base_falls_back_to_two_fifths() {
+            let profile =
+                ContextProfile::new(base(64_000, 0, 6)).with_model("deepseek-flash", Some(10_000));
+
+            assert_eq!(profile.resolve("deepseek", "deepseek-flash").target, 4_000);
+        }
+
+        #[test]
+        fn the_target_never_exceeds_the_effective_budget() {
+            let profile =
+                ContextProfile::new(base(8_000, 10_000, 6)).with_model("deepseek-flash", Some(4_000));
+
+            let limits = profile.resolve("deepseek", "deepseek-flash");
+
+            assert_eq!(limits.budget, 4_000);
+            assert_eq!(limits.target, 4_000);
+        }
+    }
+}
+
 pub struct App {
     session: Arc<SessionStore>,
     registry: ProviderRegistry,
@@ -187,6 +381,9 @@ pub struct App {
     context_target: AtomicUsize,
     /// Quantos resultados de tool recentes ficam inteiros na poda.
     context_recent_results: AtomicUsize,
+    /// Default global e janelas por modelo; resolve o budget efetivo de cada
+    /// troca de modelo/provider.
+    context_profile: Arc<context::ContextProfile>,
     /// Correção do orçamento observada no provider (real/estimado em ppm).
     token_scale: Arc<AtomicU64>,
     /// Workflows que /workflows/<nome> pode invocar. Vazio por padrão para
@@ -199,7 +396,10 @@ pub struct App {
     /// Diretório do artefato de depuração com a última mensagem e o payload.
     /// `None` desliga a gravação (testes e construtores antigos).
     debug_dir: Option<std::path::PathBuf>,
+    mode: Arc<std::sync::atomic::AtomicU8>,
+    repo_key: Option<String>,
 }
+
 
 impl App {
     pub fn new(
@@ -209,6 +409,23 @@ impl App {
         events: EventBus,
     ) -> Arc<Self> {
         Self::with_store(registry, provider_id, model, events, None)
+    }
+
+    pub fn with_repo_key(mut self: Arc<Self>, repo_key: String) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("App recém-criado").repo_key = Some(repo_key);
+        self
+    }
+
+    pub fn with_mode_cell(
+        mut self: Arc<Self>,
+        mode: Arc<std::sync::atomic::AtomicU8>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("App recém-criado").mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> tupi_kernel::AgentMode {
+        tupi_kernel::AgentMode::from_u8(self.mode.load(Ordering::SeqCst))
     }
 
     pub fn with_store(
@@ -253,7 +470,7 @@ impl App {
 
         Self::sync_connected_providers(&registry, store.as_ref());
 
-        Arc::new(Self {
+        let app = Arc::new(Self {
             session: Arc::new(SessionStore::new(SESSION_ID)),
             registry,
             provider_id: Arc::new(Mutex::new(provider_id.into())),
@@ -273,13 +490,21 @@ impl App {
             context_recent_results: AtomicUsize::new(
                 tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
             ),
+            context_profile: Arc::new(context::ContextProfile::default()),
             token_scale: Arc::new(AtomicU64::new(SCALE_ONE)),
             workflows: Arc::new(crate::workflow::EmptyIndex),
             telemetry: crate::telemetry::Telemetry::disabled(),
             memory: Arc::new(crate::memory::Memory::disabled()),
             debug_dir: None,
-        })
+            mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                tupi_kernel::AgentMode::Execution.as_u8(),
+            )),
+            repo_key: None,
+        });
+        app.apply_context();
+        app
     }
+
 
     /// Liga o catálogo de workflows lido do projeto, em `tupi-tools`.
     pub fn with_workflows(mut self: Arc<Self>, workflows: Arc<dyn WorkflowIndex>) -> Arc<Self> {
@@ -334,11 +559,42 @@ impl App {
     /// Teto de tokens estimados do contexto enviado ao modelo. Zero desliga a
     /// poda e volta a mandar o histórico inteiro.
     pub fn with_context_budget(mut self: Arc<Self>, context_budget: usize) -> Arc<Self> {
-        Arc::get_mut(&mut self)
-            .expect("App recém-criado")
-            .context_budget = AtomicUsize::new(context_budget);
+        let app = Arc::get_mut(&mut self).expect("App recém-criado");
+        app.context_budget = AtomicUsize::new(context_budget);
+        Arc::make_mut(&mut app.context_profile).base.budget = context_budget;
+        self.apply_context();
         self
     }
+
+    /// Default global e janelas por modelo, tipicamente vindos de
+    /// `configs/context.ron` + `ai.project.json`.
+    pub fn with_context_profile(
+        mut self: Arc<Self>,
+        profile: context::ContextProfile,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .context_profile = Arc::new(profile);
+        self.apply_context();
+        self
+    }
+
+    /// Grava nos atomics os tetos efetivos do modelo/provider atual.
+    pub fn apply_context(&self) {
+        let provider = self.provider_id.lock().unwrap().clone();
+        let model = self.model.lock().unwrap().clone();
+        self.apply_context_for(&provider, &model);
+    }
+
+    fn apply_context_for(&self, provider: &str, model: &str) {
+        let limits = self.context_profile.resolve(provider, model);
+
+        self.context_budget.store(limits.budget, Ordering::SeqCst);
+        self.context_target.store(limits.target, Ordering::SeqCst);
+        self.context_recent_results
+            .store(limits.recent_results, Ordering::SeqCst);
+    }
+
 
     pub fn with_telemetry(
         mut self: Arc<Self>,
@@ -403,8 +659,16 @@ impl App {
             }
         }
 
+        // O novo modelo pode declarar outra janela de contexto em
+        // ai.project.json: recalcula a poda e avisa a TUI sem novo turno.
+        self.apply_context();
+        self.events.publish(Event::ContextBudget {
+            budget: self.context_budget.load(Ordering::SeqCst) as u64,
+        });
+
         Ok(CommandOutcome::ModelChanged { model })
     }
+
 
     fn send_message(&self, text: String) -> Result<CommandOutcome, CommandError> {
         if self
@@ -427,21 +691,17 @@ impl App {
         self.active.store(request_id, Ordering::SeqCst);
 
         let model = self.model.lock().unwrap().clone();
-        let specs = self.tools.specs();
         let tools = self.tools.clone();
-        let prefix = self.prefix.clone();
+        let base_prefix = self.prefix.clone();
+        let mode_cell = Arc::clone(&self.mode);
+        let sdd_store = self.store.clone();
+        let sdd_repo_key = self.repo_key.clone();
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
         let max_tool_steps = self.max_tool_steps;
         let context_budget = self.context_budget.load(Ordering::SeqCst);
         let context_target = self.context_target.load(Ordering::SeqCst);
         let context_recent_results = self.context_recent_results.load(Ordering::SeqCst);
         let token_scale = Arc::clone(&self.token_scale);
-        let tool_tokens = tool_spec_tokens(&specs);
-        let prefix_tokens = if prefix.is_empty() {
-            0
-        } else {
-            tupi_domain::tokens::estimate_message(&Message::new(Role::System, prefix.clone()))
-        };
         let telemetry = self.telemetry.clone();
         let turn_started_at = std::time::Instant::now();
 
@@ -524,6 +784,16 @@ impl App {
                 let final_step = step >= max_tool_steps;
                 let remaining = max_tool_steps.saturating_sub(step);
                 task_partial.lock().unwrap().clear();
+                let current_mode = tupi_kernel::AgentMode::from_u8(mode_cell.load(Ordering::SeqCst));
+                let specs = tools.specs_for_mode(current_mode);
+                let tool_tokens = tool_spec_tokens(&specs);
+                let prefix = crate::sdd::compose_prefix(&base_prefix, current_mode);
+                let prefix_tokens = if prefix.is_empty() {
+                    0
+                } else {
+                    tupi_domain::tokens::estimate_message(&Message::new(Role::System, prefix.clone()))
+                };
+                let mut closed_sdd = false;
 
                 let warning_message = if step >= warn_at.max(1) {
                     let warning = if final_step {
@@ -715,6 +985,11 @@ impl App {
                     let observed = observed_scale(prompt_estimate, charged);
                     let current = token_scale.load(Ordering::SeqCst);
                     token_scale.store(next_scale(current, observed), Ordering::SeqCst);
+                    events.publish(Event::ContextUpdated {
+                        request_id,
+                        tokens: charged.saturating_add(step_completion_tokens.unwrap_or(0)),
+                        budget: context_budget as u64,
+                    });
                 }
 
                 if telemetry.is_enabled() {
@@ -807,7 +1082,11 @@ impl App {
 
                     let tool_started = std::time::Instant::now();
                     let (mut content, ok) =
-                        match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
+                        if current_mode == tupi_kernel::AgentMode::Sdd
+                            && tools.get(&call.name).is_some_and(|t| !t.sdd_allowed())
+                        {
+                            (format!("tool '{}' bloqueada no modo SDD", call.name), false)
+                        } else { match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
                             crate::pipeline::execute(
                                 &tools,
                                 &events,
@@ -831,7 +1110,19 @@ impl App {
                         } {
                             Ok(result) => (result, true),
                             Err(error) => (error, false),
-                        };
+                        } };
+                    if ok
+                        && call.name == "sdd"
+                        && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("action")
+                                    .and_then(|a| a.as_str().map(|s| s == "close"))
+                            })
+                            .unwrap_or(false)
+                    {
+                        closed_sdd = true;
+                    }
                     let tool_summary = summarize(&content);
                     if ok
                         && let Some(block) = memory
@@ -893,6 +1184,24 @@ impl App {
                     pending_calls.retain(|pending| pending.id != call.id);
                 }
                 pending.lock().unwrap().clear();
+                if closed_sdd {
+                    mode_cell.store(tupi_kernel::AgentMode::Execution.as_u8(), Ordering::SeqCst);
+                    events.publish(Event::ModeChanged {
+                        mode: tupi_kernel::AgentMode::Execution,
+                    });
+                    events.publish(Event::Notice {
+                        message: "SDD fechado — modo execução".to_string(),
+                    });
+                    if let (Some(store_ref), Some(rk)) = (&sdd_store, &sdd_repo_key)
+                        && let Ok(Some(slug)) = store_ref.active_sdd_slug(rk)
+                        && let Ok(Some(plan)) = store_ref.load_sdd_plan(rk, &slug)
+                        && plan.status == tupi_store::SddPlanStatus::Closed
+                    {
+                        session.replace_messages(vec![Message::user(
+                            crate::sdd::format_execution_handoff(&plan),
+                        )]);
+                    }
+                }
             }
 
             if !tool_log.is_empty() {
@@ -1163,6 +1472,26 @@ impl CommandHandler for App {
                 Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
                 Command::SetModel { model } => self.set_model(model),
                 Command::Memory { action } => Ok(self.memory_command(action)),
+                Command::ToggleMode => {
+                    if self.active.load(Ordering::SeqCst) != 0 {
+                        return Err(CommandError::Busy);
+                    }
+                    let next = match self.mode() {
+                        tupi_kernel::AgentMode::Execution => tupi_kernel::AgentMode::Sdd,
+                        tupi_kernel::AgentMode::Sdd => tupi_kernel::AgentMode::Execution,
+                    };
+                    self.mode.store(next.as_u8(), Ordering::SeqCst);
+                    self.events.publish(Event::ModeChanged { mode: next });
+                    Ok(CommandOutcome::ModeChanged { mode: next })
+                }
+                Command::SetMode { mode } => {
+                    if self.active.load(Ordering::SeqCst) != 0 {
+                        return Err(CommandError::Busy);
+                    }
+                    self.mode.store(mode.as_u8(), Ordering::SeqCst);
+                    self.events.publish(Event::ModeChanged { mode });
+                    Ok(CommandOutcome::ModeChanged { mode })
+                }
                 Command::NewSession => {
                     let request_id = self.active.swap(0, Ordering::SeqCst);
                     if request_id != 0 {
@@ -2964,6 +3293,41 @@ mod tests {
         }
 
         assert_eq!(usage, Some((Some(2_200), Some(1_700), Some(2))));
+    }
+
+    #[tokio::test]
+    async fn context_updated_reports_latest_step_occupancy_not_cumulative_sum() {
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                text_event("vou ler"),
+                prompt_usage(1_000, 800),
+                calls_event(vec![tool_call("c1", "echo", "{\"n\":1}")]),
+            ],
+            vec![text_event("fim"), prompt_usage(1_200, 900)],
+        ]));
+        let app =
+            app_with_tools(provider, bus, Arc::new(EchoTool::new())).with_context_budget(32_000);
+
+        app.handle(Command::SendMessage {
+            text: "leia".into(),
+        })
+        .await
+        .unwrap();
+
+        let mut updates = Vec::new();
+        for _ in 0..32 {
+            match rx.recv().await.unwrap() {
+                Event::ContextUpdated { tokens, budget, .. } => {
+                    updates.push((tokens, budget));
+                }
+                Event::StreamFinished { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(updates, vec![(1_001, 32_000), (1_201, 32_000)]);
     }
 
     #[tokio::test]

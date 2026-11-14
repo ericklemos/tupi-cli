@@ -18,6 +18,7 @@ fn mutating_tools_are_marked() {
             "edit",
             "move",
             "patch",
+            "sdd",
             "setup",
             "shell",
             "state",

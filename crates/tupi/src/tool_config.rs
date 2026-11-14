@@ -159,5 +159,16 @@ mod tests {
         assert!(exposed.has("edit"));
         assert!(exposed.has("search"));
         assert!(exposed.has("map"));
+        // Todo truncamento manda o modelo chamar a tool de recuperação; ela
+        // precisa existir no conjunto núcleo para o corpo omitido ser recuperável.
+        assert!(
+            exposed.has("peek"),
+            "peek ausente do núcleo: {:?}",
+            exposed
+                .specs()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }

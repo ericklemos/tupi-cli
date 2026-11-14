@@ -149,6 +149,10 @@ impl Tool for WebSearchTool {
             .unwrap_or("?");
         format!("websearch: {query}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 pub mod ast;
+mod backtrack;
 mod budget;
 mod edit;
 mod ledger;
@@ -64,7 +65,14 @@ mod workflow;
 mod write;
 mod write_many;
 /// Opções de composição das tools.
-#[derive(Debug, Clone)]
+pub mod sdd;
+pub use paths::repo_key;
+pub use sdd::{
+    InMemorySddStore, SddPlan, SddPlanStatus, SddStore, SddSubtask, SddSubtaskStatus, SddTask,
+    SddTaskStatus, SddTool,
+};
+
+#[derive(Clone)]
 pub struct ToolsOptions {
     /// Diretório de estado durável. `None` usa o padrão XDG do Tupi.
     pub state_dir: Option<std::path::PathBuf>,
@@ -74,6 +82,10 @@ pub struct ToolsOptions {
     pub exec_cache: bool,
     /// Liga o cache persistente de web.
     pub web_cache: bool,
+    /// Persistência de planos SDD. `None` usa `InMemorySddStore`.
+    pub sdd_store: Option<Arc<dyn crate::sdd::SddStore>>,
+    /// Célula compartilhada com o `AgentMode` ativo (`0=Execution`, `1=Sdd`).
+    pub mode_cell: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl Default for ToolsOptions {
@@ -83,6 +95,8 @@ impl Default for ToolsOptions {
             watcher: true,
             exec_cache: true,
             web_cache: true,
+            sdd_store: None,
+            mode_cell: None,
         }
     }
 }
@@ -95,6 +109,8 @@ impl ToolsOptions {
             watcher: false,
             exec_cache: false,
             web_cache: false,
+            sdd_store: None,
+            mode_cell: None,
         }
     }
 }
@@ -112,6 +128,10 @@ pub fn register_with(
 ) {
     let state_dir = options.state_dir.clone();
     let watcher = options.watcher;
+    let sdd_store = options
+        .sdd_store
+        .unwrap_or_else(|| Arc::new(crate::sdd::InMemorySddStore::default()));
+    let mode_cell = options.mode_cell;
     let store = Arc::new(ResponseStore::new(
         Duration::from_secs(600),
         8 * 1024 * 1024,
@@ -125,6 +145,7 @@ pub fn register_with(
     if watcher {
         start_watcher(&root_dir, graph.clone());
     }
+    let backtrack = Arc::new(crate::backtrack::BacktrackGraph::default());
     let read = Arc::new(
         ReadTool::new(
             root_dir.clone(),
@@ -133,7 +154,8 @@ pub fn register_with(
             DEFAULT_BUDGET_TOKENS,
         )
         .with_parse_cache(parse_cache.clone())
-        .with_graph_cache(graph.clone()),
+        .with_graph_cache(graph.clone())
+        .with_backtrack(backtrack.clone()),
     );
 
     registry.register(read.clone());
@@ -145,7 +167,9 @@ pub fn register_with(
             ledger,
             DEFAULT_BUDGET_TOKENS,
         )
-        .with_parse_cache(parse_cache),
+        .with_parse_cache(parse_cache)
+        .with_graph_cache(graph.clone())
+        .with_backtrack(backtrack),
     ));
     registry.register(Arc::new(WorkflowTool::new(
         root_dir.clone(),
@@ -267,6 +291,15 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
+    registry.register(Arc::new(
+        crate::sdd::SddTool::new(
+            root_dir.clone(),
+            sdd_store,
+            mode_cell,
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_response_store(store.clone()),
+    ));
     let state = match state_dir {
         Some(dir) => crate::state::StateTool::with_state_dir_and_store(
             root_dir.clone(),
@@ -303,6 +336,12 @@ fn start_watcher(root: &std::path::Path, cache: Arc<crate::graph::GraphCache>) {
     if watchers.contains_key(&key) {
         return;
     }
+    // Aquece o grafo fora do caminho crítico: a primeira leitura de símbolo
+    // não paga a construção completa do projeto.
+    let warm = cache.clone();
+    std::thread::spawn(move || {
+        let _ = warm.get();
+    });
     if let Ok(watcher) = crate::graph::GraphWatcher::start(key.clone(), cache) {
         watchers.insert(key, watcher);
     }
@@ -328,7 +367,9 @@ impl Exposure<'_> {
     /// `true` se `name` fica exposta ao modelo neste perfil.
     fn admits(&self, name: &str) -> bool {
         match self {
-            Self::Core => CORE_TOOLS.contains(&name),
+            // A tool de recuperação é a saída de emergência de todo
+            // truncamento: sem ela no núcleo, o corpo omitido fica inalcançável.
+            Self::Core => CORE_TOOLS.contains(&name) || name == "sdd" || name == "peek",
             Self::All => true,
             Self::Only(names) => names.iter().any(|wanted| wanted == name),
         }
@@ -341,11 +382,131 @@ pub fn register_exposed(
     registry: &mut ToolRegistry,
     exposure: Exposure<'_>,
 ) {
+    register_exposed_with(root_dir, registry, exposure, ToolsOptions::default());
+}
+
+pub use state::{StateEntry, default_state_dir, read_entries_for_root as read_state_entries};
+
+pub fn register_exposed_with(
+    root_dir: std::path::PathBuf,
+    registry: &mut ToolRegistry,
+    exposure: Exposure<'_>,
+    options: ToolsOptions,
+) {
     let mut staged = ToolRegistry::new();
-    register(root_dir, &mut staged);
+    register_with(root_dir, &mut staged, options);
     for tool in staged.into_tools() {
         if exposure.admits(&tool.spec().name) {
             registry.register(tool);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn register_with_shares_backtrack_between_read_and_search() {
+        let dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "pub fn alpha_one() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "pub fn alpha_two() -> u8 {\n    2\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("token.rs"),
+            "pub fn decode_jwt(raw: &str) -> bool {\n    !raw.is_empty()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("auth.rs"),
+            "use crate::token::decode_jwt;\n\npub fn verify_token(raw: &str) -> bool {\n    decode_jwt(raw)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("api.rs"),
+            "use crate::auth::verify_token;\n\npub fn login(raw: &str) -> bool {\n    verify_token(raw)\n}\n",
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        register_with(
+            dir.path().to_path_buf(),
+            &mut registry,
+            ToolsOptions::hermetic(state_dir.path().to_path_buf()),
+        );
+
+        let read = registry.get("read").unwrap();
+        let search = registry.get("search").unwrap();
+
+        read.call(serde_json::json!({ "path": "a.rs" })).unwrap();
+        let search_alpha = search
+            .call(serde_json::json!({ "query": "alpha" }))
+            .unwrap();
+        assert!(search_alpha.contains("1. `alpha_two`"), "{search_alpha}");
+        assert!(search_alpha.contains("2. `alpha_one`"), "{search_alpha}");
+
+        search
+            .call(serde_json::json!({ "query": "verify_token" }))
+            .unwrap();
+        read.call(serde_json::json!({ "path": "token.rs", "symbol": "decode_jwt" }))
+            .unwrap();
+        let revisit = read
+            .call(serde_json::json!({ "path": "auth.rs", "symbol": "verify_token" }))
+            .unwrap();
+        assert!(revisit.contains("Já entregue nesta sessão"), "{revisit}");
+        assert!(revisit.contains("> **Backtrack**:"), "{revisit}");
+        assert!(revisit.contains("decode_jwt"), "{revisit}");
+        assert!(revisit.contains("login"), "{revisit}");
+    }
+
+    #[test]
+    fn sdd_mode_tool_list_excludes_all_workspace_mutators() {
+        let dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        register_with(
+            dir.path().to_path_buf(),
+            &mut registry,
+            ToolsOptions::hermetic(state_dir.path().to_path_buf()),
+        );
+
+        let sdd_names: Vec<String> = registry
+            .specs_for_mode(tupi_kernel::AgentMode::Sdd)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
+        for required in ["sdd", "read", "read_many", "search", "map", "peek"] {
+            assert!(
+                sdd_names.iter().any(|n| n == required),
+                "esperava {required} em SDD: {sdd_names:?}"
+            );
+        }
+        for forbidden in [
+            "edit",
+            "write",
+            "write_many",
+            "move",
+            "patch",
+            "exec",
+            "test_many",
+            "shell",
+            "setup",
+            "state",
+        ] {
+            assert!(
+                !sdd_names.iter().any(|n| n == forbidden),
+                "não deveria permitir {forbidden} em SDD: {sdd_names:?}"
+            );
         }
     }
 }

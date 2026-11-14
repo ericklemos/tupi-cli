@@ -29,13 +29,22 @@ pub(crate) struct Rendered {
 }
 
 #[derive(Clone)]
-pub(crate) struct Pending {
-    path: PathBuf,
-    id: String,
-    file_hash: Hash,
-    text: String,
-    complete: bool,
-    omitted: bool,
+pub(crate) enum Pending {
+    Symbol {
+        path: PathBuf,
+        id: String,
+        file_hash: Hash,
+        text: String,
+        complete: bool,
+        omitted: bool,
+        relative: String,
+        neighbors: Vec<crate::backtrack::NeighborRef>,
+    },
+    Outline {
+        relative: String,
+        file_hash: Hash,
+        symbols: Vec<String>,
+    },
 }
 
 /// Lê um arquivo como esqueleto, ou um símbolo, em vez do arquivo inteiro.
@@ -46,6 +55,7 @@ pub struct ReadTool {
     default_budget_tokens: usize,
     chunker: AstChunker,
     graph: Option<Arc<crate::graph::GraphCache>>,
+    backtrack: Arc<crate::backtrack::BacktrackGraph>,
 }
 
 impl ReadTool {
@@ -62,6 +72,7 @@ impl ReadTool {
             default_budget_tokens,
             chunker: AstChunker::new(),
             graph: None,
+            backtrack: Arc::new(crate::backtrack::BacktrackGraph::default()),
         }
     }
 
@@ -72,6 +83,11 @@ impl ReadTool {
 
     pub fn with_graph_cache(mut self, graph: Arc<crate::graph::GraphCache>) -> Self {
         self.graph = Some(graph);
+        self
+    }
+
+    pub fn with_backtrack(mut self, backtrack: Arc<crate::backtrack::BacktrackGraph>) -> Self {
+        self.backtrack = backtrack;
         self
     }
 
@@ -256,11 +272,22 @@ impl ReadTool {
                 symbol,
                 params.repeat.as_deref() == Some("allow"),
             ),
-            None => Ok(self.outline_sections(path, content, relative)),
+            None => Ok(self.outline_sections(
+                path,
+                content,
+                relative,
+                params.repeat.as_deref() == Some("allow"),
+            )),
         }
     }
 
-    fn outline_sections(&self, path: &Path, content: &str, relative: &str) -> Vec<Rendered> {
+    fn outline_sections(
+        &self,
+        path: &Path,
+        content: &str,
+        relative: &str,
+        repeat_allowed: bool,
+    ) -> Vec<Rendered> {
         let snippets = self.chunker.snippets(path, content);
         if snippets.is_empty() {
             return vec![Rendered {
@@ -268,6 +295,45 @@ impl ReadTool {
                 pending: None,
             }];
         }
+
+        let file_hash = ledger::content_hash(content);
+        let short = ledger::short_hash(&file_hash);
+        if !repeat_allowed
+            && let Some((opened, unopened)) = self.backtrack.outline_summary(relative, &file_hash)
+        {
+            let mut body = format!(
+                "> **Esqueleto já entregue nesta sessão** (blake3 `{short}`). Use `repeat: \"allow\"` para reexibir ou leia um símbolo específico.\n"
+            );
+            let mut parts = Vec::new();
+            if !opened.is_empty() {
+                parts.push(format!("já abertos: {}", format_symbol_list(&opened, 8)));
+            }
+            if !unopened.is_empty() {
+                parts.push(format!(
+                    "ainda não abertos: {}",
+                    format_symbol_list(&unopened, 8)
+                ));
+            }
+            if !parts.is_empty() {
+                body.push_str(&format!("> **Backtrack**: {}\n", parts.join(" | ")));
+            }
+            return vec![Rendered {
+                section: Section {
+                    heading: format!(
+                        "### `{relative}` — {} linhas · blake3 `{short}`",
+                        content.lines().count()
+                    ),
+                    body,
+                    priority: 255,
+                },
+                pending: None,
+            }];
+        }
+
+        let symbols: Vec<String> = snippets
+            .iter()
+            .map(|snippet| snippet.qualified_name.clone())
+            .collect();
 
         let mut sections: Vec<Rendered> = snippets
             .into_iter()
@@ -296,14 +362,17 @@ impl ReadTool {
             Rendered {
                 section: Section {
                     heading: format!(
-                        "### `{relative}` — {} linhas · blake3 `{}`",
-                        content.lines().count(),
-                        ledger::short_hash(&ledger::content_hash(content))
+                        "### `{relative}` — {} linhas · blake3 `{short}`",
+                        content.lines().count()
                     ),
                     body: String::new(),
                     priority: 255,
                 },
-                pending: None,
+                pending: Some(Pending::Outline {
+                    relative: relative.to_string(),
+                    file_hash,
+                    symbols,
+                }),
             },
         );
         sections
@@ -338,15 +407,7 @@ impl ReadTool {
             );
             let fence = format!("```rust\n{}\n```\n", snippet.code);
             let mut body = fence.clone();
-
-            let mut pending = Pending {
-                path: path.to_path_buf(),
-                id: snippet.qualified_name.clone(),
-                file_hash,
-                text: snippet.code.clone(),
-                complete: true,
-                omitted: false,
-            };
+            let mut omitted = false;
 
             if !repeat_allowed {
                 match self.ledger.check(
@@ -359,7 +420,14 @@ impl ReadTool {
                     Verdict::Seen(seen) => {
                         let handle = self.live_handle(&seen, path, &snippet.qualified_name);
                         body = ledger::pointer_body(&seen, &handle);
-                        pending.omitted = true;
+                        if let Some(hint) = self
+                            .backtrack
+                            .backtrack_hint(relative, &snippet.qualified_name)
+                            && let Some(line) = hint.format_line()
+                        {
+                            body.push_str(&line);
+                        }
+                        omitted = true;
                     }
                     Verdict::Changed(changed) => {
                         body = ledger::changed_body(&changed);
@@ -371,18 +439,9 @@ impl ReadTool {
                 }
             }
 
-            let show_neighbors = !pending.omitted;
-            sections.push(Rendered {
-                section: Section {
-                    heading,
-                    body,
-                    priority: 255,
-                },
-                pending: Some(pending),
-            });
-
-            if show_neighbors
-                && let Some(graph) = &graph
+            let mut neighbor_refs: Vec<crate::backtrack::NeighborRef> = Vec::new();
+            let mut neighbor_lines = Vec::new();
+            if let Some(graph) = &graph
                 && let Some(def) = graph.defs.iter().find(|def| {
                     def.relative == relative
                         && (def.qualified == snippet.qualified_name
@@ -390,30 +449,62 @@ impl ReadTool {
                                 && def.start_line == snippet.start_line))
                 })
             {
-                let mut lines = Vec::new();
                 let callees = graph.callees_for(def);
-                if !callees.is_empty() {
-                    lines.push(format_neighbors("chama", &callees));
-                }
-                let callers = graph.callers_for(def);
-                if !callers.is_empty() {
-                    lines.push(format_neighbors("chamado por", &callers));
-                }
-                if !lines.is_empty() {
-                    let first = lines.remove(0);
-                    sections.push(Rendered {
-                        section: Section {
-                            heading: first,
-                            body: if lines.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{}\n", lines.join("\n"))
-                            },
-                            priority: 180,
-                        },
-                        pending: None,
+                for callee in &callees {
+                    neighbor_refs.push(crate::backtrack::NeighborRef {
+                        relative: callee.relative.clone(),
+                        symbol: callee.qualified.clone(),
+                        line: callee.start_line,
                     });
                 }
+                if !omitted && !callees.is_empty() {
+                    neighbor_lines.push(format_neighbors("chama", &callees));
+                }
+                let callers = graph.callers_for(def);
+                for caller in &callers {
+                    neighbor_refs.push(crate::backtrack::NeighborRef {
+                        relative: caller.relative.clone(),
+                        symbol: caller.qualified.clone(),
+                        line: caller.start_line,
+                    });
+                }
+                if !omitted && !callers.is_empty() {
+                    neighbor_lines.push(format_neighbors("chamado por", &callers));
+                }
+            }
+
+            sections.push(Rendered {
+                section: Section {
+                    heading,
+                    body,
+                    priority: 255,
+                },
+                pending: Some(Pending::Symbol {
+                    path: path.to_path_buf(),
+                    id: snippet.qualified_name.clone(),
+                    file_hash,
+                    text: snippet.code.clone(),
+                    complete: true,
+                    omitted,
+                    relative: relative.to_string(),
+                    neighbors: neighbor_refs,
+                }),
+            });
+
+            if !omitted && !neighbor_lines.is_empty() {
+                let first = neighbor_lines.remove(0);
+                sections.push(Rendered {
+                    section: Section {
+                        heading: first,
+                        body: if neighbor_lines.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}\n", neighbor_lines.join("\n"))
+                        },
+                        priority: 180,
+                    },
+                    pending: None,
+                });
             }
         }
         Ok(sections)
@@ -464,12 +555,10 @@ impl ReadTool {
 
         let mut tally: HashMap<(&Path, &str), (usize, usize)> = HashMap::new();
         for rendered in rendered {
-            let Some(pending) = &rendered.pending else {
+            let Some(Pending::Symbol { path, id, .. }) = &rendered.pending else {
                 continue;
             };
-            let entry = tally
-                .entry((pending.path.as_path(), pending.id.as_str()))
-                .or_insert((0, 0));
+            let entry = tally.entry((path.as_path(), id.as_str())).or_insert((0, 0));
             entry.0 += 1;
             if included.contains(rendered.section.heading.as_str()) {
                 entry.1 += 1;
@@ -481,26 +570,76 @@ impl ReadTool {
             let Some(pending) = &rendered.pending else {
                 continue;
             };
-            let key = (pending.path.as_path(), pending.id.as_str());
-            if !handled.insert(key) {
-                continue;
-            }
-            let (total, seen) = tally.get(&key).copied().unwrap_or((1, 0));
-            if seen == 0 {
-                continue;
-            }
-            if seen < total || pending.omitted {
-                self.ledger.note_omitted(&pending.path, &pending.id);
-            } else {
-                self.ledger.record(Delivery {
-                    tool: "read",
-                    path: &pending.path,
-                    id: &pending.id,
-                    file_hash: pending.file_hash,
-                    text: &pending.text,
-                    complete: pending.complete,
-                    handle: None,
-                });
+            match pending {
+                Pending::Outline {
+                    relative,
+                    file_hash,
+                    symbols,
+                } => {
+                    if !included.contains(rendered.section.heading.as_str()) {
+                        continue;
+                    }
+                    self.backtrack.record_visit(
+                        relative,
+                        crate::backtrack::OUTLINE_SYMBOL,
+                        *file_hash,
+                        crate::backtrack::VisitLevel::BodySeen,
+                        Some("read: outline"),
+                    );
+                    for sym in symbols {
+                        self.backtrack.record_visit(
+                            relative,
+                            sym,
+                            *file_hash,
+                            crate::backtrack::VisitLevel::SignatureSeen,
+                            Some("read: outline"),
+                        );
+                    }
+                }
+                Pending::Symbol {
+                    path,
+                    id,
+                    file_hash,
+                    text,
+                    complete,
+                    omitted,
+                    relative,
+                    neighbors,
+                } => {
+                    let key = (path.as_path(), id.as_str());
+                    if !handled.insert(key) {
+                        continue;
+                    }
+                    let (_, seen) = tally.get(&key).copied().unwrap_or((1, 0));
+                    if seen == 0 {
+                        continue;
+                    }
+                    // Entrega parcial pelo orçamento ainda é entrega: registrar
+                    // aqui faz a próxima leitura devolver um ponteiro com handle
+                    // em vez de repetir o mesmo trecho truncado.
+                    if *omitted {
+                        self.ledger.note_omitted(path, id);
+                    } else {
+                        self.ledger.record(Delivery {
+                            tool: "read",
+                            path,
+                            id,
+                            file_hash: *file_hash,
+                            text,
+                            complete: *complete,
+                            handle: None,
+                        });
+                        self.backtrack.record_visit(
+                            relative,
+                            id,
+                            *file_hash,
+                            crate::backtrack::VisitLevel::BodySeen,
+                            Some("read"),
+                        );
+                        self.backtrack
+                            .record_neighbors(relative, id, *file_hash, neighbors);
+                    }
+                }
             }
         }
     }
@@ -597,6 +736,10 @@ impl Tool for ReadTool {
         } else {
             parts.join(" · ")
         }
+    }
+
+    fn sdd_allowed(&self) -> bool {
+        true
     }
 }
 
@@ -1087,6 +1230,102 @@ mod tests {
         assert!(!second.contains("> chama:"), "{second}");
         assert!(!second.contains("> chamado por:"), "{second}");
     }
+
+    #[test]
+    fn a_second_outline_read_of_an_unchanged_file_is_a_pointer_with_backtrack_summary() {
+        let dir = fixture();
+        let tool = tool_for(dir.path());
+
+        let first = read(&tool, "auth.rs", None, None, None).unwrap();
+        assert!(first.contains("pub fn verify_token"), "{first}");
+        assert!(first.contains("pub fn logout"), "{first}");
+
+        read(&tool, "auth.rs", Some("verify_token"), None, None).unwrap();
+
+        let second = read(&tool, "auth.rs", None, None, None).unwrap();
+        assert!(
+            second.contains("Esqueleto já entregue nesta sessão"),
+            "{second}"
+        );
+        assert!(second.contains("já abertos: `verify_token`"), "{second}");
+        assert!(second.contains("ainda não abertos: `logout`"), "{second}");
+        assert!(!second.contains("pub fn logout"), "{second}");
+
+        let repeated = read(&tool, "auth.rs", None, None, Some("allow")).unwrap();
+        assert!(repeated.contains("pub fn verify_token"), "{repeated}");
+        assert!(repeated.contains("pub fn logout"), "{repeated}");
+    }
+
+    #[test]
+    fn revisiting_a_symbol_with_graph_neighbors_shows_backtrack_frontier() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("token.rs"),
+            "pub fn decode_jwt(raw: &str) -> bool {\n    !raw.is_empty()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("auth.rs"),
+            "use crate::token::decode_jwt;\n\npub fn verify_token(raw: &str) -> bool {\n    decode_jwt(raw)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("api.rs"),
+            "use crate::auth::verify_token;\n\npub fn login(raw: &str) -> bool {\n    verify_token(raw)\n}\n",
+        )
+        .unwrap();
+
+        let graph = crate::graph::GraphCache::shared(dir.path());
+        let tool = tool_for(dir.path()).with_graph_cache(graph);
+
+        read(&tool, "auth.rs", Some("verify_token"), None, None).unwrap();
+        read(&tool, "token.rs", Some("decode_jwt"), None, None).unwrap();
+
+        let revisit = read(&tool, "auth.rs", Some("verify_token"), None, None).unwrap();
+        assert!(revisit.contains("Já entregue nesta sessão"), "{revisit}");
+        assert!(revisit.contains("> **Backtrack**:"), "{revisit}");
+        assert!(revisit.contains("já abertos:"), "{revisit}");
+        assert!(revisit.contains("decode_jwt"), "{revisit}");
+        assert!(revisit.contains("fronteira ainda não aberta:"), "{revisit}");
+        assert!(revisit.contains("login"), "{revisit}");
+        assert!(!revisit.contains("> chama:"), "{revisit}");
+        assert!(!revisit.contains("> chamado por:"), "{revisit}");
+    }
+
+    #[test]
+    fn a_line_suffix_selects_one_of_two_identical_impls() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("cache.rs"),
+            "impl Cache {\n    fn first(&self) {}\n}\n\nimpl Cache {\n    fn second(&self) {}\n}\n",
+        )
+        .unwrap();
+        let tool = tool_for(dir.path());
+
+        let text = read(&tool, "cache.rs", Some("impl Cache@5"), None, None).unwrap();
+
+        assert!(text.contains("fn second"), "{text}");
+        assert!(!text.contains("fn first"), "{text}");
+    }
+
+    #[test]
+    fn a_budget_truncated_symbol_is_a_pointer_on_the_next_read() {
+        let dir = tempdir().unwrap();
+        let mut source = String::from("pub fn big() {\n");
+        for index in 0..120 {
+            source.push_str(&format!("    let v{index} = {index};\n"));
+        }
+        source.push_str("}\n");
+        fs::write(dir.path().join("big.rs"), source).unwrap();
+        let tool = tool_for(dir.path());
+
+        let first = read(&tool, "big.rs", Some("big"), Some(60), None).unwrap();
+        assert!(first.contains("Resposta truncada"), "{first}");
+
+        let second = read(&tool, "big.rs", Some("big"), None, None).unwrap();
+        assert!(second.contains("Já entregue nesta sessão"), "{second}");
+        assert!(!second.contains("let v0"), "{second}");
+    }
 }
 
 const MAX_NEIGHBORS: usize = 6;
@@ -1105,5 +1344,14 @@ fn format_neighbors(label: &str, defs: &[&crate::graph::Def]) -> String {
         )
     } else {
         format!("> {label}: {}", items.join(", "))
+    }
+}
+
+fn format_symbol_list(symbols: &[String], max: usize) -> String {
+    let items: Vec<String> = symbols.iter().take(max).map(|s| format!("`{s}`")).collect();
+    if symbols.len() > max {
+        format!("{}, +{} mais", items.join(", "), symbols.len() - max)
+    } else {
+        items.join(", ")
     }
 }

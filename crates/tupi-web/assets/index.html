@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tupi — dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="identity">
+        <strong>tupi</strong>
+        <span id="session-model">—</span>
+        <span id="session-provider" class="muted"></span>
+      </div>
+      <div class="status">
+        <span id="stream-status" class="badge offline">desconectado</span>
+        <span id="context-usage" class="muted">contexto —</span>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button data-tab="graph" class="active">Grafo</button>
+      <button data-tab="memory">Memória &amp; Fatos</button>
+      <button data-tab="session">Sessão &amp; Telemetria</button>
+      <button data-tab="workspace">Workspace</button>
+    </nav>
+
+    <main>
+      <section id="panel-graph" class="panel active">
+        <div class="graph-controls">
+          <input id="graph-search" type="search" placeholder="símbolo ou arquivo" />
+          <button id="graph-search-run">Buscar</button>
+          <input id="trace-from" placeholder="trace de" />
+          <input id="trace-to" placeholder="até" />
+          <button id="trace-run">Rota</button>
+        </div>
+        <div class="graph-layout">
+          <canvas id="graph-canvas" width="900" height="560"></canvas>
+          <aside class="graph-side">
+            <div id="graph-summary" class="muted">grafo ainda não carregado</div>
+            <ul id="graph-results"></ul>
+            <div id="graph-detail"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="panel-memory" class="panel">
+        <div class="columns">
+          <div>
+            <h2>Fatos ativos</h2>
+            <ul id="facts-active"></ul>
+            <h2>Esquecidos</h2>
+            <ul id="facts-forgotten"></ul>
+          </div>
+          <div>
+            <h2>Pendências abertas</h2>
+            <ul id="pendings-open"></ul>
+            <h2>Pendências fechadas</h2>
+            <ul id="pendings-closed"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-session" class="panel">
+        <div class="cards" id="session-cards"></div>
+        <h2>Linha do tempo</h2>
+        <ul id="timeline"></ul>
+      </section>
+
+      <section id="panel-workspace" class="panel">
+        <div class="columns">
+          <div>
+            <h2>Notas e tarefas</h2>
+            <ul id="state-entries"></ul>
+          </div>
+          <div>
+            <h2>Workflows</h2>
+            <ul id="workflow-list"></ul>
+            <h2>Mensagens</h2>
+            <ul id="history-list"></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

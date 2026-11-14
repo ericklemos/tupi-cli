@@ -335,12 +335,6 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
         summary.push_str(&clip(block, 1_600, 200));
         summary.push_str("\n\x7e\x7e\x7e\n");
     }
-    if diag.errors.len() > MAX_ERRORS_SHOWN {
-        summary.push_str(&format!(
-            "\n(+{} erros na saida completa)\n",
-            diag.errors.len() - MAX_ERRORS_SHOWN
-        ));
-    }
     for block in diag.warnings.iter().take(MAX_WARNINGS_SHOWN) {
         summary.push_str("\n\x7e\x7e\x7etext\n");
         summary.push_str(&clip(block, 1_000, 0));
@@ -353,13 +347,28 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
         priority: 255,
     }];
 
+    // Os erros do compilador são o payload: um teto no resumo não pode
+    // esconder o oitavo erro atrás de uma seção que o orçamento descarta.
+    let mut remaining_errors = String::new();
+    for block in diag.errors.iter().skip(MAX_ERRORS_SHOWN) {
+        remaining_errors.push_str("\n\x7e\x7e\x7etext\n");
+        remaining_errors.push_str(&clip(block, 1_600, 200));
+        remaining_errors.push_str("\n\x7e\x7e\x7e\n");
+    }
+    if !remaining_errors.is_empty() {
+        sections.push(Section {
+            heading: "#### erros restantes".to_string(),
+            body: remaining_errors,
+            priority: 200,
+        });
+    }
+
     let combined = format!(
         "{}\n{}",
         clip(raw.stderr.trim_end(), 8_000, 2_000),
         clip(raw.stdout.trim_end(), 8_000, 8_000)
     );
-    let needs_detail = diag.errors.len() > MAX_ERRORS_SHOWN
-        || diag.warnings.len() > MAX_WARNINGS_SHOWN
+    let needs_detail = diag.warnings.len() > MAX_WARNINGS_SHOWN
         || raw.stdout.contains("failures:")
         || (!raw.success && diag.errors.is_empty() && !combined.trim().is_empty());
 
@@ -671,5 +680,37 @@ mod tests {
         }
         assert!(fingerprint(dir.path(), 10).is_some());
         assert!(fingerprint(dir.path(), 3).is_none());
+    }
+
+    #[test]
+    fn every_compiler_error_reaches_the_model() {
+        let mut stderr = String::new();
+        for index in 0..40 {
+            stderr.push_str(&format!(
+                "error[E{index:04}]: falha {index}\n --> src/a.rs:1:1\n\n"
+            ));
+        }
+        let raw = Output {
+            stdout: String::new(),
+            stderr,
+            success: false,
+            timed_out: false,
+            duration: Duration::from_millis(1),
+        };
+        let args = build_args(&params(ExecKind::Check)).unwrap();
+        let sections = sections_for(&args, &raw, false);
+        let important: String = sections
+            .iter()
+            .filter(|section| section.priority >= 200)
+            .map(|section| section.body.as_str())
+            .collect();
+
+        for index in 0..40 {
+            let code = format!("E{index:04}");
+            assert!(
+                important.contains(&code),
+                "erro {code} não chegou ao modelo"
+            );
+        }
     }
 }

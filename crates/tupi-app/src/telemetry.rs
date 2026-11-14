@@ -582,6 +582,14 @@ impl CommandInfo {
                 extra: None,
                 model: None,
             },
+            Command::ToggleMode | Command::SetMode { .. } => Self {
+                command: "set_mode".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: None,
+                model: None,
+            },
             Command::RefreshModels => Self {
                 command: "refresh_models".to_string(),
                 request: None,
@@ -663,6 +671,7 @@ impl CommandInfo {
                         CommandOutcome::Cancelled => "cancelled",
                         CommandOutcome::ModelChanged { .. } => "model_changed",
                         CommandOutcome::ShowPrompts { .. } => "show_prompts",
+                        CommandOutcome::ModeChanged { .. } => "mode_changed",
                         CommandOutcome::SessionReset => "session_reset",
                         CommandOutcome::Memory { .. } => "memory",
                         CommandOutcome::MemoryToggled { .. } => "memory_toggled",
@@ -685,6 +694,7 @@ impl CommandInfo {
                         finished.enabled = Some(*enabled);
                     }
                     CommandOutcome::Cancelled
+                    | CommandOutcome::ModeChanged { .. }
                     | CommandOutcome::Memory { .. }
                     | CommandOutcome::MemoryForgotten { .. }
                     | CommandOutcome::SessionReset
@@ -823,6 +833,12 @@ pub fn clip(text: &str) -> Clipped {
 
 pub fn clip_preview(text: &str) -> Clipped {
     clip_to(text, PROMPT_PREVIEW_BYTES)
+}
+
+/// O envelope de truncamento das tools conta como resultado truncado,
+/// mesmo quando o payload inteiro coube no clip.
+pub fn truncated(content: &str, clipped: bool) -> bool {
+    clipped || content.contains("Resposta truncada")
 }
 
 fn clip_to(text: &str, max_bytes: usize) -> Clipped {
@@ -1169,5 +1185,12 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 10);
         assert_eq!(stats.cached_tokens, 2);
         assert_eq!(stats.completion_tokens, 3);
+    }
+
+    #[test]
+    fn the_truncation_envelope_counts_as_truncated() {
+        assert!(truncated("> Resposta truncada: 2 seções omitidas", false));
+        assert!(truncated("texto", true));
+        assert!(!truncated("texto", false));
     }
 }

@@ -194,6 +194,10 @@ impl Tool for ContextTool {
             .unwrap_or("?");
         format!("context_graph: {target}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

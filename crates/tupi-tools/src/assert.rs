@@ -180,6 +180,10 @@ impl Tool for AssertTool {
         let kind = arguments.get("kind").and_then(Value::as_str).unwrap_or("?");
         format!("assert: {kind} {symbol}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

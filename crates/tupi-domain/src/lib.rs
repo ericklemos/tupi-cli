@@ -98,6 +98,29 @@ impl Session {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum AgentMode {
+    #[default]
+    Execution,
+    Sdd,
+}
+
+impl AgentMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Execution => 0,
+            Self::Sdd => 1,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Sdd,
+            _ => Self::Execution,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Token {
@@ -109,6 +132,17 @@ pub enum Event {
         prompt_tokens: Option<u64>,
         cached_tokens: Option<u64>,
         completion_tokens: Option<u64>,
+    },
+    /// Ocupação atual da janela de contexto observada no último passo.
+    ContextUpdated {
+        request_id: RequestId,
+        tokens: u64,
+        budget: u64,
+    },
+    /// Novo teto de contexto depois de trocar de modelo. Não traz ocupação:
+    /// só o budget muda, sem inventar tokens.
+    ContextBudget {
+        budget: u64,
     },
     StreamFailed {
         request_id: RequestId,
@@ -154,7 +188,11 @@ pub enum Event {
         /// true: entra no fim do turno; antes da resposta.
         after: bool,
     },
+    ModeChanged {
+        mode: AgentMode,
+    },
 }
+
 
 #[cfg(test)]
 mod tests {

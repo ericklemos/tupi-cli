@@ -1,4 +1,4 @@
-# Tupi
+apena# Tupi
 
 Chat de terminal em Rust, com TUI (ratatui), streaming e tools de leitura,
 busca, edição, escrita, execução e grafo de chamadas. O modelo trabalha no

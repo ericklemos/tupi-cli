@@ -177,6 +177,10 @@ impl Tool for ResearchTool {
             .unwrap_or("?");
         format!("research: {query}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

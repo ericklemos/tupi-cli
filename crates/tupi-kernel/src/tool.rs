@@ -103,6 +103,11 @@ pub trait Tool: Send + Sync {
     fn mutates(&self) -> bool {
         false
     }
+
+    /// Fail-closed: apenas tools seguras para investigação/SDD retornam true.
+    fn sdd_allowed(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone)]
@@ -121,6 +126,18 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|tool| tool.spec()).collect()
+    }
+
+    pub fn specs_for_mode(&self, mode: crate::AgentMode) -> Vec<ToolSpec> {
+        match mode {
+            crate::AgentMode::Execution => self.specs(),
+            crate::AgentMode::Sdd => self
+                .tools
+                .iter()
+                .filter(|tool| tool.sdd_allowed())
+                .map(|tool| tool.spec())
+                .collect(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -199,7 +216,7 @@ mod tests {
         let tool = EchoTool("echo");
         assert_eq!(
             tool.describe_call(&serde_json::json!({"path": "a.rs"})),
-            "{\"path\":\"a.rs\"}"
+            r#"{"path":"a.rs"}"#
         );
     }
 
@@ -231,5 +248,48 @@ mod tests {
             error.to_string(),
             "caminho fora do diretório raiz: ../../etc/passwd"
         );
+    }
+
+    #[test]
+    fn agent_mode_defaults_to_execution_and_specs_for_mode_filters_sdd() {
+        assert_eq!(crate::AgentMode::default(), crate::AgentMode::Execution);
+        assert_eq!(
+            crate::AgentMode::from_u8(crate::AgentMode::Sdd.as_u8()),
+            crate::AgentMode::Sdd
+        );
+
+        struct AllowedTool;
+        impl Tool for AllowedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "read".into(),
+                    description: "".into(),
+                    schema: serde_json::json!({}),
+                }
+            }
+            fn call(&self, _: Value) -> Result<String, ToolError> {
+                Ok("ok".into())
+            }
+            fn sdd_allowed(&self) -> bool {
+                true
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool("edit")));
+        reg.register(Arc::new(AllowedTool));
+
+        let exec_names: Vec<_> = reg
+            .specs_for_mode(crate::AgentMode::Execution)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let sdd_names: Vec<_> = reg
+            .specs_for_mode(crate::AgentMode::Sdd)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(exec_names, vec!["edit", "read"]);
+        assert_eq!(sdd_names, vec!["read"]);
     }
 }

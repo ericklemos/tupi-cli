@@ -170,6 +170,10 @@ impl Tool for ImpactTool {
             .unwrap_or("?");
         format!("impact_check: {symbol}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

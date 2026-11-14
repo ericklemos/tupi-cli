@@ -293,6 +293,10 @@ impl Tool for DiffTool {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
         format!("diff: {base}..{path}")
     }
+
+    fn sdd_allowed(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
