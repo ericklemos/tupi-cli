@@ -310,6 +310,27 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     tool_options.embedder = Some(embedder_slot);
+    if config::summaries_enabled(
+        &docs_folders,
+        std::env::var("TUPI_RAG_SUMMARIES").ok().as_deref(),
+    ) {
+        let generator_slot =
+            std::sync::Arc::new(tupi_kernel::generate::GeneratorSlot::empty());
+        let slot = std::sync::Arc::clone(&generator_slot);
+        let base = data_dir(|key| std::env::var(key).ok());
+        tokio::spawn(async move {
+            match tupi_infer::ensure_generation_model(&base, &tupi_infer::HttpFetcher).await {
+                Ok(path) => match tupi_infer::LlamaGenerator::load(&path) {
+                    Ok(generator) => slot.set(std::sync::Arc::new(generator)),
+                    Err(error) => tracing::warn!(%error, "gerador de resumos nao carregou"),
+                },
+                Err(error) => tracing::warn!(%error, "download do gerador falhou"),
+            }
+        });
+        tool_options.generator = Some(generator_slot);
+    } else {
+        tool_options.generator = None;
+    }
     tupi_tools::register_exposed_with(
         root.clone(),
         &mut tools,

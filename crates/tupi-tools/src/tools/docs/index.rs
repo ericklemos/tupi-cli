@@ -1,12 +1,13 @@
 //! Índice incremental da documentação do projeto.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ignore::WalkBuilder;
 use tupi_kernel::ToolError;
 use tupi_kernel::embed::Embedder;
+use tupi_kernel::generate::Generator;
 
 use crate::support::budget::{Section, estimate_tokens};
 
@@ -32,6 +33,13 @@ pub struct RefreshReport {
     pub error: Option<String>,
 }
 
+#[allow(dead_code)]
+pub struct SummaryOutcome {
+    pub path: String,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Índice em memória, recarregado do disco na primeira chamada.
 pub struct DocsIndex {
     root_dir: PathBuf,
@@ -43,6 +51,7 @@ struct State {
     index: Index,
     vectors: HashMap<String, Vec<Vec<f32>>>,
     loaded: bool,
+    pending: VecDeque<String>,
 }
 
 impl DocsIndex {
@@ -54,6 +63,7 @@ impl DocsIndex {
                 index: Index::empty(Vec::new()),
                 vectors: HashMap::new(),
                 loaded: false,
+                pending: VecDeque::new(),
             }),
         }
     }
@@ -238,6 +248,18 @@ impl DocsIndex {
         state.index.files = files;
         state.index.folders = folders;
         state.index.skipped = skipped;
+        let missing: Vec<String> = state
+            .index
+            .files
+            .iter()
+            .filter(|file| file.summary.is_none())
+            .map(|file| file.path.clone())
+            .collect();
+        for path in missing {
+            if !state.pending.contains(&path) {
+                state.pending.push_back(path);
+            }
+        }
 
         let mut embedded = 0usize;
         let mut pending_vectors = 0usize;
@@ -428,6 +450,11 @@ impl DocsIndex {
             report.pending_vectors,
             report.touched.len()
         );
+        text.push_str(&format!(
+            "\n- resumos: {} prontos, {} pendentes",
+            state.index.files.iter().filter(|file| file.summary.is_some()).count(),
+            state.pending.len()
+        ));
         if let Some(error) = &report.error {
             text.push_str(&format!("\n- erro: {error}"));
         }
@@ -456,6 +483,7 @@ impl DocsIndex {
         })
     }
 
+#[allow(dead_code)]
     pub fn files_len(&self) -> usize {
         self.state
             .lock()
@@ -464,7 +492,105 @@ impl DocsIndex {
             .files
             .len()
     }
+#[allow(dead_code)]
+    pub fn pending_summaries(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .len()
+    }
 
+#[allow(dead_code)]
+    pub fn summaries_ready(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .index
+            .files
+            .iter()
+            .filter(|file| file.summary.is_some())
+            .count()
+    }
+
+    pub fn process_one_summary(
+        &self,
+        generator: &dyn Generator,
+        max_chars: usize,
+        max_tokens: usize,
+    ) -> Option<SummaryOutcome> {
+        let path = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.pending.pop_front()?
+        };
+        let (hash, headings, excerpt) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let file = state.index.files.iter().find(|file| file.path == path)?;
+            if let Some(summary) = &file.summary {
+                return Some(SummaryOutcome {
+                    path,
+                    summary: Some(summary.clone()),
+                    error: None,
+                });
+            }
+            let mut seen = HashSet::new();
+            let headings: Vec<String> = file
+                .chunks
+                .iter()
+                .map(|chunk| chunk.heading.clone())
+                .filter(|heading| !heading.is_empty() && seen.insert(heading.clone()))
+                .take(12)
+                .collect();
+            let full = std::fs::read_to_string(self.root_dir.join(&path)).ok()?;
+            (
+                file.hash.clone(),
+                headings,
+                super::summary::truncate_chars(&full, 4000),
+            )
+        };
+        let prompt = super::summary::build_prompt(&path, &headings, &excerpt);
+        let (summary, error) = match generator.generate(&prompt, max_tokens) {
+            Ok(raw) => (super::summary::sanitize(&raw, max_chars), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let current = std::fs::read(self.root_dir.join(&path))
+            .map(|bytes| store::hash_hex(&bytes))
+            .unwrap_or_default();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if current != hash {
+            state.pending.push_back(path.clone());
+            return Some(SummaryOutcome {
+                path,
+                summary: None,
+                error: Some("arquivo mudou".to_string()),
+            });
+        }
+        if let Some(file) = state
+            .index
+            .files
+            .iter_mut()
+            .find(|file| file.path == path)
+        {
+            file.summary = summary.clone();
+            let _ = store::save_index(&self.root_dir, &state.index);
+        }
+        Some(SummaryOutcome {
+            path,
+            summary,
+            error,
+        })
+    }
+
+#[allow(dead_code)]
     pub fn chunks_len(&self) -> usize {
         self.state
             .lock()
@@ -551,7 +677,8 @@ fn has_ignored_component(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::docs::test_support::FakeEmbedder;
+    use crate::tools::docs::test_support::{FakeEmbedder, FakeGenerator};
+    use tupi_kernel::generate::{GenerateError, Generator};
 
     fn write(dir: &std::path::Path, relative: &str, text: &str) {
         let path = dir.join(relative);
@@ -652,5 +779,66 @@ mod tests {
         index.refresh(Some(&FakeEmbedder::named("um")), 10);
         let report = index.refresh(Some(&FakeEmbedder::named("dois")), 10);
         assert_eq!(report.embedded, 1);
+    }
+    #[test]
+    fn process_one_summary_stores_a_sanitized_line() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "docs/a.md", "# A\n\ntexto unico\n");
+        let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("docs")]);
+        index.refresh(None, 0);
+        let generator = FakeGenerator::default();
+
+        let outcome = index.process_one_summary(&generator, 160, 64).expect("outcome");
+
+        assert_eq!(outcome.path, "docs/a.md");
+        assert_eq!(outcome.summary.as_deref(), Some("Resumo de teste."));
+        assert_eq!(index.summaries_ready(), 1);
+    }
+
+    #[test]
+    fn a_changed_file_discards_the_stale_summary() {
+        struct MutatingGenerator {
+            path: std::path::PathBuf,
+        }
+        impl Generator for MutatingGenerator {
+            fn model_id(&self) -> &str {
+                "mutating"
+            }
+            fn generate(&self, _prompt: &str, _max_tokens: usize) -> Result<String, GenerateError> {
+                std::fs::write(&self.path, "# A\n\nmudou\n").unwrap();
+                Ok("Resumo velho.".to_string())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "docs/a.md", "# A\n\nantes\n");
+        let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("docs")]);
+        index.refresh(None, 0);
+        let generator = MutatingGenerator {
+            path: dir.path().join("docs/a.md"),
+        };
+
+        let outcome = index.process_one_summary(&generator, 160, 64).expect("outcome");
+
+        assert!(outcome.summary.is_none());
+        assert_eq!(index.summaries_ready(), 0);
+        assert!(index.pending_summaries() >= 1);
+    }
+
+    #[test]
+    fn a_reload_enqueues_files_without_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "docs/a.md", "# A\n\ntexto\n");
+        write(dir.path(), "docs/b.md", "# B\n\ntexto\n");
+        {
+            let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("docs")]);
+            index.refresh(None, 0);
+            index
+                .process_one_summary(&FakeGenerator::default(), 160, 64)
+                .unwrap();
+        }
+        let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("docs")]);
+        index.refresh(None, 0);
+        assert_eq!(index.summaries_ready(), 1);
+        assert!(index.pending_summaries() >= 1);
     }
 }

@@ -130,6 +130,33 @@ mod tests {
             .expect("embedding");
         assert_eq!(vectors[0].len(), 1024);
     }
+    #[test]
+    fn summaries_are_enabled_only_with_folders_and_without_off() {
+        let folders = vec![std::path::PathBuf::from("docs")];
+        assert!(super::summaries_enabled(&folders, None));
+        assert!(super::summaries_enabled(&folders, Some("auto")));
+        assert!(!super::summaries_enabled(&folders, Some("off")));
+        assert!(!super::summaries_enabled(&[], None));
+    }
+
+    #[test]
+    fn real_generation_model_produces_a_line() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let path = home.join(".tupi/models/LiquidAI/LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf");
+        if !path.exists() {
+            return;
+        }
+        let generator = tupi_infer::LlamaGenerator::load(&path).expect("modelo carrega");
+        let text = tupi_kernel::generate::Generator::generate(
+            &generator,
+            "Resuma em uma linha: A cobranca e mensal.",
+            16,
+        )
+        .expect("geracao");
+        assert!(!text.trim().is_empty());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -251,4 +278,8 @@ mod context_tests {
 
 pub fn docs_embedding_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
     !folders.is_empty() && !matches!(value.map(str::trim), Some("off" | "0" | "false"))
+}
+
+pub fn summaries_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
+    docs_embedding_enabled(folders, value)
 }

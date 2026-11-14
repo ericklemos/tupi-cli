@@ -5,6 +5,7 @@ pub(crate) mod chunk;
 pub(crate) mod store;
 pub(crate) mod index;
 pub(crate) mod search;
+pub(crate) mod summary;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,11 +23,12 @@ use self::index::DocsIndex;
 
 /// Tool de consulta à documentação declarada no projeto.
 pub struct DocsTool {
-    index: DocsIndex,
+    index: Arc<DocsIndex>,
     store: Arc<ResponseStore>,
     #[allow(dead_code)]
     ledger: Arc<DeliveryLedger>,
     embedder: Option<Arc<EmbedderSlot>>,
+    generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
     default_budget_tokens: usize,
 }
 
@@ -37,13 +39,27 @@ impl DocsTool {
         store: Arc<ResponseStore>,
         ledger: Arc<DeliveryLedger>,
         embedder: Option<Arc<EmbedderSlot>>,
+        generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
         default_budget_tokens: usize,
     ) -> Self {
+        let index = Arc::new(DocsIndex::new(root_dir, folders));
+        if let Some(slot) = generator.clone() {
+            let worker_index = Arc::clone(&index);
+            std::thread::spawn(move || loop {
+                let generated = slot.get().and_then(|generator| {
+                    worker_index.process_one_summary(generator.as_ref(), 160, 64)
+                });
+                if generated.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+        }
         Self {
-            index: DocsIndex::new(root_dir, folders),
+            index,
             store,
             ledger,
             embedder,
+            generator,
             default_budget_tokens,
         }
     }
@@ -190,7 +206,12 @@ impl Tool for DocsTool {
                 }
             }
             DocsParams::Status => {
-                let text = self.index.status_text(&report, embedder_ref);
+                let mut text = self.index.status_text(&report, embedder_ref);
+                if let Some(generator) = self.generator.as_ref().and_then(|slot| slot.get()) {
+                    text.push_str(&format!("\n- gerador: {}", generator.model_id()));
+                } else if self.generator.is_some() {
+                    text.push_str("\n- gerador: carregando/ausente");
+                }
                 Ok(render_sections(
                     &self.store,
                     vec![Section {
@@ -282,6 +303,7 @@ mod tests {
 
     use crate::support::ledger::DeliveryLedger;
     use crate::support::store::ResponseStore;
+    use crate::tools::docs::test_support::FakeGenerator;
 
     fn tool(dir: &std::path::Path) -> DocsTool {
         DocsTool::new(
@@ -292,6 +314,7 @@ mod tests {
                 1024 * 1024,
             )),
             Arc::new(DeliveryLedger::new(64, 1024 * 1024)),
+            None,
             None,
             4000,
         )
@@ -355,5 +378,18 @@ mod tests {
             "{second}"
         );
         assert!(!second.contains("conteudo unico"));
+    }
+    #[test]
+    fn map_shows_a_summary_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/a.md"), "# A\n\ntexto\n").unwrap();
+        let tool = tool(dir.path());
+        let _ = tool.index.refresh(None, 0);
+        tool.index
+            .process_one_summary(&FakeGenerator::default(), 160, 64)
+            .unwrap();
+        let out = Tool::call(&tool, serde_json::json!({"action":"map"})).unwrap();
+        assert!(out.contains("Resumo de teste."), "{out}");
     }
 }

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: Test (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-ubuntu-22.04
+      - name: Configure git identity for tests that commit
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  build-check:
+    name: Build check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-${{ matrix.os }}
+      - name: Locate libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (Test-Path (Join-Path $llvm "libclang.dll")) {
+            "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+      - name: cargo check
+        run: cargo check --workspace --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked

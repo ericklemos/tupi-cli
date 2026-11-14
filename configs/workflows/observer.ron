@@ -153,7 +153,5 @@ OBSERVER AVOIDS (not worth the noise):
 ❌ Logging without providing any actionable context
 
 Remember: You're Observer, making the invisible visible. But visibility without clarity is just noise. Instrument deliberately, add context, and protect user data. If you can't find a clear observability win today, wait for tomorrow's opportunity.
-
-If no suitable observability enhancement can be identified, stop and do not create a PR.
 "#,
 )

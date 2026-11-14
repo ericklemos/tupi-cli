@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    EMBEDDING_BYTES, EMBEDDING_FILE, EMBEDDING_REPO, EMBEDDING_SHA256, InferError, models_dir,
+    EMBEDDING_BYTES, EMBEDDING_FILE, EMBEDDING_REPO, EMBEDDING_SHA256, InferError, LFM3_BYTES,
+    LFM3_FILE, LFM3_REPO, LFM3_SHA256, models_dir,
 };
 
 #[async_trait]
@@ -34,24 +35,58 @@ pub async fn ensure_embedding_model(
     base: &Path,
     fetcher: &dyn Fetcher,
 ) -> Result<PathBuf, InferError> {
-    let dir = models_dir(base, EMBEDDING_REPO);
+    ensure_model(
+        base,
+        EMBEDDING_REPO,
+        EMBEDDING_FILE,
+        EMBEDDING_SHA256,
+        EMBEDDING_BYTES,
+        fetcher,
+    )
+    .await
+}
+
+pub async fn ensure_generation_model(
+    base: &Path,
+    fetcher: &dyn Fetcher,
+) -> Result<PathBuf, InferError> {
+    ensure_model(
+        base,
+        LFM3_REPO,
+        LFM3_FILE,
+        LFM3_SHA256,
+        LFM3_BYTES,
+        fetcher,
+    )
+    .await
+}
+
+pub async fn ensure_model(
+    base: &Path,
+    repo: &str,
+    file: &str,
+    sha256: &str,
+    bytes: u64,
+    fetcher: &dyn Fetcher,
+) -> Result<PathBuf, InferError> {
+    let dir = models_dir(base, repo);
     std::fs::create_dir_all(&dir)?;
-    let target = dir.join(EMBEDDING_FILE);
-    if target.exists() && verify(&target, EMBEDDING_SHA256)? {
+    let target = dir.join(file);
+    if target.exists() && verify(&target, sha256)? {
         return Ok(target);
     }
     let _ = std::fs::remove_file(&target);
-    let tmp = dir.join(format!("{EMBEDDING_FILE}.part"));
-    let url = format!("https://huggingface.co/{EMBEDDING_REPO}/resolve/main/{EMBEDDING_FILE}");
+    let tmp = dir.join(format!("{file}.part"));
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
     let size = fetcher.download(&url, &tmp).await?;
-    if size != EMBEDDING_BYTES {
+    if size != bytes {
         let _ = std::fs::remove_file(&tmp);
         return Err(InferError::Size {
-            expected: EMBEDDING_BYTES,
+            expected: bytes,
             actual: size,
         });
     }
-    if !verify(&tmp, EMBEDDING_SHA256)? {
+    if !verify(&tmp, sha256)? {
         let _ = std::fs::remove_file(&tmp);
         return Err(InferError::Checksum);
     }
@@ -105,6 +140,21 @@ mod tests {
         assert!(
             !models_dir(dir.path(), "LiquidAI/LFM2.5-Embedding-350M-GGUF")
                 .join("LFM2.5-Embedding-350M-Q8_0.gguf")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_generation_download_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = StubFetcher {
+            bytes: b"errado".to_vec(),
+        };
+        let result = ensure_generation_model(dir.path(), &fetcher).await;
+        assert!(result.is_err());
+        assert!(
+            !models_dir(dir.path(), "LiquidAI/LFM3-1.7B-GGUF")
+                .join("LFM3-1.7B-Q4_K_M.gguf")
                 .exists()
         );
     }

@@ -1,4 +1,5 @@
 use tupi_kernel::embed::{EmbedError, Embedder};
+use tupi_kernel::generate::{GenerateError, Generator};
 
 /// Embedder determinístico para testes: 4 dimensões, sem modelo real.
 pub(crate) struct FakeEmbedder {
@@ -72,4 +73,33 @@ fn fake_vec(text: &str) -> Vec<f32> {
         buckets[index] += 1.0;
     }
     buckets.to_vec()
+}
+
+/// Gerador determinístico para testes.
+pub(crate) struct FakeGenerator {
+    model: String,
+}
+
+impl FakeGenerator {
+    pub fn named(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+        }
+    }
+}
+
+impl Default for FakeGenerator {
+    fn default() -> Self {
+        Self::named("fake-gen")
+    }
+}
+
+impl Generator for FakeGenerator {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn generate(&self, _prompt: &str, _max_tokens: usize) -> Result<String, GenerateError> {
+        Ok("Resumo de teste.".to_string())
+    }
 }

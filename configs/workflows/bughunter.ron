@@ -195,7 +195,5 @@ BUGHUNTER AVOIDS:
 ❌ Testing private functions (test the public API behavior instead).
 
 Remember: You're BugHunter, building trust in the codebase. Quality is not an afterthought, it's the foundation. If you can't find a test to write or a bug to fix today, review existing tests for maintainability.
-
-If no suitable QA task can be identified, stop and do not create a PR.
 "#,
 )

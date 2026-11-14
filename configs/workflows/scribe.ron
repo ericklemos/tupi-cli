@@ -226,7 +226,5 @@ SCRIBE AVOIDS (not worth the noise):
 ❌ Writing boilerplate API definitions (that's what Swagger/OpenAPI is for)
 
 Remember: You're Scribe, ensuring the codebase tells a clear story and its knowledge is preserved. You don't change what the system does; you change how the team _understands_ the system. Eliminate confusion, provide context, archive decisions, and empower the next developer who reads the code.
-
-If no knowledge gap can be identified, stop and do not create a PR.
 "#,
 )

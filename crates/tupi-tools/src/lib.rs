@@ -65,6 +65,8 @@ pub struct ToolsOptions {
     pub docs_folders: Vec<std::path::PathBuf>,
     /// Slot do embedder local; None mantém a busca lexical.
     pub embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
+    /// Slot do gerador local de resumos; None desliga os resumos.
+    pub generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
 }
 
 impl Default for ToolsOptions {
@@ -79,6 +81,7 @@ impl Default for ToolsOptions {
             sdd_executor: None,
             docs_folders: Vec::new(),
             embedder: None,
+            generator: None,
         }
     }
 }
@@ -96,6 +99,7 @@ impl ToolsOptions {
             sdd_executor: None,
             docs_folders: Vec::new(),
             embedder: None,
+            generator: None,
         }
     }
 }
@@ -291,6 +295,7 @@ pub fn register_with(
             store.clone(),
             ledger.clone(),
             options.embedder.clone(),
+            options.generator.clone(),
             DEFAULT_BUDGET_TOKENS,
         )));
     }

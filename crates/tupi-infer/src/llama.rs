@@ -18,6 +18,13 @@ pub struct LlamaEmbedder {
 
 impl LlamaEmbedder {
     pub fn load(path: &std::path::Path) -> Result<Self, InferError> {
+        // O llama.cpp escreve no stderr por conta própria (`create_tensor`,
+        // `load_tensors`, metadados do gguf). Com a TUI no alternate screen
+        // essas linhas furam o desenho e a tela "quebra"; o callback precisa
+        // existir antes do `LlamaBackend::init`, que também loga.
+        llama_cpp_2::send_logs_to_tracing(
+            llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+        );
         let backend =
             LlamaBackend::init().map_err(|error| InferError::Unavailable(error.to_string()))?;
         let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())
