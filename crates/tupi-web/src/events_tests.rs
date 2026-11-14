@@ -15,7 +15,10 @@ async fn wait_for(hub: &EventHub, expected: usize) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!("ring buffer não recebeu {expected} eventos (tem {})", hub.len());
+    panic!(
+        "ring buffer não recebeu {expected} eventos (tem {})",
+        hub.len()
+    );
 }
 
 fn is_notice(event: &WebEvent, text: &str) -> bool {
@@ -77,7 +80,10 @@ async fn sse_stream_replays_ring_buffer_and_survives_lagged_receiver() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 2, "o stream deve continuar entregando eventos após o lag");
+    assert_eq!(
+        seen, 2,
+        "o stream deve continuar entregando eventos após o lag"
+    );
 }
 
 #[tokio::test]
@@ -97,10 +103,7 @@ async fn sse_stream_replays_snapshot_before_live_events() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let _ = rx.recv().await;
 
-    let mut stream = Box::pin(sse_stream(
-        snapshot,
-        hub.subscribe().1,
-    ));
+    let mut stream = Box::pin(sse_stream(snapshot, hub.subscribe().1));
     let first = stream.next().await.unwrap();
     assert!(is_notice(&first, "snapshot"));
 }

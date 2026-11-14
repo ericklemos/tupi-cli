@@ -15,6 +15,67 @@ mod tool_config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    struct AgentExecutor {
+        store: std::sync::Arc<dyn tupi_tools::sdd::SddStore>,
+        provider: std::sync::Arc<dyn tupi_kernel::Provider>,
+        model: String,
+        root: std::path::PathBuf,
+        events: tupi_kernel::EventBus,
+        agent_tools: std::sync::Arc<dyn Fn() -> tupi_kernel::ToolRegistry + Send + Sync>,
+        max_parallel: usize,
+        agent_max_steps: usize,
+        agent_timeout: std::time::Duration,
+        repo_key: String,
+    }
+
+    impl AgentExecutor {
+        fn run(&self, plan: &tupi_tools::sdd::SddPlan) -> Result<String, String> {
+            let request = tupi_app::sdd_api::SddExecRequest {
+                root: self.root.clone(),
+                store: self.store.clone(),
+                repo_key: self.repo_key.clone(),
+                tools: (self.agent_tools)(),
+                agent_tools: self.agent_tools.clone(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                agent_prefix: tupi_app::sdd_api::AGENT_PREFIX.to_string(),
+                max_parallel: self.max_parallel,
+                agent_max_steps: self.agent_max_steps,
+                agent_timeout: self.agent_timeout,
+                events: self.events.clone(),
+                request_id: 0,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                in_flight: std::sync::Arc::new(tokio::sync::Notify::new()),
+                in_flight_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            let outcome = tokio::runtime::Handle::current()
+                .block_on(tupi_app::sdd_api::execute(request, &plan.slug));
+            write_report(&self.root, &plan.slug, &outcome.report);
+            if outcome.ok {
+                Ok(outcome.report)
+            } else {
+                Err(outcome.report)
+            }
+        }
+    }
+
+    fn write_report(root: &std::path::Path, slug: &str, report: &str) {
+        let dir = root.join(".agents/tupi/sdd");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let _ = std::fs::write(dir.join(format!("{slug}.execution.md")), report);
+    }
+
+    fn setting_usize(store: &tupi_store::Store, key: &str, default: usize) -> usize {
+        store
+            .setting(key)
+            .ok()
+            .flatten()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
     let cli = parse_cli_options(&std::env::args().collect::<Vec<_>>())?;
     let dotenv_path = dotenvy::dotenv().ok();
 
@@ -186,12 +247,56 @@ async fn main() -> anyhow::Result<()> {
         tupi_kernel::AgentMode::Execution.as_u8(),
     ));
     let repo_key = tupi_tools::repo_key(&root);
+    let sdd_store_for_tools: std::sync::Arc<dyn tupi_tools::sdd::SddStore> =
+        std::sync::Arc::new(sdd_store::RedbSddStore::new(std::sync::Arc::clone(&store)));
+    let agent_root = root.clone();
+    let agent_tools = std::sync::Arc::new(move || {
+        let mut registry = tupi_kernel::ToolRegistry::new();
+        tupi_tools::register_agent(
+            agent_root.clone(),
+            &mut registry,
+            tupi_tools::AgentToolsOptions::default(),
+        );
+        registry
+    });
+    let auto_execute = store
+        .setting("sdd.auto_execute")
+        .ok()
+        .flatten()
+        .map(|value| value.trim() != "false")
+        .unwrap_or(true);
     let mut tool_options = tupi_tools::ToolsOptions::default();
-    tool_options.sdd_store = Some(std::sync::Arc::new(sdd_store::RedbSddStore::new(
-        std::sync::Arc::clone(&store),
-    )));
+    tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
-    tupi_tools::register_exposed_with(root.clone(), &mut tools, tool_limits.exposure(), tool_options);
+    if auto_execute {
+        if let Some(provider_impl) = registry.get(&provider) {
+            let executor = std::sync::Arc::new(AgentExecutor {
+                store: sdd_store_for_tools,
+                provider: provider_impl,
+                model: model.clone(),
+                root: root.clone(),
+                events: events.clone(),
+                agent_tools,
+                max_parallel: setting_usize(&store, "sdd.max_parallel", 4),
+                agent_max_steps: setting_usize(&store, "sdd.agent_max_steps", 24),
+                agent_timeout: std::time::Duration::from_secs(setting_usize(
+                    &store,
+                    "sdd.agent_timeout_seconds",
+                    600,
+                ) as u64),
+                repo_key: repo_key.clone(),
+            });
+            tool_options.sdd_executor = Some(std::sync::Arc::new(
+                move |plan: &tupi_tools::sdd::SddPlan| executor.run(plan),
+            ));
+        }
+    }
+    tupi_tools::register_exposed_with(
+        root.clone(),
+        &mut tools,
+        tool_limits.exposure(),
+        tool_options,
+    );
 
     let tool_names: Vec<String> = tools.specs().iter().map(|spec| spec.name.clone()).collect();
     let workflow_names: Vec<String> = available
@@ -279,13 +384,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let launcher: std::sync::Arc<dyn tupi_tui::run::DashboardLauncher> = dashboard.clone();
-    let outcome = tupi_tui::run::run_with_dashboard(
-        buses,
-        model,
-        provider,
-        Some(launcher),
-    )
-    .await;
+    let outcome = tupi_tui::run::run_with_dashboard(buses, model, provider, Some(launcher)).await;
     dashboard.shutdown().await;
     let reason = if outcome.is_ok() { "quit" } else { "error" };
     let error = outcome.as_ref().err().map(|error| error.to_string());
@@ -293,7 +392,6 @@ async fn main() -> anyhow::Result<()> {
     outcome?;
     Ok(())
 }
-
 
 fn tool_root() -> anyhow::Result<PathBuf> {
     let root = std::env::current_dir().context("não foi possível obter o diretório atual")?;
@@ -551,8 +649,12 @@ mod cli_tests {
         assert_eq!(enabled.web_port, 7788);
 
         assert!(
-            parse_cli_options(&["tupi".to_string(), "--web-port".to_string(), "abc".to_string()])
-                .is_err()
+            parse_cli_options(&[
+                "tupi".to_string(),
+                "--web-port".to_string(),
+                "abc".to_string()
+            ])
+            .is_err()
         );
         assert!(parse_cli_options(&["tupi".to_string(), "--web-port".to_string()]).is_err());
     }

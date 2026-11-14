@@ -36,15 +36,118 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// Pastas de documentação do projeto, ancoradas no root.
+    /// Pastas de documentação resolvidas contra `root`, na ordem do arquivo.
     pub fn docs_folders(&self, root: &Path) -> Vec<PathBuf> {
         self.docs_folders
             .iter()
             .map(|folder| root.join(folder))
             .collect()
     }
-}
 
+    /// Chave `provider/modelo` usada em `models`.
+    ///
+    /// `None` quando provider ou modelo está vazio: `"/modelo"` nunca
+    /// resolveria na leitura, então gravá-la seria só sujeira no arquivo.
+    pub fn model_key(provider: &str, model: &str) -> Option<String> {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        Some(format!("{provider}/{model}"))
+    }
+
+    /// Grava `models[key].context_window` em `ai.project.json`.
+    ///
+    /// O merge acontece sobre `serde_json::Value` porque a config ignora
+    /// campos desconhecidos: reserializar `ProjectConfig` apagaria o que o
+    /// usuário escreveu à mão. `Ok(false)` quando nada foi escrito — entrada
+    /// já presente com `context_window`, `key` vazia ou janela zero (zero
+    /// desliga a poda e só poluiria o arquivo). Erro de leitura ou parse não
+    /// toca no arquivo.
+    pub fn record_model_window(
+        root: &Path,
+        key: &str,
+        context_window: usize,
+    ) -> Result<bool, ProjectConfigError> {
+        let path = project_path(root);
+        if key.trim().is_empty() || context_window == 0 {
+            return Ok(false);
+        }
+
+        let value = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<serde_json::Value>(&text).map_err(|source| {
+                ProjectConfigError::Parse {
+                    path: path.clone(),
+                    source,
+                }
+            })?,
+            // Arquivo ausente nasce com o mesmo fallback de `load_or_create`.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(fallback(root)).map_err(|source| {
+                    ProjectConfigError::Serialize {
+                        path: path.clone(),
+                        source,
+                    }
+                })?
+            }
+            Err(source) => {
+                return Err(ProjectConfigError::Read {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+
+        let serde_json::Value::Object(mut object) = value else {
+            return Err(ProjectConfigError::NotAnObject { path });
+        };
+
+        if !matches!(object.get("models"), Some(serde_json::Value::Object(_))) {
+            object.insert(
+                "models".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
+        let models = object
+            .get_mut("models")
+            .and_then(|models| models.as_object_mut())
+            .expect("models garantido como objeto acima");
+
+        if !matches!(models.get(key), Some(serde_json::Value::Object(_))) {
+            models.insert(
+                key.to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
+        let entry = models
+            .get_mut(key)
+            .and_then(|entry| entry.as_object_mut())
+            .expect("models[key] garantido como objeto acima");
+
+        // Valor presente (inclusive escrito à mão) é intenção preservada.
+        if entry
+            .get("context_window")
+            .is_some_and(|window| !window.is_null())
+        {
+            return Ok(false);
+        }
+        entry.insert(
+            "context_window".to_string(),
+            serde_json::json!(context_window),
+        );
+
+        let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(object)).map_err(
+            |source| ProjectConfigError::Serialize {
+                path: path.clone(),
+                source,
+            },
+        )?;
+        text.push('\n');
+        std::fs::write(&path, text).map_err(|source| ProjectConfigError::Write { path, source })?;
+        Ok(true)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProjectConfigError {
@@ -72,6 +175,8 @@ pub enum ProjectConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("{path} não tem a forma de um objeto JSON de configuração")]
+    NotAnObject { path: PathBuf },
     #[error("name precisa ser não vazio")]
     EmptyName,
     #[error(
@@ -182,7 +287,6 @@ fn fallback(root: &Path) -> ProjectConfig {
     }
 }
 
-
 fn fallback_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -226,6 +330,100 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_file_gains_the_model_window_of_the_key() {
+        let dir = tempdir().unwrap();
+        let key = "anthropic/claude";
+        assert!(ProjectConfig::record_model_window(dir.path(), key, 4096).unwrap());
+
+        let text = std::fs::read_to_string(project_path(dir.path())).unwrap();
+        assert!(text.ends_with('\n'));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["models"][key]["context_window"], serde_json::json!(4096));
+
+        let config = read_project(dir.path()).unwrap();
+        assert_eq!(config.name, folder(dir.path()));
+        assert_eq!(config.models[key].context_window, Some(4096));
+    }
+
+    #[test]
+    fn recording_a_window_keeps_unknown_fields_and_other_entries() {
+        let dir = tempdir().unwrap();
+        let path = project_path(dir.path());
+        std::fs::write(
+            &path,
+            r#"{
+  "name": "projeto",
+  "future": 1,
+  "docs_folders": ["docs"],
+  "models": {"openai/gpt": {"context_window": 8192}}
+}"#,
+        )
+        .unwrap();
+
+        assert!(ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096).unwrap());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["name"], serde_json::json!("projeto"));
+        assert_eq!(value["future"], serde_json::json!(1));
+        assert_eq!(value["docs_folders"], serde_json::json!(["docs"]));
+        assert_eq!(
+            value["models"]["openai/gpt"]["context_window"],
+            serde_json::json!(8192)
+        );
+        assert_eq!(
+            value["models"]["anthropic/claude"]["context_window"],
+            serde_json::json!(4096)
+        );
+
+        let config = read_project(dir.path()).unwrap();
+        assert_eq!(config.name, "projeto");
+        assert_eq!(
+            config.docs_folders(dir.path()),
+            vec![dir.path().join("docs")]
+        );
+        assert_eq!(config.models["openai/gpt"].context_window, Some(8192));
+        assert_eq!(config.models["anthropic/claude"].context_window, Some(4096));
+    }
+
+    #[test]
+    fn an_existing_window_and_a_zero_default_are_left_untouched() {
+        let dir = tempdir().unwrap();
+        let path = project_path(dir.path());
+        let original = "{\n  \"models\": {\n    \"anthropic/claude\": {\n      \"context_window\": 1024\n    }\n  }\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        // Valor já preenchido pelo usuário nunca é sobrescrito.
+        assert!(
+            !ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // Janela zero desliga a poda: não cria entrada nenhuma.
+        assert!(!ProjectConfig::record_model_window(dir.path(), "openai/gpt", 0).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn an_empty_provider_or_model_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = project_path(dir.path());
+
+        for (provider, model) in [("", "model_2"), ("prov_b", ""), ("   ", "model_2")] {
+            assert_eq!(ProjectConfig::model_key(provider, model), None);
+            let key = ProjectConfig::model_key(provider, model).unwrap_or_default();
+            assert!(!ProjectConfig::record_model_window(dir.path(), &key, 4096).unwrap());
+            assert!(!path.exists(), "chave vazia não pode criar nem tocar o arquivo");
+        }
+
+        assert_eq!(
+            ProjectConfig::model_key("prov_b", "model_2").as_deref(),
+            Some("prov_b/model_2")
+        );
+    }
+
+    #[test]
     fn an_existing_file_wins() {
         let dir = tempdir().unwrap();
         let path = project_path(dir.path());
@@ -265,6 +463,21 @@ mod tests {
     #[test]
     fn a_root_without_a_file_name_uses_the_fallback() {
         assert_eq!(fallback_name(Path::new("/")), "project");
+    }
+
+    #[test]
+    fn an_invalid_file_is_not_rewritten_by_a_recorded_window() {
+        let dir = tempdir().unwrap();
+        let path = project_path(dir.path());
+        let original = "{\n  \"models\": {\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096);
+        assert!(
+            result.is_err(),
+            "JSON inválido precisa voltar como erro, não como sucesso: {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 }
 

@@ -1,5 +1,5 @@
-use axum::extract::{Query as QueryParams, State};
 use axum::Json;
+use axum::extract::{Query as QueryParams, State};
 use serde::{Deserialize, Serialize};
 use tupi_domain::memory::{Fact, Pending};
 

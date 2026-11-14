@@ -1,29 +1,30 @@
-pub mod ast;
-mod backtrack;
-mod budget;
-mod edit;
-mod ledger;
-mod peek;
-mod ranking;
-mod read;
-mod read_many;
-pub mod scanner;
-mod search;
-mod span;
-mod store;
-mod terms;
+mod support;
+mod tools;
+
+pub use support::{ast, graph, scanner};
+pub(crate) use support::{
+    backtrack, budget, ledger, paths, proc, ranking, span, store, terms, web,
+};
+
+pub use tools::sdd;
+pub(crate) use tools::{
+    assert, context_graph, diff, edit, env, exec, facts, fetch, impact, map, patch, peek, read,
+    read_many, relocate, research, search, setup, shell, state, test_many, trace, websearch, why,
+    workflow, write, write_many,
+};
 
 pub use ast::{AstChunker, AstSnippet};
 pub use budget::{
     CHARS_PER_TOKEN, DEFAULT_BUDGET_TOKENS, Section, Selection, estimate_tokens, render, select,
     split_section,
 };
+pub use store::ResponseStore;
+
 pub use edit::{EditParams, EditTool};
 pub use peek::PeekTool;
 pub use read::{ReadParams, ReadTool};
 pub use read_many::{ReadItem, ReadManyParams, ReadManyTool};
 pub use search::{SearchDetail, SearchParams, SearchTool};
-pub use store::ResponseStore;
 pub use workflow::{
     Catalog, WorkflowTool, catalog, global_agents_dir, local_agents_dir, prompt_section,
 };
@@ -36,42 +37,13 @@ use std::time::Duration;
 use tupi_kernel::ToolRegistry;
 
 use crate::ledger::DeliveryLedger;
-
-mod assert;
-mod context_graph;
-mod diff;
-mod env;
-/// Registra `read`, `read_many`, `search` e `peek`, compartilhando store e ledger.
-mod exec;
-mod facts;
-mod fetch;
-pub mod graph;
-mod impact;
-mod map;
-mod patch;
-mod paths;
-mod proc;
-mod relocate;
-mod research;
-mod setup;
-mod shell;
-mod state;
-mod test_many;
-mod trace;
-mod web;
-mod websearch;
-mod why;
-mod workflow;
-mod write;
-mod write_many;
-/// Opções de composição das tools.
-pub mod sdd;
 pub use paths::repo_key;
 pub use sdd::{
     InMemorySddStore, SddPlan, SddPlanStatus, SddStore, SddSubtask, SddSubtaskStatus, SddTask,
     SddTaskStatus, SddTool,
 };
 
+pub use agent_tools::{AgentToolsOptions, register_agent};
 #[derive(Clone)]
 pub struct ToolsOptions {
     /// Diretório de estado durável. `None` usa o padrão XDG do Tupi.
@@ -86,6 +58,9 @@ pub struct ToolsOptions {
     pub sdd_store: Option<Arc<dyn crate::sdd::SddStore>>,
     /// Célula compartilhada com o `AgentMode` ativo (`0=Execution`, `1=Sdd`).
     pub mode_cell: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Executor disparado ao fechar um plano SDD.
+    pub sdd_executor:
+        Option<Arc<dyn Fn(&crate::sdd::SddPlan) -> Result<String, String> + Send + Sync>>,
 }
 
 impl Default for ToolsOptions {
@@ -97,6 +72,7 @@ impl Default for ToolsOptions {
             web_cache: true,
             sdd_store: None,
             mode_cell: None,
+            sdd_executor: None,
         }
     }
 }
@@ -111,6 +87,7 @@ impl ToolsOptions {
             web_cache: false,
             sdd_store: None,
             mode_cell: None,
+            sdd_executor: None,
         }
     }
 }
@@ -176,7 +153,6 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::pipeline::PipelineTool));
     registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(EditTool::new(
             root_dir.clone(),
@@ -291,15 +267,15 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(
-        crate::sdd::SddTool::new(
-            root_dir.clone(),
-            sdd_store,
-            mode_cell,
-            DEFAULT_BUDGET_TOKENS,
-        )
-        .with_response_store(store.clone()),
-    ));
+    let mut sdd_tool = crate::sdd::SddTool::new(
+        root_dir.clone(),
+        sdd_store,
+        mode_cell,
+        DEFAULT_BUDGET_TOKENS,
+    )
+    .with_response_store(store.clone());
+    sdd_tool.executor = options.sdd_executor.clone();
+    registry.register(Arc::new(sdd_tool));
     let state = match state_dir {
         Some(dir) => crate::state::StateTool::with_state_dir_and_store(
             root_dir.clone(),
@@ -347,7 +323,7 @@ fn start_watcher(root: &std::path::Path, cache: Arc<crate::graph::GraphCache>) {
     }
 }
 
-mod pipeline;
+mod agent_tools;
 
 /// Tools expostas ao modelo quando a configuração não pede um perfil próprio.
 pub const CORE_TOOLS: &[&str] = &["edit", "exec", "map", "read", "read_many", "search"];

@@ -57,7 +57,10 @@ pub fn build_router(ctx: Arc<DashboardContext>) -> Router {
 }
 
 /// Sobe o servidor em `127.0.0.1:port` (`0` escolhe uma porta livre).
-pub async fn start_server(ctx: Arc<DashboardContext>, port: u16) -> anyhow::Result<DashboardHandle> {
+pub async fn start_server(
+    ctx: Arc<DashboardContext>,
+    port: u16,
+) -> anyhow::Result<DashboardHandle> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let url = format!("http://127.0.0.1:{}", addr.port());

@@ -218,6 +218,12 @@ pub fn pendings(root: &Path) -> Vec<Pending> {
 }
 
 pub fn save_pendings(root: &Path, pendings: &[Pending]) -> std::io::Result<()> {
+    // Teto do log antes de compactar. O caminho normal é só append: cada linha
+    // é um retrato completo de um `Pending` e o leitor fica com a última
+    // ocorrência do id, então duas abas fechando dívidas ao mesmo tempo não se
+    // apagam e não existe read-modify-write do arquivo inteiro.
+    const COMPACT_LINES: usize = 512;
+
     let path = pending_path(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -227,7 +233,25 @@ pub fn save_pendings(root: &Path, pendings: &[Pending]) -> std::io::Result<()> {
         body.push_str(&serde_json::to_string(pending).unwrap_or_default());
         body.push('\n');
     }
-    write_atomic(&path, body.as_bytes())
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(body.as_bytes())?;
+    drop(file);
+
+    // Compactação: reconcilia relendo o próprio log, para não descartar linhas
+    // que outra sessão anexou depois da nossa escrita.
+    let log = std::fs::read_to_string(&path)?;
+    if log.lines().count() <= COMPACT_LINES {
+        return Ok(());
+    }
+    let mut snapshot = String::new();
+    for pending in super::memory::pendings(root) {
+        snapshot.push_str(&serde_json::to_string(&pending).unwrap_or_default());
+        snapshot.push('\n');
+    }
+    write_atomic(&path, snapshot.as_bytes())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

@@ -40,6 +40,7 @@ fn to_store_plan(plan: &SddPlan) -> StorePlan {
                 title: t.title.clone(),
                 details: t.details.clone(),
                 nuances: t.nuances.clone(),
+                parallel: t.parallel,
                 status: match t.status {
                     SddTaskStatus::Open => StoreTaskStatus::Open,
                     SddTaskStatus::InProgress => StoreTaskStatus::InProgress,
@@ -52,6 +53,13 @@ fn to_store_plan(plan: &SddPlan) -> StorePlan {
                         id: s.id.clone(),
                         title: s.title.clone(),
                         acceptance: s.acceptance.clone(),
+                        touches: s.touches.clone(),
+                        acceptance_test: s.acceptance_test.as_ref().map(|t| {
+                            tupi_store::AcceptanceTest {
+                                package: t.package.clone(),
+                                filter: t.filter.clone(),
+                            }
+                        }),
                         status: match s.status {
                             SddSubtaskStatus::Open => StoreSubtaskStatus::Open,
                             SddSubtaskStatus::Done => StoreSubtaskStatus::Done,
@@ -87,6 +95,7 @@ fn from_store_plan(plan: StorePlan) -> SddPlan {
                 title: t.title,
                 details: t.details,
                 nuances: t.nuances,
+                parallel: t.parallel,
                 status: match t.status {
                     StoreTaskStatus::Open => SddTaskStatus::Open,
                     StoreTaskStatus::InProgress => SddTaskStatus::InProgress,
@@ -99,6 +108,13 @@ fn from_store_plan(plan: StorePlan) -> SddPlan {
                         id: s.id,
                         title: s.title,
                         acceptance: s.acceptance,
+                        touches: s.touches,
+                        acceptance_test: s.acceptance_test.map(|t| {
+                            tupi_tools::sdd::AcceptanceTest {
+                                package: t.package,
+                                filter: t.filter,
+                            }
+                        }),
                         status: match s.status {
                             StoreSubtaskStatus::Open => SddSubtaskStatus::Open,
                             StoreSubtaskStatus::Done => SddSubtaskStatus::Done,
@@ -176,11 +192,17 @@ mod tests {
                 title: "Refresh".into(),
                 details: "Det".into(),
                 nuances: vec![],
+                parallel: true,
                 status: SddTaskStatus::InProgress,
                 subtasks: vec![SddSubtask {
                     id: "T1.1".into(),
                     title: "Lock".into(),
                     acceptance: "Passa".into(),
+                    touches: vec!["src/a.rs".into()],
+                    acceptance_test: Some(tupi_tools::sdd::AcceptanceTest {
+                        package: Some("tupi-app".into()),
+                        filter: "sdd_run".into(),
+                    }),
                     status: SddSubtaskStatus::Done,
                 }],
             }],

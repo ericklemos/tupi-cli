@@ -122,6 +122,12 @@ fn scaled_budget(budget: usize, scale: u64) -> usize {
     ((budget as u128 * SCALE_ONE as u128) / scale.max(1) as u128) as usize
 }
 
+/// Converte a estimativa em unidades do histórico para tokens reais, usando
+/// a escala observada (`real / estimado`).
+fn scaled_estimate(estimate: usize, scale: u64) -> usize {
+    ((estimate as u128 * scale as u128) / SCALE_ONE as u128) as usize
+}
+
 fn plan_context(
     messages: &[Message],
     context_budget: usize,
@@ -230,7 +236,8 @@ pub mod context {
 
         /// Declara a janela de um modelo. Ausente ou zero mantém o default.
         pub fn with_model(mut self, key: impl Into<String>, context_window: Option<usize>) -> Self {
-            self.models.insert(key.into(), ModelContext { context_window });
+            self.models
+                .insert(key.into(), ModelContext { context_window });
             self
         }
 
@@ -348,8 +355,8 @@ pub mod context {
 
         #[test]
         fn the_target_never_exceeds_the_effective_budget() {
-            let profile =
-                ContextProfile::new(base(8_000, 10_000, 6)).with_model("deepseek-flash", Some(4_000));
+            let profile = ContextProfile::new(base(8_000, 10_000, 6))
+                .with_model("deepseek-flash", Some(4_000));
 
             let limits = profile.resolve("deepseek", "deepseek-flash");
 
@@ -384,6 +391,9 @@ pub struct App {
     /// Default global e janelas por modelo; resolve o budget efetivo de cada
     /// troca de modelo/provider.
     context_profile: Arc<context::ContextProfile>,
+    /// Gancho que completa o `ai.project.json` com a janela do modelo em uso.
+    /// `None` nos construtores de teste: nada toca em disco por acidente.
+    model_recorder: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
     /// Correção do orçamento observada no provider (real/estimado em ppm).
     token_scale: Arc<AtomicU64>,
     /// Workflows que /workflows/<nome> pode invocar. Vazio por padrão para
@@ -397,9 +407,12 @@ pub struct App {
     /// `None` desliga a gravação (testes e construtores antigos).
     debug_dir: Option<std::path::PathBuf>,
     mode: Arc<std::sync::atomic::AtomicU8>,
+    /// O fluxo SDD já começou nesta sessão: Shift+Tab fica travado até o
+    /// `sdd(action="close")` ou `/new`.
+    sdd_flow_started: Arc<AtomicBool>,
     repo_key: Option<String>,
 }
-
+const SDD_LOCK_NOTICE: &str = "SDD em andamento — conclua o fluxo antes de trocar de modo";
 
 impl App {
     pub fn new(
@@ -491,6 +504,7 @@ impl App {
                 tupi_domain::context::DEFAULT_RECENT_RESULTS_KEPT,
             ),
             context_profile: Arc::new(context::ContextProfile::default()),
+            model_recorder: None,
             token_scale: Arc::new(AtomicU64::new(SCALE_ONE)),
             workflows: Arc::new(crate::workflow::EmptyIndex),
             telemetry: crate::telemetry::Telemetry::disabled(),
@@ -499,12 +513,12 @@ impl App {
             mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 tupi_kernel::AgentMode::Execution.as_u8(),
             )),
+            sdd_flow_started: Arc::new(AtomicBool::new(false)),
             repo_key: None,
         });
         app.apply_context();
         app
-    }
-
+}
 
     /// Liga o catálogo de workflows lido do projeto, em `tupi-tools`.
     pub fn with_workflows(mut self: Arc<Self>, workflows: Arc<dyn WorkflowIndex>) -> Arc<Self> {
@@ -584,6 +598,11 @@ impl App {
         let provider = self.provider_id.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
         self.apply_context_for(&provider, &model);
+        // Completa o `ai.project.json` com a janela do modelo em uso. Sem
+        // gancho (testes) é no-op; o erro morre no closure do chamador.
+        if let Some(record) = self.model_recorder.as_deref() {
+            record(&provider, &model);
+        }
     }
 
     fn apply_context_for(&self, provider: &str, model: &str) {
@@ -594,7 +613,6 @@ impl App {
         self.context_recent_results
             .store(limits.recent_results, Ordering::SeqCst);
     }
-
 
     pub fn with_telemetry(
         mut self: Arc<Self>,
@@ -669,7 +687,6 @@ impl App {
         Ok(CommandOutcome::ModelChanged { model })
     }
 
-
     fn send_message(&self, text: String) -> Result<CommandOutcome, CommandError> {
         if self
             .active
@@ -689,11 +706,15 @@ impl App {
 
         let request_id = self.next_request.fetch_add(1, Ordering::SeqCst);
         self.active.store(request_id, Ordering::SeqCst);
+        if self.mode() == tupi_kernel::AgentMode::Sdd {
+            self.sdd_flow_started.store(true, Ordering::SeqCst);
+        }
 
         let model = self.model.lock().unwrap().clone();
         let tools = self.tools.clone();
         let base_prefix = self.prefix.clone();
         let mode_cell = Arc::clone(&self.mode);
+        let sdd_flow_started = Arc::clone(&self.sdd_flow_started);
         let sdd_store = self.store.clone();
         let sdd_repo_key = self.repo_key.clone();
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
@@ -784,14 +805,18 @@ impl App {
                 let final_step = step >= max_tool_steps;
                 let remaining = max_tool_steps.saturating_sub(step);
                 task_partial.lock().unwrap().clear();
-                let current_mode = tupi_kernel::AgentMode::from_u8(mode_cell.load(Ordering::SeqCst));
+                let current_mode =
+                    tupi_kernel::AgentMode::from_u8(mode_cell.load(Ordering::SeqCst));
                 let specs = tools.specs_for_mode(current_mode);
                 let tool_tokens = tool_spec_tokens(&specs);
                 let prefix = crate::sdd::compose_prefix(&base_prefix, current_mode);
                 let prefix_tokens = if prefix.is_empty() {
                     0
                 } else {
-                    tupi_domain::tokens::estimate_message(&Message::new(Role::System, prefix.clone()))
+                    tupi_domain::tokens::estimate_message(&Message::new(
+                        Role::System,
+                        prefix.clone(),
+                    ))
                 };
                 let mut closed_sdd = false;
 
@@ -889,7 +914,7 @@ impl App {
 
                 if telemetry.is_enabled() {
                     let body = crate::debug::render_prompt(&request);
-                    let clipped = crate::telemetry::clip_preview(&body);
+                    let clipped = crate::telemetry::prompt_body(&body);
                     telemetry.record(crate::telemetry::TelemetryEvent::PromptSent(
                         crate::telemetry::PromptSent {
                             request: request_id,
@@ -901,6 +926,7 @@ impl App {
                             body_bytes: clipped.bytes,
                             truncated: clipped.truncated,
                             estimate_tokens: prompt_estimate,
+                            estimate_scaled: scaled_estimate(prompt_estimate, scale),
                             messages: request.messages.len(),
                             tools: request.tools.len(),
                         },
@@ -928,39 +954,46 @@ impl App {
                     Ok(mut stream) => {
                         while let Some(item) = stream.next().await {
                             match item {
-                                Ok(ProviderEvent::Text(text)) => {
-                                    if telemetry.is_enabled() {
-                                        if first_token_at.is_none() {
-                                            first_token_at = Some(std::time::Instant::now());
+                                Ok(event) => {
+                                    if telemetry.is_enabled() && first_token_at.is_none() {
+                                        first_token_at = Some(std::time::Instant::now());
+                                    }
+                                    match event {
+                                        ProviderEvent::Text(text) => {
+                                            if telemetry.is_enabled() {
+                                                delta_count += 1;
+                                                delta_chars += text.chars().count();
+                                            }
+                                            streamed_text.push_str(&text);
+                                            task_partial.lock().unwrap().push_str(&text);
+                                            events.publish(Event::Token { request_id, text });
                                         }
-                                        delta_count += 1;
-                                        delta_chars += text.chars().count();
+                                        ProviderEvent::ToolCalls(tool_calls) => {
+                                            if telemetry.is_enabled() {
+                                                step_tool_names = tool_calls
+                                                    .iter()
+                                                    .map(|call| call.name.clone())
+                                                    .collect();
+                                            }
+                                            calls = tool_calls;
+                                        }
+                                        ProviderEvent::Usage {
+                                            prompt_tokens: prompt,
+                                            cached_tokens: cached,
+                                            completion_tokens: completion,
+                                        } => {
+                                            step_prompt_tokens =
+                                                add_tokens(step_prompt_tokens, prompt);
+                                            step_cached_tokens =
+                                                add_tokens(step_cached_tokens, cached);
+                                            step_completion_tokens =
+                                                add_tokens(step_completion_tokens, completion);
+                                            prompt_tokens = add_tokens(prompt_tokens, prompt);
+                                            cached_tokens = add_tokens(cached_tokens, cached);
+                                            completion_tokens =
+                                                add_tokens(completion_tokens, completion);
+                                        }
                                     }
-                                    streamed_text.push_str(&text);
-                                    task_partial.lock().unwrap().push_str(&text);
-                                    events.publish(Event::Token { request_id, text });
-                                }
-                                Ok(ProviderEvent::ToolCalls(tool_calls)) => {
-                                    if telemetry.is_enabled() {
-                                        step_tool_names = tool_calls
-                                            .iter()
-                                            .map(|call| call.name.clone())
-                                            .collect();
-                                    }
-                                    calls = tool_calls;
-                                }
-                                Ok(ProviderEvent::Usage {
-                                    prompt_tokens: prompt,
-                                    cached_tokens: cached,
-                                    completion_tokens: completion,
-                                }) => {
-                                    step_prompt_tokens = add_tokens(step_prompt_tokens, prompt);
-                                    step_cached_tokens = add_tokens(step_cached_tokens, cached);
-                                    step_completion_tokens =
-                                        add_tokens(step_completion_tokens, completion);
-                                    prompt_tokens = add_tokens(prompt_tokens, prompt);
-                                    cached_tokens = add_tokens(cached_tokens, cached);
-                                    completion_tokens = add_tokens(completion_tokens, completion);
                                 }
                                 Err(error) => {
                                     failure_kind =
@@ -998,6 +1031,7 @@ impl App {
                             request: request_id,
                             step,
                             estimate_tokens: prompt_estimate,
+                            estimate_scaled: scaled_estimate(prompt_estimate, scale),
                             scale_ppm: scale,
                             duration_us: crate::telemetry::micros(provider_started.elapsed()),
                             first_token_us: first_token_at.map(|first| {
@@ -1081,12 +1115,12 @@ impl App {
                     }
 
                     let tool_started = std::time::Instant::now();
-                    let (mut content, ok) =
-                        if current_mode == tupi_kernel::AgentMode::Sdd
-                            && tools.get(&call.name).is_some_and(|t| !t.sdd_allowed())
-                        {
-                            (format!("tool '{}' bloqueada no modo SDD", call.name), false)
-                        } else { match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
+                    let (mut content, ok) = if current_mode == tupi_kernel::AgentMode::Sdd
+                        && tools.get(&call.name).is_some_and(|t| !t.sdd_allowed())
+                    {
+                        (format!("tool '{}' bloqueada no modo SDD", call.name), false)
+                    } else {
+                        match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
                             crate::pipeline::execute(
                                 &tools,
                                 &events,
@@ -1110,7 +1144,8 @@ impl App {
                         } {
                             Ok(result) => (result, true),
                             Err(error) => (error, false),
-                        } };
+                        }
+                    };
                     if ok
                         && call.name == "sdd"
                         && serde_json::from_str::<serde_json::Value>(&call.arguments)
@@ -1185,6 +1220,7 @@ impl App {
                 }
                 pending.lock().unwrap().clear();
                 if closed_sdd {
+                    sdd_flow_started.store(false, Ordering::SeqCst);
                     mode_cell.store(tupi_kernel::AgentMode::Execution.as_u8(), Ordering::SeqCst);
                     events.publish(Event::ModeChanged {
                         mode: tupi_kernel::AgentMode::Execution,
@@ -1476,6 +1512,14 @@ impl CommandHandler for App {
                     if self.active.load(Ordering::SeqCst) != 0 {
                         return Err(CommandError::Busy);
                     }
+                    if self.mode() == tupi_kernel::AgentMode::Sdd
+                        && self.sdd_flow_started.load(Ordering::SeqCst)
+                    {
+                        self.events.publish(Event::Notice {
+                            message: SDD_LOCK_NOTICE.to_string(),
+                        });
+                        return Ok(CommandOutcome::Noop);
+                    }
                     let next = match self.mode() {
                         tupi_kernel::AgentMode::Execution => tupi_kernel::AgentMode::Sdd,
                         tupi_kernel::AgentMode::Sdd => tupi_kernel::AgentMode::Execution,
@@ -1487,6 +1531,15 @@ impl CommandHandler for App {
                 Command::SetMode { mode } => {
                     if self.active.load(Ordering::SeqCst) != 0 {
                         return Err(CommandError::Busy);
+                    }
+                    if self.mode() == tupi_kernel::AgentMode::Sdd
+                        && mode != tupi_kernel::AgentMode::Sdd
+                        && self.sdd_flow_started.load(Ordering::SeqCst)
+                    {
+                        self.events.publish(Event::Notice {
+                            message: SDD_LOCK_NOTICE.to_string(),
+                        });
+                        return Ok(CommandOutcome::Noop);
                     }
                     self.mode.store(mode.as_u8(), Ordering::SeqCst);
                     self.events.publish(Event::ModeChanged { mode });
@@ -1501,6 +1554,7 @@ impl CommandHandler for App {
                     close_unanswered(&self.session, &self.pending, "nova sessão iniciada");
                     self.session.replace_messages(Vec::new());
                     self.memory.new_session();
+                    self.sdd_flow_started.store(false, Ordering::SeqCst);
 
                     Ok(CommandOutcome::SessionReset)
                 }
@@ -2026,6 +2080,12 @@ mod budget_tests {
     }
 
     #[test]
+    fn a_scaled_estimate_multiplies_when_the_provider_charges_more() {
+        assert_eq!(scaled_estimate(16_000, SCALE_ONE * 2), 32_000);
+        assert_eq!(scaled_estimate(16_000, SCALE_ONE), 16_000);
+    }
+
+    #[test]
     fn the_scale_moves_toward_the_observation() {
         assert_eq!(next_scale(SCALE_ONE, Some(SCALE_ONE * 3)), SCALE_ONE * 2);
         assert_eq!(next_scale(SCALE_ONE * 2, None), SCALE_ONE * 2);
@@ -2103,7 +2163,21 @@ mod budget_tests {
 }
 impl App {
     pub fn with_memory(self: Arc<Self>, root: std::path::PathBuf) -> Arc<Self> {
-        self.memory.attach(root);
+        self.memory.attach(root, None);
+        self
+    }
+
+    /// Gancho que completa o `ai.project.json` com a janela do modelo em uso.
+    ///
+    /// Sem gancho (construtores de teste) nada toca em disco, e o erro de
+    /// escrita fica dentro do closure: a troca de modelo nunca falha por I/O.
+    pub fn with_model_recorder(
+        mut self: Arc<Self>,
+        recorder: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .model_recorder = Some(recorder);
         self
     }
 

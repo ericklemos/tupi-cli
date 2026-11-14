@@ -36,11 +36,7 @@ async fn graph_endpoints_handle_empty_graph_and_unknown_symbol() {
     assert_eq!(body["node_count"], 0);
     assert_eq!(body["edge_count"], 0);
 
-    let (status, body) = get(
-        app,
-        "/api/graph/neighborhood?symbol=funcao_que_nao_existe",
-    )
-    .await;
+    let (status, body) = get(app, "/api/graph/neighborhood?symbol=funcao_que_nao_existe").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].is_string());
 }

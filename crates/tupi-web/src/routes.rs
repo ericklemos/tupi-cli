@@ -110,11 +110,17 @@ pub(crate) fn router(ctx: Arc<DashboardContext>) -> Router {
         .route("/api/workflows", get(workflows))
         .route("/api/graph/summary", get(crate::graph_api::summary))
         .route("/api/graph/search", get(crate::graph_api::search))
-        .route("/api/graph/neighborhood", get(crate::graph_api::neighborhood))
+        .route(
+            "/api/graph/neighborhood",
+            get(crate::graph_api::neighborhood),
+        )
         .route("/api/graph/trace", get(crate::graph_api::trace))
         .route("/api/memory", get(crate::inspect_api::memory))
         .route("/api/state", get(crate::inspect_api::state))
-        .route("/api/telemetry/recent", get(crate::inspect_api::telemetry_recent))
+        .route(
+            "/api/telemetry/recent",
+            get(crate::inspect_api::telemetry_recent),
+        )
         .route("/api/events", get(crate::events::events))
         .layer(axum::middleware::from_fn(guard))
         .with_state(AppState { ctx, hub })
@@ -177,10 +183,7 @@ async fn overview(State(state): State<AppState>) -> Json<OverviewDto> {
         root: ctx.root.display().to_string(),
         state_dir: ctx.state_dir.display().to_string(),
         telemetry_enabled: ctx.telemetry.is_enabled(),
-        telemetry_path: ctx
-            .telemetry
-            .path()
-            .map(|path| path.display().to_string()),
+        telemetry_path: ctx.telemetry.path().map(|path| path.display().to_string()),
         stats: ctx.telemetry.stats().into(),
         fact_count: facts.iter().filter(|fact| fact.live()).count(),
         open_pending_count: pendings.iter().filter(|pending| pending.open()).count(),
@@ -260,11 +263,7 @@ fn workflow_dto(workflow: Workflow) -> WorkflowDto {
         description: workflow.description,
         source: workflow_source_name(&workflow.source),
         path: workflow.path.map(|path| path.display().to_string()),
-        shadowed: workflow
-            .shadowed
-            .iter()
-            .map(workflow_source_name)
-            .collect(),
+        shadowed: workflow.shadowed.iter().map(workflow_source_name).collect(),
     }
 }
 

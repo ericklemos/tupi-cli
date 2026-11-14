@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 tupi-domain.workspace = true
+tupi-tools.workspace = true
 tupi-kernel.workspace = true
 tupi-providers.workspace = true
 tupi-store.workspace = true

@@ -2,7 +2,7 @@
 
 # Tabs de sessão estilo navegador na TUI do Tupi (`tabs-sessoes-multiplas`)
 
-**Status:** draft
+**Status:** closed
 
 ## Objetivo
 
@@ -39,16 +39,16 @@ Permitir múltiplas sessões de conversa vivas e evoluindo em paralelo no Tupi (
 
 ## Tasks
 
-- [ ] **T1** Protocolo ciente de sessão (tupi-domain + tupi-kernel)
+- [~] **T1** Protocolo ciente de sessão (tupi-domain + tupi-kernel)
   - Objetivo: cada `Command`, `Query` e evento ambíguo passa a nomear a sessão, sem reescrever os ~56 call sites de teste em `crates/tupi-app/tests`.
-  - [ ] **T1.1** `CommandBus::dispatch_in(session, command)` mantendo `dispatch(command)` no foco — `CommandBus` ganha `dispatch_in`; `dispatch` injeta o foco atual. Testes existentes de `tupi-app/tests` compilam sem alteração.
+  - [x] **T1.1** `CommandBus::dispatch_in(session, command)` mantendo `dispatch(command)` no foco — `CommandBus` ganha `dispatch_in`; `dispatch` injeta o foco atual. Testes existentes de `tupi-app/tests` compilam sem alteração.
   - [ ] **T1.2** `Event`: `session: SessionId` nos 6 variantes sem `request_id` — `Memory`, `Notice`, `ModelsLoaded`, `ModelsFailed`, `ModeChanged` e `ContextBudget` (`crates/tupi-domain/src/lib.rs:125-194`) carregam `session`. `Token`/`ToolStarted`/`ToolFinished`/`ContextUpdated`/`ContextTrimmed`/`StreamFinished`/`StreamFailed`/`PromptMessages` não mudam (já roteáveis por `request_id`).
-  - [ ] **T1.3** `Query::History` por sessão com foco como default — `Query::History` lê o histórico da sessão pedida; sem sessão explícita usa o foco, preservando `history` (`crates/tupi-app/tests/pipeline.rs:173`).
-- [ ] **T2** `Memory` independente por sessão sobre o ledger do repositório
+  - [x] **T1.3** `Query::History` por sessão com foco como default — `Query::History` lê o histórico da sessão pedida; sem sessão explícita usa o foco, preservando `history` (`crates/tupi-app/tests/pipeline.rs:173`).
+- [x] **T2** `Memory` independente por sessão sobre o ledger do repositório
   - Três camadas: ledger de fatos (repositório, compartilhado), fila de pendências (append-only, decisão tomada) e estado in-memory (por sessão).
-  - [ ] **T2.1** Injetar `SessionId` na `Memory` e eliminar a colisão de `next_session` — `Memory::next_session` (`crates/tupi-app/src/memory.rs:144-147`) deixa de derivar id de `{pid}-{now}-{sequence}` local; duas instâncias criadas no mesmo segundo no mesmo processo geram ids distintos (teste novo).
-  - [ ] **T2.2** Migrar a fila de pendências para log append-only — `open_pending`/`close_pending` viram linhas de log append-only; leitura reconcilia o log aplicando os fechamentos; compactação reescreve só quando o log passa de um limiar. Teste: 2 sessões fechando pendências ao mesmo tempo preservam os 2 fechamentos (sem lock global).
-  - [ ] **T2.3** Dividir o ledger de fatos entre sessões, não a dívida de recall — Sessão A e B enxergam o mesmo `facts.jsonl`; `/new` em A zera apenas `session`/`first_turn`/`cache` de A. Teste: `Memory::new_session` em A não altera `first_turn` nem o cache de B (`crates/tupi-app/src/memory.rs:93-100`).
+  - [x] **T2.1** Injetar `SessionId` na `Memory` e eliminar a colisão de `next_session` — `Memory::next_session` (`crates/tupi-app/src/memory.rs:144-147`) deixa de derivar id de `{pid}-{now}-{sequence}` local; duas instâncias criadas no mesmo segundo no mesmo processo geram ids distintos (teste novo).
+  - [x] **T2.2** Migrar a fila de pendências para log append-only — `open_pending`/`close_pending` viram linhas de log append-only; leitura reconcilia o log aplicando os fechamentos; compactação reescreve só quando o log passa de um limiar. Teste: 2 sessões fechando pendências ao mesmo tempo preservam os 2 fechamentos (sem lock global).
+  - [x] **T2.3** Dividir o ledger de fatos entre sessões, não a dívida de recall — Sessão A e B enxergam o mesmo `facts.jsonl`; `/new` em A zera apenas `session`/`first_turn`/`cache` de A. Teste: `Memory::new_session` em A não altera `first_turn` nem o cache de B (`crates/tupi-app/src/memory.rs:93-100`).
 - [ ] **T3** `Sessions` em tupi-app: runtime por sessão com turnos paralelos
   - Hoje `App` é Arc<Self> com turno único: `active` com `compare_exchange(0, u64::MAX)` (`crates/tupi-app/src/app.rs:673-680`), `current` e `pending` singulares (`crates/tupi-app/src/app.rs:362-401`).
   - [ ] **T3.1** Extrair o runtime de turno de `App` para `SessionRuntime` — `active`, `current`, `pending`, `next_request`, `token_scale`, `SessionStore`, `Memory` e a célula de modo migram de `App` para `SessionRuntime`; `App` mantém só o compartilhado (registry base, events, redb, state dirs, telemetry, workflows, prefix, context profile).

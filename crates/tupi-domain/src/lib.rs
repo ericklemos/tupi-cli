@@ -193,7 +193,6 @@ pub enum Event {
     },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

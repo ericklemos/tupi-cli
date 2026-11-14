@@ -95,7 +95,6 @@ pub struct Memory {
     enabled: AtomicBool,
     session: Mutex<String>,
     first_turn: AtomicBool,
-    sequence: AtomicU64,
     cache: Mutex<HashMap<String, Option<MemoryBlock>>>,
 }
 
@@ -106,23 +105,25 @@ impl Memory {
             enabled: AtomicBool::new(false),
             session: Mutex::new(String::new()),
             first_turn: AtomicBool::new(true),
-            sequence: AtomicU64::new(1),
             cache: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn new(root: PathBuf) -> Self {
         let memory = Self::disabled();
-        memory.attach(root);
+        memory.attach(root, None);
         memory
     }
 
-    pub fn attach(&self, root: PathBuf) {
+    pub fn attach(&self, root: PathBuf, label: Option<String>) {
         *self.root.lock().unwrap() = Some(root);
         self.enabled.store(true, Ordering::SeqCst);
         let mut session = self.session.lock().unwrap();
-        if session.is_empty() {
-            *session = self.next_session();
+        match label {
+            // Rótulo injetado de fora: `Sessions` é o único dono dos ids.
+            Some(label) => *session = label,
+            None if session.is_empty() => *session = self.next_session(),
+            None => {}
         }
     }
 
@@ -142,7 +143,10 @@ impl Memory {
     }
 
     fn next_session(&self) -> String {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        // Contador do processo: duas `Memory` criadas no mesmo segundo continuam
+        // recebendo ids distintos. O rótulo nunca pode sair de estado local.
+        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::SeqCst);
         format!("{}-{}-{sequence}", std::process::id(), memory::now())
     }
 
@@ -152,14 +156,23 @@ impl Memory {
 
     /// Rotaciona a sessão: a leitura da memória volta a ser devida.
     pub fn new_session(&self) -> String {
+        let previous = self.session();
         let session = self.next_session();
         *self.session.lock().unwrap() = session.clone();
         self.first_turn.store(true, Ordering::SeqCst);
         self.cache.lock().unwrap().clear();
         if let Some(root) = self.active_root() {
+            // Fecha só a dívida desta aba: o log é do repositório, mas o id
+            // carrega a sessão dona, então a irmã não é afetada.
+            let feedback = format!("{previous}:{}", memory::FEEDBACK_ID);
             let mut queue = memory::pendings(&root);
-            if memory::close_pending(&mut queue, memory::FEEDBACK_ID, "session", "nova sessão") {
-                let _ = memory::save_pendings(&root, &queue);
+            if memory::close_pending(&mut queue, &feedback, "session", "nova sessão") {
+                let touched: Vec<memory::Pending> = queue
+                    .iter()
+                    .filter(|pending| pending.id == feedback)
+                    .cloned()
+                    .collect();
+                let _ = memory::save_pendings(&root, &touched);
             }
         }
         session
@@ -179,35 +192,29 @@ impl Memory {
         if session.is_empty() {
             return None;
         }
+        // A dívida de recall é da aba: o id no log carrega a sessão dona, então
+        // a consulta de uma aba não quita a dívida da irmã.
+        let read = format!("{session}:{}", memory::READ_ID);
+        let feedback = format!("{session}:{}", memory::FEEDBACK_ID);
+        // Só as linhas que esta aba tocou vão para o log: anexar o retrato
+        // inteiro da fila reintroduziria o estado velho das abas irmãs.
+        let touched = |queue: &Vec<memory::Pending>| -> Vec<memory::Pending> {
+            queue
+                .iter()
+                .filter(|pending| pending.id == read || pending.id == feedback)
+                .cloned()
+                .collect()
+        };
 
         if self.first_turn.swap(false, Ordering::SeqCst) {
             let mut queue = memory::pendings(&root);
-            let mut changed =
-                memory::open_pending(&mut queue, memory::READ_ID, memory::READ_KIND, &session);
-            if let Some(stale) = queue
-                .iter()
-                .find(|pending| {
-                    pending.id == memory::FEEDBACK_ID
-                        && pending.open()
-                        && !pending.session.is_empty()
-                        && pending.session != session
-                })
-                .map(|pending| pending.id.clone())
-            {
-                changed |= memory::close_pending(
-                    &mut queue,
-                    &stale,
-                    "session",
-                    "sessão anterior encerrada",
-                );
-            }
-            if changed {
-                let _ = memory::save_pendings(&root, &queue);
+            if memory::open_pending(&mut queue, &read, memory::READ_KIND, &session) {
+                let _ = memory::save_pendings(&root, &touched(&queue));
             }
         }
 
         let queue = memory::pendings(&root);
-        if !memory::is_open(&queue, memory::READ_ID) {
+        if !memory::is_open(&queue, &read) {
             return None;
         }
 
@@ -215,14 +222,9 @@ impl Memory {
         // retroalimentação para o extrator semear a memória.
         if memory::facts(&root).is_empty() {
             let mut queue = memory::pendings(&root);
-            memory::close_pending(&mut queue, memory::READ_ID, "recall", "no-facts");
-            memory::open_pending(
-                &mut queue,
-                memory::FEEDBACK_ID,
-                memory::FEEDBACK_KIND,
-                &session,
-            );
-            let _ = memory::save_pendings(&root, &queue);
+            memory::close_pending(&mut queue, &read, "recall", "no-facts");
+            memory::open_pending(&mut queue, &feedback, memory::FEEDBACK_KIND, &session);
+            let _ = memory::save_pendings(&root, &touched(&queue));
             return None;
         }
 
@@ -232,15 +234,10 @@ impl Memory {
 
         let mut queue = memory::pendings(&root);
         let reason = format!("injected:{}", block.facts);
-        let mut changed = memory::close_pending(&mut queue, memory::READ_ID, "recall", &reason);
-        changed |= memory::open_pending(
-            &mut queue,
-            memory::FEEDBACK_ID,
-            memory::FEEDBACK_KIND,
-            &session,
-        );
+        let mut changed = memory::close_pending(&mut queue, &read, "recall", &reason);
+        changed |= memory::open_pending(&mut queue, &feedback, memory::FEEDBACK_KIND, &session);
         if changed {
-            let _ = memory::save_pendings(&root, &queue);
+            let _ = memory::save_pendings(&root, &touched(&queue));
         }
         Some(block)
     }
@@ -276,15 +273,20 @@ impl Memory {
     }
 
     fn consulted(&self, root: &Path) {
+        let session = self.session();
+        let read = format!("{session}:{}", memory::READ_ID);
+        let feedback = format!("{session}:{}", memory::FEEDBACK_ID);
         let mut queue = memory::pendings(root);
-        if memory::close_pending(&mut queue, memory::READ_ID, "recall", "injected:tool") {
-            memory::open_pending(
-                &mut queue,
-                memory::FEEDBACK_ID,
-                memory::FEEDBACK_KIND,
-                &self.session(),
-            );
-            let _ = memory::save_pendings(root, &queue);
+        if memory::close_pending(&mut queue, &read, "recall", "injected:tool") {
+            memory::open_pending(&mut queue, &feedback, memory::FEEDBACK_KIND, &session);
+            // Append-only: só as linhas desta aba, para não regravar o retrato
+            // velho das abas irmãs.
+            let touched: Vec<memory::Pending> = queue
+                .iter()
+                .filter(|pending| pending.id == read || pending.id == feedback)
+                .cloned()
+                .collect();
+            let _ = memory::save_pendings(root, &touched);
         }
     }
 
@@ -337,8 +339,10 @@ impl Memory {
         if cancel.load(Ordering::SeqCst) || evidence.tools.is_empty() {
             return None;
         }
+        // A dívida de retroalimentação é da aba: o id no log carrega a sessão.
+        let feedback = format!("{}:{}", self.session(), memory::FEEDBACK_ID);
         let queue = memory::pendings(&root);
-        if !memory::is_open(&queue, memory::FEEDBACK_ID) {
+        if !memory::is_open(&queue, &feedback) {
             return None;
         }
 
@@ -369,8 +373,15 @@ impl Memory {
         } else {
             format!("added:{added}")
         };
-        memory::close_pending(&mut queue, memory::FEEDBACK_ID, "extractor", &reason);
-        let _ = memory::save_pendings(&root, &queue);
+        if memory::close_pending(&mut queue, &feedback, "extractor", &reason) {
+            // Append-only: anexa só a linha desta aba, sem regravar a fila.
+            let touched: Vec<memory::Pending> = queue
+                .iter()
+                .filter(|pending| pending.id == feedback)
+                .cloned()
+                .collect();
+            let _ = memory::save_pendings(&root, &touched);
+        }
 
         Some(FeedOutcome {
             added,
@@ -717,8 +728,15 @@ mod async_memory_tests {
         assert!(block.text.contains("PKCE"));
         assert!(!block.text.contains("watcher"));
         let queue = memory::pendings(root.path());
-        assert!(!memory::is_open(&queue, memory::READ_ID));
-        assert!(memory::is_open(&queue, memory::FEEDBACK_ID));
+        let owner = memory.session();
+        assert!(!memory::is_open(
+            &queue,
+            &format!("{owner}:{}", memory::READ_ID)
+        ));
+        assert!(memory::is_open(
+            &queue,
+            &format!("{owner}:{}", memory::FEEDBACK_ID)
+        ));
     }
 
     #[tokio::test]

@@ -135,6 +135,74 @@ async fn wait_finished(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> Vec<
 }
 
 #[tokio::test]
+async fn shift_tab_is_blocked_after_first_message_in_sdd() {
+    let bus = EventBus::new(16);
+    let mut rx = bus.subscribe();
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![Ok(ProviderEvent::Text(
+        "vamos planejar".into(),
+    ))]]));
+    let app = App::with_tools(
+        registry(provider),
+        "scripted",
+        "m".into(),
+        bus,
+        None,
+        ToolRegistry::new(),
+        "BASE".into(),
+    )
+    .with_mode_cell(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8())));
+
+    // Antes de qualquer mensagem, a troca é livre: SDD -> Execution -> SDD.
+    assert!(matches!(
+        app.handle(Command::ToggleMode).await.unwrap(),
+        CommandOutcome::ModeChanged {
+            mode: AgentMode::Execution
+        }
+    ));
+    app.handle(Command::ToggleMode).await.unwrap();
+
+    app.handle(Command::SendMessage {
+        text: "quero auth".into(),
+    })
+    .await
+    .unwrap();
+    wait_finished(&mut rx).await;
+
+    let outcome = app.handle(Command::ToggleMode).await.unwrap();
+    assert!(matches!(outcome, CommandOutcome::Noop));
+    assert_eq!(app.mode(), AgentMode::Sdd);
+
+    // SetMode também não pode furar a trava.
+    assert!(matches!(
+        app.handle(Command::SetMode {
+            mode: AgentMode::Execution
+        })
+        .await
+        .unwrap(),
+        CommandOutcome::Noop
+    ));
+
+    let mut locked_notice = false;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Notice { message } = event
+            && message.contains("SDD em andamento")
+        {
+            locked_notice = true;
+        }
+    }
+    assert!(locked_notice, "a tentativa de troca precisa avisar");
+
+    // /new destrava.
+    app.handle(Command::NewSession).await.unwrap();
+    assert!(matches!(
+        app.handle(Command::ToggleMode).await.unwrap(),
+        CommandOutcome::ModeChanged {
+            mode: AgentMode::Execution
+        }
+    ));
+}
+
+#[tokio::test]
 async fn toggle_mode_emits_event_and_filters_specs_in_sdd_mode() {
     let bus = EventBus::new(32);
     let mut rx = bus.subscribe();
@@ -253,11 +321,14 @@ async fn closing_sdd_mid_turn_trims_session_without_orphaned_tool_results_and_un
             title: "Refresh".into(),
             details: "Renovar antes de expirar".into(),
             nuances: vec![],
+            parallel: false,
             status: SddTaskStatus::Open,
             subtasks: vec![SddSubtask {
                 id: "T1.1".into(),
                 title: "Mutex".into(),
                 acceptance: "Teste passa".into(),
+                touches: vec![],
+                acceptance_test: None,
                 status: SddSubtaskStatus::Open,
             }],
         }],
@@ -334,6 +405,14 @@ async fn closing_sdd_mid_turn_trims_session_without_orphaned_tool_results_and_un
         "edit deve estar liberado no step seguinte"
     );
     assert_eq!(app.mode(), AgentMode::Execution);
+
+    // O fechamento destrava a troca de modo.
+    assert!(matches!(
+        app.handle(Command::ToggleMode).await.unwrap(),
+        CommandOutcome::ModeChanged {
+            mode: AgentMode::Sdd
+        }
+    ));
     assert!(events.iter().any(|e| matches!(
         e,
         Event::ModeChanged {
@@ -377,10 +456,8 @@ async fn closing_sdd_mid_turn_trims_session_without_orphaned_tool_results_and_un
 
 #[tokio::test]
 async fn toggling_mode_twice_keeps_the_sdd_plan_open_and_does_not_announce_close() {
-    let db_path = std::env::temp_dir().join(format!(
-        "tupi-app-sdd-toggle-{}.redb",
-        std::process::id()
-    ));
+    let db_path =
+        std::env::temp_dir().join(format!("tupi-app-sdd-toggle-{}.redb", std::process::id()));
     let _ = std::fs::remove_file(&db_path);
     let store = Arc::new(Store::open(&db_path).unwrap());
     let repo_key = "repo-toggle".to_string();

@@ -158,8 +158,12 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
         .iter()
         .find(|line| line["event"] == "prompt_sent")
         .unwrap();
-    assert!(prompt["body"].as_str().unwrap().contains("oi"));
     assert_eq!(prompt["body_hash"].as_str().unwrap().len(), 12);
+    assert!(prompt["body_chars"].as_u64().unwrap() > 0);
+    assert!(prompt["estimate_scaled"].as_u64().is_some());
+    if std::env::var("TUPI_TELEMETRY_BODY").is_err() {
+        assert!(prompt["body"].as_str().unwrap().is_empty());
+    }
 
     let tool = lines
         .iter()
@@ -185,6 +189,11 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
         .collect();
     assert_eq!(responses.len(), 2);
     assert!(responses.iter().all(|line| line["ok"] == true));
+    assert!(
+        responses
+            .iter()
+            .all(|line| line["estimate_scaled"].as_u64().is_some())
+    );
 
     let seqs: Vec<u64> = lines
         .iter()

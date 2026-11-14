@@ -18,7 +18,15 @@ fn browser_command(url: &str) -> (&'static str, Vec<String>) {
 
 #[cfg(target_os = "windows")]
 fn browser_command(url: &str) -> (&'static str, Vec<String>) {
-    ("cmd", vec!["/C".to_string(), "start".to_string(), String::new(), url.to_string()])
+    (
+        "cmd",
+        vec![
+            "/C".to_string(),
+            "start".to_string(),
+            String::new(),
+            url.to_string(),
+        ],
+    )
 }
 
 /// Dispara o processo em segundo plano. Devolve `false` quando o programa não

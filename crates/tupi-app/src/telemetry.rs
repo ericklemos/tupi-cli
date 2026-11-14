@@ -153,8 +153,9 @@ impl Telemetry {
         }
     }
 
-    /// Respeita TUPI_TELEMETRY (0/off/false desliga) e TUPI_TELEMETRY_PATH
-    /// (troca o destino).
+    /// Respeita TUPI_TELEMETRY (0/off/false desliga), TUPI_TELEMETRY_PATH
+    /// (troca o destino) e TUPI_TELEMETRY_BODY (1/on/true/yes guarda o corpo
+    /// do prompt; desligado por padrão).
     pub fn from_env(default_path: PathBuf) -> Self {
         if let Ok(value) = std::env::var("TUPI_TELEMETRY")
             && matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
@@ -460,6 +461,9 @@ pub struct PromptSent {
     pub body_bytes: usize,
     pub truncated: bool,
     pub estimate_tokens: usize,
+    /// `estimate_tokens` corrigido pela escala observada; é o valor que se
+    /// compara com `prompt_tokens`.
+    pub estimate_scaled: usize,
     pub messages: usize,
     pub tools: usize,
 }
@@ -472,9 +476,14 @@ pub struct ProviderResponse {
     /// `prompt_tokens`, mostra quanto o template do provedor cobra além do
     /// que o histórico declara.
     pub estimate_tokens: usize,
+    /// `estimate_tokens` corrigido pela escala observada; é o valor que se
+    /// compara com `prompt_tokens`.
+    pub estimate_scaled: usize,
     /// Correção de orçamento em vigor no passo (1_000_000 = sem correção).
     pub scale_ppm: u64,
     pub duration_us: u64,
+    /// Tempo até o primeiro evento do stream (texto, tool call ou usage).
+    /// `None` quando o stream falha antes de produzir qualquer evento.
     pub first_token_us: Option<u64>,
     pub delta_count: usize,
     pub delta_chars: usize,
@@ -831,6 +840,37 @@ pub fn clip(text: &str) -> Clipped {
     clip_to(text, MAX_TEXT_BYTES)
 }
 
+/// Corpo do prompt na telemetria. Por padrão fica vazio: reescrever o
+/// histórico inteiro a cada passo domina o arquivo e o rodízio apaga o começo
+/// das sessões longas. Ligue com `TUPI_TELEMETRY_BODY=1` para depurar o
+/// payload literal.
+pub fn prompt_body(text: &str) -> Clipped {
+    let requested = std::env::var("TUPI_TELEMETRY_BODY")
+        .ok()
+        .is_some_and(|value| body_requested(&value));
+    prompt_body_with(text, requested)
+}
+
+fn body_requested(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
+}
+
+fn prompt_body_with(text: &str, include: bool) -> Clipped {
+    if include {
+        return clip_preview(text);
+    }
+
+    Clipped {
+        text: String::new(),
+        chars: text.chars().count(),
+        bytes: text.len(),
+        truncated: !text.is_empty(),
+    }
+}
+
 pub fn clip_preview(text: &str) -> Clipped {
     clip_to(text, PROMPT_PREVIEW_BYTES)
 }
@@ -1088,6 +1128,30 @@ mod tests {
     }
 
     #[test]
+    fn prompt_body_is_omitted_unless_requested() {
+        let text = "sistema\nusuário";
+        let hidden = prompt_body_with(text, false);
+        assert!(hidden.text.is_empty());
+        assert_eq!(hidden.chars, text.chars().count());
+        assert_eq!(hidden.bytes, text.len());
+        assert!(hidden.truncated);
+
+        let shown = prompt_body_with(text, true);
+        assert_eq!(shown.text, text);
+        assert!(!shown.truncated);
+    }
+
+    #[test]
+    fn body_flag_accepts_truthy_values() {
+        for value in ["1", "on", "TRUE", "yes"] {
+            assert!(body_requested(value), "{value}");
+        }
+        for value in ["0", "off", "false", ""] {
+            assert!(!body_requested(value), "{value}");
+        }
+    }
+
+    #[test]
     fn text_hash_is_short_and_deterministic() {
         let a = text_hash("abc");
 
@@ -1162,6 +1226,7 @@ mod tests {
             request: 1,
             step: 1,
             estimate_tokens: 10,
+            estimate_scaled: 10,
             scale_ppm: 1_000_000,
             duration_us: 1,
             first_token_us: None,

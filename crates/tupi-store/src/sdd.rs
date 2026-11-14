@@ -28,11 +28,23 @@ pub enum SddSubtaskStatus {
     Done,
 }
 
+/// Teste cargo que prova o aceite de uma subtask.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptanceTest {
+    #[serde(default)]
+    pub package: Option<String>,
+    pub filter: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SddSubtask {
     pub id: String,
     pub title: String,
     pub acceptance: String,
+    #[serde(default)]
+    pub touches: Vec<String>,
+    #[serde(default)]
+    pub acceptance_test: Option<AcceptanceTest>,
     pub status: SddSubtaskStatus,
 }
 
@@ -43,6 +55,8 @@ pub struct SddTask {
     pub details: String,
     #[serde(default)]
     pub nuances: Vec<String>,
+    #[serde(default)]
+    pub parallel: bool,
     pub status: SddTaskStatus,
     #[serde(default)]
     pub subtasks: Vec<SddSubtask>,
@@ -220,11 +234,17 @@ mod tests {
                 title: "Task 1".to_string(),
                 details: "Detalhes".to_string(),
                 nuances: vec![],
+                parallel: true,
                 status: SddTaskStatus::Open,
                 subtasks: vec![SddSubtask {
                     id: "T1.1".to_string(),
                     title: "Subtask 1".to_string(),
                     acceptance: "Passa teste".to_string(),
+                    touches: vec!["src/a.rs".to_string()],
+                    acceptance_test: Some(AcceptanceTest {
+                        package: Some("tupi-app".to_string()),
+                        filter: "sdd_run".to_string(),
+                    }),
                     status: SddSubtaskStatus::Open,
                 }],
             }],

@@ -118,7 +118,6 @@ impl Cache {
 /// Per-message render cache. Invalidate one message while it streams, and
 /// every message when the transcript width changes.
 
-
 fn owned_line(line: Line<'_>) -> Line<'static> {
     let style = line.style;
     let alignment = line.alignment;

@@ -24,6 +24,15 @@ pub enum QueryResult {
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
     async fn query(&self, query: Query) -> Result<QueryResult, QueryError>;
+
+    /// Roteia a consulta para a sessão indicada. `None` resolve no foco atual.
+    async fn query_in(
+        &self,
+        _session: Option<tupi_domain::SessionId>,
+        query: Query,
+    ) -> Result<QueryResult, QueryError> {
+        self.query(query).await
+    }
 }
 
 #[derive(Clone)]
@@ -37,6 +46,15 @@ impl QueryBus {
     }
 
     pub async fn dispatch(&self, query: Query) -> Result<QueryResult, QueryError> {
-        self.handler.query(query).await
+        self.handler.query_in(None, query).await
+    }
+
+    /// Despacha a consulta para uma sessão explícita sem mover o foco.
+    pub async fn dispatch_in(
+        &self,
+        session: tupi_domain::SessionId,
+        query: Query,
+    ) -> Result<QueryResult, QueryError> {
+        self.handler.query_in(Some(session), query).await
     }
 }

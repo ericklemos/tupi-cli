@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tupi_tui::run::{DashboardLauncher, dashboard_notice};
-use tupi_tui::state::{ChatState, COMMANDS};
+use tupi_tui::state::{COMMANDS, ChatState};
 
 struct FakeLauncher;
 

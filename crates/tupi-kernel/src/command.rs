@@ -86,6 +86,17 @@ pub enum CommandOutcome {
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
     async fn handle(&self, command: Command) -> Result<CommandOutcome, CommandError>;
+
+    /// Roteia o comando para a sessão indicada. `None` resolve no foco atual,
+    /// que é o comportamento de `dispatch`. O padrão delega para `handle` para
+    /// que handlers sem noção de sessão continuem válidos.
+    async fn handle_in(
+        &self,
+        _session: Option<tupi_domain::SessionId>,
+        command: Command,
+    ) -> Result<CommandOutcome, CommandError> {
+        self.handle(command).await
+    }
 }
 
 #[derive(Clone)]
@@ -99,6 +110,15 @@ impl CommandBus {
     }
 
     pub async fn dispatch(&self, command: Command) -> Result<CommandOutcome, CommandError> {
-        self.handler.handle(command).await
+        self.handler.handle_in(None, command).await
+    }
+
+    /// Despacha o comando para uma sessão explícita sem mover o foco.
+    pub async fn dispatch_in(
+        &self,
+        session: tupi_domain::SessionId,
+        command: Command,
+    ) -> Result<CommandOutcome, CommandError> {
+        self.handler.handle_in(Some(session), command).await
     }
 }

@@ -1,11 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
+use axum::Json;
 use axum::extract::{Query as QueryParams, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use petgraph::visit::EdgeRef;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use tupi_tools::graph::{Def, ProjectCodeGraph, RelationKind, SymbolNode};
 
@@ -87,7 +87,11 @@ fn def_dto(graph: &ProjectCodeGraph, def: &Def) -> GraphSymbolDto {
         is_public: def.is_public,
         is_callable: def.is_callable,
         is_test: def.is_test,
-        kind: if def.is_callable { "member" } else { "container" },
+        kind: if def.is_callable {
+            "member"
+        } else {
+            "container"
+        },
         callers: graph.callers_for(def).len(),
         callees: def.calls.len(),
     }
@@ -357,10 +361,7 @@ pub(crate) async fn trace(
         let mut edges = Vec::new();
         for pair in indices.windows(2) {
             let (left, right) = (pair[0], pair[1]);
-            if let Some(edge) = graph
-                .graph
-                .edges(left)
-                .find(|edge| edge.target() == right)
+            if let Some(edge) = graph.graph.edges(left).find(|edge| edge.target() == right)
                 && let (Some(from), Some(to)) = (
                     graph.graph.node_weight(edge.source()),
                     graph.graph.node_weight(edge.target()),

@@ -35,11 +35,23 @@ pub enum SddSubtaskStatus {
     Done,
 }
 
+/// Teste cargo que prova o aceite de uma subtask.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptanceTest {
+    #[serde(default)]
+    pub package: Option<String>,
+    pub filter: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SddSubtask {
     pub id: String,
     pub title: String,
     pub acceptance: String,
+    #[serde(default)]
+    pub touches: Vec<String>,
+    #[serde(default)]
+    pub acceptance_test: Option<AcceptanceTest>,
     pub status: SddSubtaskStatus,
 }
 
@@ -50,6 +62,8 @@ pub struct SddTask {
     pub details: String,
     #[serde(default)]
     pub nuances: Vec<String>,
+    #[serde(default)]
+    pub parallel: bool,
     pub status: SddTaskStatus,
     #[serde(default)]
     pub subtasks: Vec<SddSubtask>,
@@ -147,6 +161,7 @@ enum SddAction {
     Activate,
     Close,
     Progress,
+    Execute,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +170,10 @@ struct SubtaskInput {
     title: String,
     #[serde(default)]
     acceptance: String,
+    #[serde(default)]
+    touches: Vec<String>,
+    #[serde(default)]
+    acceptance_test: Option<AcceptanceTest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +184,8 @@ struct TaskInput {
     details: String,
     #[serde(default)]
     nuances: Vec<String>,
+    #[serde(default)]
+    parallel: bool,
     #[serde(default)]
     subtasks: Vec<SubtaskInput>,
 }
@@ -198,6 +219,7 @@ pub struct SddTool {
     mode_cell: Option<Arc<AtomicU8>>,
     response_store: Arc<ResponseStore>,
     default_budget_tokens: usize,
+    pub(crate) executor: Option<Arc<dyn Fn(&SddPlan) -> Result<String, String> + Send + Sync>>,
 }
 
 impl SddTool {
@@ -213,6 +235,7 @@ impl SddTool {
             mode_cell,
             response_store: Arc::new(ResponseStore::new(Duration::from_secs(600), 1024 * 1024)),
             default_budget_tokens,
+            executor: None,
         }
     }
 
@@ -226,6 +249,42 @@ impl SddTool {
             .as_ref()
             .map(|cell| AgentMode::from_u8(cell.load(Ordering::SeqCst)))
             .unwrap_or(AgentMode::Execution)
+    }
+
+    fn execution_spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sdd".to_string(),
+            description: "Consulta e atualiza o progresso de specs SDD no modo execução: status, list, activate, progress e execute.".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "list", "activate", "progress", "execute"],
+                        "description": "Ação SDD disponível no modo Execution."
+                    },
+                    "slug": {
+                        "type": "string",
+                        "description": "Identificador curto da iniciativa ([a-z0-9-_])."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Id da task ou subtask para action=progress."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "in_progress", "done"],
+                        "description": "Novo status para action=progress."
+                    },
+                    "budget_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Teto de tokens da resposta."
+                    }
+                },
+                "required": ["action"]
+            }),
+        }
     }
 
     fn require_sdd_mode(&self, action: &str) -> Result<(), ToolError> {
@@ -264,18 +323,7 @@ impl SddTool {
     }
 
     fn write_markdown_mirror(&self, plan: &SddPlan) -> Result<PathBuf, ToolError> {
-        let rel = format!(".agents/tupi/sdd/{}.md", plan.slug);
-        let target = paths::resolve_for_write(&self.root_dir, &rel)?;
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ToolError::Other(format!("falha ao criar diretório SDD: {error}"))
-            })?;
-        }
-        let md = render_markdown(plan);
-        paths::atomic_write(&target, md.as_bytes()).map_err(|error| {
-            ToolError::Other(format!("falha ao gravar espelho SDD em {rel}: {error}"))
-        })?;
-        Ok(target)
+        write_mirror(&self.root_dir, plan)
     }
 
     fn render_budgeted(&self, sections: Vec<Section>, budget_tokens: usize) -> String {
@@ -330,6 +378,21 @@ fn status_label_task(status: SddTaskStatus) -> &'static str {
     }
 }
 
+/// Grava o espelho markdown do plano em `.agents/tupi/sdd/<slug>.md`.
+pub fn write_mirror(root: &std::path::Path, plan: &SddPlan) -> Result<PathBuf, ToolError> {
+    let rel = format!(".agents/tupi/sdd/{}.md", plan.slug);
+    let target = paths::resolve_for_write(root, &rel)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ToolError::Other(format!("falha ao criar diretório SDD: {error}")))?;
+    }
+    let md = render_markdown(plan);
+    paths::atomic_write(&target, md.as_bytes()).map_err(|error| {
+        ToolError::Other(format!("falha ao gravar espelho SDD em {rel}: {error}"))
+    })?;
+    Ok(target)
+}
+
 pub fn render_markdown(plan: &SddPlan) -> String {
     let mut out = String::new();
     out.push_str("<!-- Gerado automaticamente pelo tupi (somente leitura; fonte de verdade no banco local). -->\n\n");
@@ -363,7 +426,11 @@ pub fn render_markdown(plan: &SddPlan) -> String {
             SddTaskStatus::InProgress => "~",
             SddTaskStatus::Open => " ",
         };
-        out.push_str(&format!("- [{mark}] **{}** {}\n", task.id, task.title));
+        out.push_str(&format!("- [{mark}] **{}** {}", task.id, task.title));
+        if task.parallel {
+            out.push_str(" (paralela)");
+        }
+        out.push('\n');
         if !task.details.trim().is_empty() {
             out.push_str(&format!("  - {}\n", task.details.trim()));
         }
@@ -376,6 +443,20 @@ pub fn render_markdown(plan: &SddPlan) -> String {
                 SddSubtaskStatus::Open => " ",
             };
             out.push_str(&format!("  - [{smark}] **{}** {}", sub.id, sub.title));
+            if !sub.touches.is_empty() {
+                out.push_str(&format!(" (toca: {})", sub.touches.join(", ")));
+            }
+            if let Some(test) = &sub.acceptance_test {
+                match test.package.as_deref() {
+                    Some(package) => {
+                        out.push_str(&format!(
+                            " (aceite: cargo test -p {package} {})",
+                            test.filter
+                        ));
+                    }
+                    None => out.push_str(&format!(" (aceite: cargo test {})", test.filter)),
+                }
+            }
             if !sub.acceptance.trim().is_empty() {
                 out.push_str(&format!(" — {}", sub.acceptance.trim()));
             }
@@ -523,6 +604,13 @@ impl Tool for SddTool {
         }
     }
 
+    fn spec_for_mode(&self, mode: AgentMode) -> ToolSpec {
+        match mode {
+            AgentMode::Execution => self.execution_spec(),
+            AgentMode::Sdd => self.spec(),
+        }
+    }
+
     fn call(&self, arguments: Value) -> Result<String, ToolError> {
         let params: SddParams = serde_json::from_value(arguments)
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
@@ -632,6 +720,7 @@ impl Tool for SddTool {
                         title: t.title,
                         details: t.details,
                         nuances: t.nuances,
+                        parallel: t.parallel,
                         status: SddTaskStatus::Open,
                         subtasks: t
                             .subtasks
@@ -640,6 +729,8 @@ impl Tool for SddTool {
                                 id: s.id,
                                 title: s.title,
                                 acceptance: s.acceptance,
+                                touches: s.touches,
+                                acceptance_test: s.acceptance_test,
                                 status: SddSubtaskStatus::Open,
                             })
                             .collect(),
@@ -738,13 +829,53 @@ impl Tool for SddTool {
                     .set_active_slug(&rk, Some(&slug))
                     .map_err(ToolError::Other)?;
                 self.write_markdown_mirror(&plan)?;
-                vec![Section {
+                let mut sections = vec![Section {
                     heading: format!("### sdd — spec '{}' fechada", plan.slug),
                     body: format!(
                         "- status: closed\n- tasks: {}\n- espelho: .agents/tupi/sdd/{}.md",
                         plan.tasks.len(),
                         plan.slug
                     ),
+                    priority: 255,
+                }];
+                if let Some(executor) = &self.executor {
+                    let body = match (executor)(&plan) {
+                        Ok(report) => report,
+                        Err(error) => format!("execução SDD falhou: {error}"),
+                    };
+                    sections.push(Section {
+                        heading: "### sdd — execução".to_string(),
+                        body,
+                        priority: 255,
+                    });
+                }
+                sections
+            }
+            SddAction::Execute => {
+                self.require_execution_mode("execute")?;
+                let slug = self.resolve_target_slug(params.slug.as_deref())?;
+                let plan = self
+                    .sdd_store
+                    .load(&rk, &slug)
+                    .map_err(ToolError::Other)?
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(format!("plano '{slug}' não encontrado"))
+                    })?;
+                if plan.status == SddPlanStatus::Draft {
+                    return Err(ToolError::Other(
+                        "feche o plano SDD antes de executar".into(),
+                    ));
+                }
+                let executor = self.executor.as_ref().ok_or_else(|| {
+                    ToolError::Other("execução SDD não configurada neste processo".into())
+                })?;
+                let body = match (executor)(&plan) {
+                    Ok(report) => report,
+                    Err(error) => format!("execução SDD falhou: {error}"),
+                };
+                vec![Section {
+                    heading: "### sdd — execução".to_string(),
+                    body,
                     priority: 255,
                 }]
             }
@@ -875,6 +1006,36 @@ mod tests {
     use tupi_kernel::{AgentMode, Tool};
 
     use super::*;
+
+    #[test]
+    fn execution_spec_lists_only_progress_actions() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemorySddStore::default());
+        let tool = SddTool::new(dir.path().to_path_buf(), store, None, 2000);
+
+        let exec = tool.spec_for_mode(AgentMode::Execution);
+        let actions: Vec<&str> = exec.schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["status", "list", "activate", "progress", "execute"]
+        );
+        assert!(exec.schema["properties"].get("tasks").is_none());
+
+        let sdd = tool.spec_for_mode(AgentMode::Sdd);
+        let actions: Vec<&str> = sdd.schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(actions.contains(&"upsert_spec"));
+        assert!(sdd.schema["properties"].get("tasks").is_some());
+    }
 
     #[test]
     fn sdd_upsert_spec_set_tasks_and_writes_markdown_mirror() {

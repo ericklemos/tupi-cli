@@ -108,6 +108,10 @@ pub trait Tool: Send + Sync {
     fn sdd_allowed(&self) -> bool {
         false
     }
+
+    fn spec_for_mode(&self, _mode: crate::AgentMode) -> ToolSpec {
+        self.spec()
+    }
 }
 
 #[derive(Default, Clone)]
@@ -130,12 +134,16 @@ impl ToolRegistry {
 
     pub fn specs_for_mode(&self, mode: crate::AgentMode) -> Vec<ToolSpec> {
         match mode {
-            crate::AgentMode::Execution => self.specs(),
+            crate::AgentMode::Execution => self
+                .tools
+                .iter()
+                .map(|tool| tool.spec_for_mode(mode))
+                .collect(),
             crate::AgentMode::Sdd => self
                 .tools
                 .iter()
                 .filter(|tool| tool.sdd_allowed())
-                .map(|tool| tool.spec())
+                .map(|tool| tool.spec_for_mode(mode))
                 .collect(),
         }
     }
@@ -291,5 +299,48 @@ mod tests {
             .collect();
         assert_eq!(exec_names, vec!["edit", "read"]);
         assert_eq!(sdd_names, vec!["read"]);
+    }
+
+    #[test]
+    fn specs_for_mode_uses_the_tool_mode_spec() {
+        struct ModeSpecTool;
+
+        impl Tool for ModeSpecTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "sdd".into(),
+                    description: "completa".into(),
+                    schema: serde_json::json!({}),
+                }
+            }
+
+            fn spec_for_mode(&self, mode: crate::AgentMode) -> ToolSpec {
+                match mode {
+                    crate::AgentMode::Execution => ToolSpec {
+                        name: "sdd".into(),
+                        description: "reduzida".into(),
+                        schema: serde_json::json!({}),
+                    },
+                    crate::AgentMode::Sdd => self.spec(),
+                }
+            }
+
+            fn call(&self, _: Value) -> Result<String, ToolError> {
+                Ok(String::new())
+            }
+
+            fn sdd_allowed(&self) -> bool {
+                true
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ModeSpecTool));
+
+        let exec = reg.specs_for_mode(crate::AgentMode::Execution);
+        let sdd = reg.specs_for_mode(crate::AgentMode::Sdd);
+
+        assert_eq!(exec[0].description, "reduzida");
+        assert_eq!(sdd[0].description, "completa");
     }
 }

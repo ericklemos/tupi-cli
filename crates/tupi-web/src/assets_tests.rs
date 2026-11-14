@@ -43,8 +43,14 @@ async fn static_assets_are_embedded_with_proper_mime_types_and_no_cdn() {
             content_type.contains(expected_mime),
             "{uri} retornou {content_type}"
         );
-        assert!(!body.contains("https://cdn"), "{uri} não deve usar CDN externa");
-        assert!(!body.contains("http://cdn"), "{uri} não deve usar CDN externa");
+        assert!(
+            !body.contains("https://cdn"),
+            "{uri} não deve usar CDN externa"
+        );
+        assert!(
+            !body.contains("http://cdn"),
+            "{uri} não deve usar CDN externa"
+        );
     }
 }
 

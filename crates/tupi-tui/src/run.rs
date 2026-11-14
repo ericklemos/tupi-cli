@@ -33,9 +33,7 @@ pub trait DashboardLauncher: Send + Sync {
 }
 
 /// Mensagem mostrada em `/dashboard` quando o launcher existe ou falta.
-pub async fn dashboard_notice(
-    dashboard: Option<&std::sync::Arc<dyn DashboardLauncher>>,
-) -> String {
+pub async fn dashboard_notice(dashboard: Option<&std::sync::Arc<dyn DashboardLauncher>>) -> String {
     match dashboard {
         Some(launcher) => match launcher.open().await {
             Ok(url) => format!("dashboard: {url}"),
@@ -2348,14 +2346,18 @@ mod tests {
         terminal
             .draw(|frame| draw_details(frame, &state, "modelo", "prov", frame.area()))
             .unwrap();
-        let exec_row: String = (0..100).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+        let exec_row: String = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
         assert!(exec_row.contains("[EXEC]"), "{exec_row:?}");
 
         state.apply_mode_changed(tupi_kernel::AgentMode::Sdd);
         terminal
             .draw(|frame| draw_details(frame, &state, "modelo", "prov", frame.area()))
             .unwrap();
-        let sdd_row: String = (0..100).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+        let sdd_row: String = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
         assert!(sdd_row.contains("[SDD]"), "{sdd_row:?}");
     }
 
@@ -2369,11 +2371,17 @@ mod tests {
         let plain_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
 
         assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::Dispatch);
-        assert_eq!(should_toggle_mode(&state, shift_tab), ToggleAction::Dispatch);
+        assert_eq!(
+            should_toggle_mode(&state, shift_tab),
+            ToggleAction::Dispatch
+        );
         assert_eq!(should_toggle_mode(&state, plain_tab), ToggleAction::Ignore);
 
         state.begin_assistant();
-        assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::BusyNotice);
+        assert_eq!(
+            should_toggle_mode(&state, backtab),
+            ToggleAction::BusyNotice
+        );
 
         state.finish_assistant();
         state.open_overlay("modelos", vec!["a".into()]);

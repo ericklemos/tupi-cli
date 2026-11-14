@@ -290,7 +290,6 @@ impl ChatState {
         }
     }
 
-
     fn finish_metrics(&mut self, now: std::time::Instant) {
         if let Some(index) = self.streaming_index
             && let Some(ChatEntry::Message {
@@ -875,12 +874,18 @@ mod tests {
         state.apply_mode_changed(tupi_kernel::AgentMode::Execution);
         assert_eq!(state.mode, tupi_kernel::AgentMode::Execution);
         assert_eq!(state.lines.len(), 1);
-        assert!(state.notice.is_none(), "troca manual de modo não fecha o SDD");
+        assert!(
+            state.notice.is_none(),
+            "troca manual de modo não fecha o SDD"
+        );
 
         // Nem um aviso de fechamento real pode sobreviver à volta para o SDD.
         state.notice = Some("SDD fechado — modo execução".to_string());
         state.apply_mode_changed(tupi_kernel::AgentMode::Sdd);
         assert_eq!(state.mode, tupi_kernel::AgentMode::Sdd);
-        assert!(state.notice.is_none(), "aviso de fechamento ficou preso no modo SDD");
+        assert!(
+            state.notice.is_none(),
+            "aviso de fechamento ficou preso no modo SDD"
+        );
     }
 }
