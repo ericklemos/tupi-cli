@@ -9,6 +9,14 @@ const FALLBACK_NAME: &str = "project";
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Configuração do índice vetorial local ("space").
+pub struct SpaceConfig {
+    /// `false` desliga o worker e a fusão densa. Ausente = ligado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelConfig {
     /// Janela de contexto do modelo, em tokens. Ausente ou zero mantém o
     /// default de `configs/context.ron`.
@@ -37,6 +45,9 @@ pub struct ProjectConfig {
     /// Porta local do dashboard web. Ausente ou zero deixa o SO escolher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard_web_port: Option<u16>,
+    /// Índice vetorial local do repositório. Ausente liga por padrão.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceConfig>,
 }
 
 pub use crate::lang::Lang;
@@ -44,6 +55,14 @@ pub use crate::lang::Lang;
 const DEFAULT_DOCS_FOLDER: &str = "docs";
 impl ProjectConfig {
     /// Pastas de documentação resolvidas contra `root`, na ordem do arquivo.
+    /// O espaço vetorial local está ligado? Ausente = sim.
+    pub fn space_enabled(&self) -> bool {
+        self.space
+            .as_ref()
+            .and_then(|space| space.enabled)
+            .unwrap_or(true)
+    }
+
     pub fn docs_folders(&self, root: &Path) -> Vec<PathBuf> {
         self.docs_folders
             .iter()
@@ -318,6 +337,7 @@ fn fallback(root: &Path) -> ProjectConfig {
         docs_folders: vec![DEFAULT_DOCS_FOLDER.to_string()],
         models: Default::default(),
         dashboard_web_port: None,
+        space: None,
     }
 }
 
@@ -561,4 +581,19 @@ mod dashboard_port_tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("dashboard_web_port"), "texto: {text}");
     }
+}
+
+#[test]
+fn space_is_enabled_by_default() {
+    assert!(config(r#"{"name":"x"}"#).space_enabled());
+}
+
+#[test]
+fn space_can_be_disabled_in_the_project_file() {
+    assert!(!config(r#"{"name":"x","space":{"enabled":false}}"#).space_enabled());
+}
+
+#[cfg(test)]
+fn config(text: &str) -> ProjectConfig {
+    parse_project(text, Path::new("ai.project.json")).unwrap()
 }

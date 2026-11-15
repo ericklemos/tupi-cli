@@ -11,6 +11,7 @@ use tupi_domain::{Event, RequestId, Role};
 use tupi_kernel::{Command, CommandBus, CommandError, CommandOutcome, EventBus, QueryBus};
 use unicode_width::UnicodeWidthStr;
 
+use crate::sdd::{SDD_COMMAND, parse_sdd_invocation, sdd_spec_names};
 use crate::state::{ChatEntry, ChatState, Status};
 use crate::terminal::TerminalGuard;
 
@@ -59,11 +60,19 @@ pub async fn run_with_dashboard(
     let mut state = ChatState::default();
     let mut request: Option<RequestId> = None;
     state.workflows = workflow_names(&buses.queries).await;
+    state.sdd_specs = sdd_spec_names(&buses.queries).await;
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &model, &provider))?;
 
+        // A TUI só desenha no topo do laço: sem uma fonte de tempo aqui,
+        // spinner e cronômetro congelariam justamente enquanto a tool roda.
+        // O tick existe apenas enquanto há algo para animar.
+        let animating = state.tools_in_flight() > 0 || state.processing();
+        let mut tick = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(100)));
+
         tokio::select! {
+            () = &mut tick, if animating => {}
             received = key_events.next() => {
                 let Some(Ok(event)) = received else { continue };
 
@@ -253,13 +262,14 @@ pub async fn run_with_dashboard(
                                         }
                                     } else if input == "/new" {
                                         // A TUI não guarda o histórico: quem o tem é a sessão do
-                                        // app. Limpar aqui é reconstruir o estado local; os nomes
-                                        // dos workflows voltam porque não vêm do app.
+                                        // app. Limpar aqui é reconstruir o estado local; os catálogos
+                                        // locais voltam porque não vêm do app.
                                         match buses.commands.dispatch(Command::NewSession).await {
                                             Ok(CommandOutcome::SessionReset) => {
-                                                let workflows = std::mem::take(&mut state.workflows);
-                                                state = ChatState::default();
-                                                state.workflows = workflows;
+                                                state.reset_for_new_session();
+                                                // Planos podem ter mudado durante a sessão.
+                                                state.sdd_specs =
+                                                    sdd_spec_names(&buses.queries).await;
                                                 state.notice = Some("nova sessão".to_string());
                                             }
                                             Ok(_) => {}
@@ -288,6 +298,37 @@ pub async fn run_with_dashboard(
                                         state.refresh_suggestions();
                                         state.notice =
                                             Some(dashboard_notice(dashboard.as_ref()).await);
+                                    } else if let Some(slug) = parse_sdd_invocation(&input) {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        match slug {
+                                            None => {
+                                                state.notice = Some(format!(
+                                                    "uso: {SDD_COMMAND} <slug> — Tab completa os planos abertos"
+                                                ))
+                                            }
+                                            Some(slug) => match buses
+                                                .commands
+                                                .dispatch(Command::ResumeSdd {
+                                                    slug: slug.to_string(),
+                                                })
+                                                .await
+                                            {
+                                                Ok(CommandOutcome::SddResumed {
+                                                    mode, ..
+                                                }) => {
+                                                    // O aviso vem do app como
+                                                    // Event::Notice, depois do
+                                                    // ModeChanged: assim ele não
+                                                    // é apagado pelo rodapé.
+                                                    state.apply_mode_changed(mode);
+                                                    state.sdd_specs =
+                                                        sdd_spec_names(&buses.queries).await;
+                                                }
+                                                Ok(_) => {}
+                                                Err(error) => state.notice = Some(error.to_string()),
+                                            },
+                                        }
                                     } else if let Some(action) = parse_memory_invocation(&input) {
                                         state.input.clear();
                                         state.refresh_suggestions();
@@ -484,9 +525,16 @@ pub async fn run_with_dashboard(
                         request_id,
                         call_id,
                         ok,
+                        duration_us,
                         ..
                     }) if Some(request_id) == request => {
-                        state.finish_tool(&call_id, ok);
+                        // A duração vem de quem executou a tool: o evento já
+                        // atravessou o bus, então medir aqui daria errado.
+                        state.finish_tool(
+                            &call_id,
+                            ok,
+                            Some(std::time::Duration::from_micros(duration_us)),
+                        );
                     }
                     Ok(Event::Memory { text, after }) => {
                         state.push_memory(&text, after);
@@ -503,6 +551,11 @@ pub async fn run_with_dashboard(
                     }
                     Ok(Event::ModeChanged { mode }) => {
                         state.apply_mode_changed(mode);
+                        // Fechar o SDD muda o plano persistido: recarrega os
+                        // slugs retomáveis sem depender do próximo boot.
+                        if mode == tupi_kernel::AgentMode::Execution {
+                            state.sdd_specs = sdd_spec_names(&buses.queries).await;
+                        }
                     }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {
@@ -924,7 +977,9 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
     // Quebra o texto na largura útil; as continuações recuam 2 colunas para
     // alinhar com o texto depois do prompt.
     let input_width = inner.width.saturating_sub(2).max(1) as usize;
-    let wrapped = wrap_text(&state.input, input_width);
+    // `wrap_input`, não `wrap_text`: o composer mostra o rascunho como foi
+    // digitado, inclusive o espaço final que anda o cursor.
+    let wrapped = wrap_input(&state.input, input_width);
     let start = wrapped.len().saturating_sub(inner.height as usize);
     let visible = &wrapped[start..];
 
@@ -935,7 +990,7 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
         let placeholder = if busy {
             "escreva algo…  (enter enfileira)"
         } else {
-            "escreva algo…  (/models troca o modelo)"
+            "escreva algo…  (/models modelo · /sdd retoma)"
         };
         lines.push(Line::from(vec![
             prompt.clone(),
@@ -1048,6 +1103,20 @@ fn draw_details(
         }
     }
 
+    /// Placar das tools do turno, ao lado do contexto. `None` quando o turno
+    /// não chamou nenhuma tool: rodapé sem tool continua idêntico.
+    fn placar_text(state: &ChatState) -> Option<String> {
+        let (total, failures) = state.turn_tool_stats();
+        if total == 0 {
+            return None;
+        }
+        Some(if failures > 0 {
+            format!("⚙ {total} {failures}✗")
+        } else {
+            format!("⚙ {total}")
+        })
+    }
+
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1104,35 +1173,37 @@ fn draw_details(
             None => format!("{} tokens", format_compact_tokens(ctx.tokens)),
         };
 
+        let placar = placar_text(state);
+        let placar_width = placar
+            .as_ref()
+            .map(|text| text.chars().count() + 5)
+            .unwrap_or(0) as u16;
+
         let left_width = left.width() as u16;
         let ctx_width = ("ctx ".width() + value.width()) as u16;
-        let full_width = full_hints.width() as u16 + 5 + ctx_width;
-        let short_width = short_hints.width() as u16 + 5 + ctx_width;
+        let full_width = full_hints.width() as u16 + 5 + placar_width + ctx_width;
+        let short_width = short_hints.width() as u16 + 5 + placar_width + ctx_width;
+
+        // O placar entra antes do contexto e é a primeira coisa a cair quando
+        // a largura aperta: o contexto nunca sai por causa dele.
+        let right_line = |hints: &str| {
+            let mut spans = vec![Span::styled(
+                format!("{hints}  ·  "),
+                Style::default().fg(Color::DarkGray),
+            )];
+            if let Some(text) = placar.clone() {
+                spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+                spans.push(Span::raw("  ·  "));
+            }
+            spans.push(Span::styled("ctx ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(value.clone(), Style::default().fg(ctx_color)));
+            Line::from(spans)
+        };
 
         let (right_line, right_width) = if area.width >= left_width + 2 + full_width {
-            (
-                Line::from(vec![
-                    Span::styled(
-                        format!("{full_hints}  ·  "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(value, Style::default().fg(ctx_color)),
-                ]),
-                full_width + 1,
-            )
+            (right_line(full_hints), full_width + 1)
         } else if area.width >= left_width + 2 + short_width {
-            (
-                Line::from(vec![
-                    Span::styled(
-                        format!("{short_hints}  ·  "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled("ctx ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(value, Style::default().fg(ctx_color)),
-                ]),
-                short_width + 1,
-            )
+            (right_line(short_hints), short_width + 1)
         } else if area.width > ctx_width + 10 {
             (
                 Line::from(vec![
@@ -1377,150 +1448,10 @@ fn transcript_rows_at(
     cache: &mut crate::markdown::Cache,
     now: std::time::Instant,
 ) -> Vec<Line<'static>> {
-    let area_width = width as usize;
-    if area_width < 8 {
-        return Vec::new();
-    }
-
-    let indent = 2usize;
-    let content_width = area_width.saturating_sub(indent).max(1);
-    let compact = area_width < 60;
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    rows.push(Line::from(""));
-
-    for (index, entry) in lines.iter().enumerate() {
-        if index > 0 {
-            rows.push(Line::from(""));
-        }
-
-        let (role, text, metrics, pending) = match entry {
-            ChatEntry::Message {
-                role,
-                content,
-                metrics,
-            } => (*role, content.as_str(), metrics.as_ref(), false),
-            ChatEntry::Queued { content } => (Role::User, content.as_str(), None, true),
-            ChatEntry::Tool {
-                name, summary, ok, ..
-            } => {
-                let (mark, color) = match ok {
-                    Some(true) => ("✓", Color::Green),
-                    Some(false) => ("✗", Color::Red),
-                    None => ("…", Color::DarkGray),
-                };
-                let label = format!("{name} · {summary}");
-                let line = wrap_text(&label, content_width)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                rows.push(Line::from(vec![
-                    Span::styled(
-                        "  ⚙ ",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(line),
-                    Span::raw(" "),
-                    Span::styled(mark.to_string(), Style::default().fg(color)),
-                ]));
-                continue;
-            }
-            ChatEntry::Memory { text } => {
-                for line in wrap_text(text, content_width.saturating_sub(4)) {
-                    rows.push(Line::from(vec![
-                        Span::styled(
-                            "  ◆ ",
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            line,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ),
-                    ]));
-                }
-                continue;
-            }
-            ChatEntry::Prompt { content } => {
-                rows.push(Line::from(vec![
-                    Span::styled(
-                        "  ◆ ",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "prompt enviado",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                for line in plain_rows(content, content_width) {
-                    rows.push(indent_line(line, indent));
-                }
-                continue;
-            }
-        };
-
-        let (marker, label, color) = match role {
-            Role::User if pending => ("❯", "você · pendente", Color::DarkGray),
-            Role::User => ("❯", "você", Color::Cyan),
-            Role::Assistant => ("●", "tupi", Color::Green),
-            Role::System => ("◆", "sistema", Color::Yellow),
-            Role::Tool => ("⚙", "tool", Color::DarkGray),
-        };
-
-        let mut header = vec![
-            Span::styled(
-                marker.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                label.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if role == Role::Assistant
-            && let Some(metrics) = metrics
-        {
-            header.push(Span::styled(
-                format!("  {}", metrics.header(now, compact)),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        rows.push(Line::from(header));
-
-        let body = match role {
-            Role::User | Role::Assistant => cache.rows(index, text, content_width).to_vec(),
-            Role::System => markdown_rows(text, content_width),
-            Role::Tool => plain_rows(text, content_width),
-        };
-
-        for line in body {
-            rows.push(indent_line(line, indent));
-        }
-    }
-
-    if processing {
-        if !rows.last().map(|row| row.width() == 0).unwrap_or(true) {
-            rows.push(Line::from(""));
-        }
-        rows.push(Line::from(Span::styled(
-            "  processando...",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::DIM),
-        )));
-    }
-
-    rows.push(Line::from(""));
-    rows
+    // Fonte única: a seleção por arraste precisa das MESMAS linhas que o
+    // desenho produz. Manter aqui uma segunda cópia do render já fez o texto
+    // copiado divergir do exibido quando o formato das tools mudou.
+    transcript_layout_at(lines, width, processing, cache, now).rows
 }
 
 pub(crate) struct Transcript {
@@ -1537,6 +1468,26 @@ fn transcript_layout_at(
     cache: &mut crate::markdown::Cache,
     now: std::time::Instant,
 ) -> Transcript {
+    /// Glifo e cor por categoria de tool: leitura por tipo sem gastar
+    /// colunas. Só caracteres de largura 1, porque a TUI depende do terminal.
+    fn tool_glyph(name: &str) -> (&'static str, Color) {
+        match name {
+            "read" | "read_many" | "search" | "map" | "trace" | "impact" | "why" | "peek"
+            | "docs" | "context_graph" | "facts" | "diff" | "assert" | "websearch" | "fetch"
+            | "research" | "env" => ("◆", Color::Cyan),
+            "edit" | "write" | "write_many" | "patch" | "relocate" => ("▪", Color::Yellow),
+            "exec" | "shell" | "test_many" | "setup" => ("▸", Color::Magenta),
+            _ => ("⚙", Color::DarkGray),
+        }
+    }
+
+    /// Spinner de tool em voo: braille é largura 1 e não pisca como `…`.
+    fn spinner(now: std::time::Instant, started: std::time::Instant) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        let tick = now.saturating_duration_since(started).as_millis() / 120;
+        FRAMES[(tick as usize) % FRAMES.len()]
+    }
+
     let area_width = width as usize;
     if area_width < 8 {
         return Transcript {
@@ -1553,10 +1504,22 @@ fn transcript_layout_at(
     rows.push(Line::from(""));
     owners.push(None);
 
+    // Uma "run" são as `ChatEntry::Tool` consecutivas: o lote de trabalho que
+    // o usuário lê junto. Runs de 3+ ganham cabeçalho com placar.
+    let mut previous_was_tool = false;
+    let mut group_open = false;
+
     for (index, entry) in lines.iter().enumerate() {
         if index > 0 {
             rows.push(Line::from(""));
             owners.push(None);
+        }
+
+        let is_tool = matches!(entry, ChatEntry::Tool { .. });
+        let continuing_run = previous_was_tool && is_tool;
+        previous_was_tool = is_tool;
+        if !is_tool {
+            group_open = false;
         }
 
         let (role, text, metrics, pending) = match entry {
@@ -1567,29 +1530,128 @@ fn transcript_layout_at(
             } => (*role, content.as_str(), metrics.as_ref(), false),
             ChatEntry::Queued { content } => (Role::User, content.as_str(), None, true),
             ChatEntry::Tool {
-                name, summary, ok, ..
+                call_id,
+                name,
+                summary,
+                ok,
+                started,
+                duration,
             } => {
-                let (mark, color) = match ok {
+                if !continuing_run {
+                    let run_len = lines[index..]
+                        .iter()
+                        .take_while(|entry| matches!(entry, ChatEntry::Tool { .. }))
+                        .count();
+                    if run_len >= 3 {
+                        let run = &lines[index..index + run_len];
+                        let top: Vec<&ChatEntry> = run
+                            .iter()
+                            .filter(|entry| {
+                                matches!(entry, ChatEntry::Tool { call_id, .. } if !call_id.contains('#'))
+                            })
+                            .collect();
+                        let total = top.len();
+                        let done = top
+                            .iter()
+                            .filter(|entry| matches!(entry, ChatEntry::Tool { ok: Some(_), .. }))
+                            .count();
+                        let failures = top
+                            .iter()
+                            .filter(|entry| {
+                                matches!(
+                                    entry,
+                                    ChatEntry::Tool {
+                                        ok: Some(false),
+                                        ..
+                                    }
+                                )
+                            })
+                            .count();
+                        // O total conta só chamadas de topo: as de pipeline
+                        // (id com `#`) já estão representadas pelo pai.
+                        let placar = if done < total {
+                            format!("{done} de {total}")
+                        } else if failures > 0 {
+                            format!("{}✓ {failures}✗", total - failures)
+                        } else {
+                            format!("{total}✓")
+                        };
+                        rows.push(Line::from(vec![
+                            Span::styled(
+                                "  ⚙ ",
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{total} tools · "),
+                                Style::default().fg(Color::Gray),
+                            ),
+                            Span::styled(placar, Style::default().fg(Color::DarkGray)),
+                        ]));
+                        owners.push(Some(index));
+                        group_open = true;
+                    }
+                }
+
+                let child = call_id.contains('#');
+                let extra = if group_open {
+                    2 + if child { 2 } else { 0 }
+                } else {
+                    0
+                };
+                let lead = format!("  {}{}", " ".repeat(extra), if child { "└ " } else { "" });
+                let (glyph, glyph_color) = tool_glyph(name);
+                let (mark, mark_color) = match ok {
                     Some(true) => ("✓", Color::Green),
                     Some(false) => ("✗", Color::Red),
-                    None => ("…", Color::DarkGray),
+                    None => (spinner(now, *started), Color::Yellow),
                 };
+                // Em voo o tempo é vivo; concluída, é a duração medida por
+                // quem executou — nunca reinventada aqui.
+                let elapsed = duration.unwrap_or_else(|| now.saturating_duration_since(*started));
+                let time = if compact {
+                    String::new()
+                } else {
+                    crate::metrics::format_duration(elapsed)
+                };
+
+                let lead_width = lead.chars().count();
+                let time_width = time.chars().count();
+                // Sobra para o resumo: prefixo + glifo + espaço + tempo +
+                // espaço + marcador, com 1 coluna de respiro.
+                let reserved = lead_width + 1 + 1 + time_width + 1 + 1 + 1;
+                let label_width = content_width.saturating_sub(reserved).max(8);
                 let label = format!("{name} · {summary}");
-                let line = wrap_text(&label, content_width)
+                let line = wrap_text(&label, label_width)
                     .into_iter()
                     .next()
                     .unwrap_or_default();
-                rows.push(Line::from(vec![
+
+                let used = lead_width + 1 + 1 + line.chars().count() + 1 + 1;
+                let slack = content_width.saturating_sub(used);
+                let show_time = !time.is_empty() && slack > time_width;
+                let mut spans = vec![
+                    Span::styled(lead, Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        "  ⚙ ",
+                        glyph,
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(glyph_color)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(line),
                     Span::raw(" "),
-                    Span::styled(mark.to_string(), Style::default().fg(color)),
-                ]));
+                    Span::raw(line),
+                ];
+                if show_time {
+                    spans.push(Span::raw(" ".repeat(slack - time_width)));
+                    spans.push(Span::styled(time, Style::default().fg(Color::DarkGray)));
+                }
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    mark.to_string(),
+                    Style::default().fg(mark_color),
+                ));
+                rows.push(Line::from(spans));
                 owners.push(Some(index));
                 continue;
             }
@@ -2074,6 +2136,57 @@ fn find_single_star(characters: &[char], from: usize) -> Option<usize> {
     None
 }
 
+/// Quebra o rascunho do composer preservando cada espaço digitado.
+///
+/// `wrap_text` colapsa espaços (`split_whitespace`), o que serve ao
+/// transcript mas não a um editor: com `"oi "` a última linha virava `"oi"`,
+/// o cursor não andava e a tecla espaço parecia não ter efeito até a letra
+/// seguinte. Aqui a quebra continua preferindo fim de palavra (o espaço fica
+/// no fim da linha anterior), mas todo espaço conta coluna.
+fn wrap_input(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for character in text.chars() {
+        // Colagem multilinha não tem linha própria no composer de uma linha
+        // só: vira espaço, como já acontecia na quebra por palavras.
+        let character = match character {
+            '\n' | '\r' => ' ',
+            other => other,
+        };
+        let character_width = character.width().unwrap_or(0);
+
+        if current_width > 0 && current_width + character_width > width {
+            // Quebra no último espaço para não cortar palavra ao meio; sem
+            // espaço, corta no limite mesmo.
+            let last_space = current
+                .char_indices()
+                .rev()
+                .find(|(index, candidate)| *index > 0 && *candidate == ' ')
+                .map(|(index, _)| index);
+            match last_space {
+                Some(index) => {
+                    let rest = current.split_off(index + 1);
+                    lines.push(std::mem::take(&mut current));
+                    current = rest;
+                }
+                None => lines.push(std::mem::take(&mut current)),
+            }
+            current_width = current.width();
+        }
+
+        current.push(character);
+        current_width += character_width;
+    }
+
+    lines.push(current);
+    lines
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -2253,6 +2366,7 @@ mod tests {
 
     #[test]
     fn tool_entries_render_as_a_compact_line() {
+        let now = std::time::Instant::now();
         let lines = vec![
             message(Role::User, "leia"),
             ChatEntry::Tool {
@@ -2260,14 +2374,158 @@ mod tests {
                 name: "read".into(),
                 summary: "src/a.rs".into(),
                 ok: Some(true),
+                started: now,
+                duration: Some(std::time::Duration::from_millis(250)),
             },
         ];
-        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
+        let rows = transcript_rows(&lines, 80, false, &mut crate::markdown::Cache::default());
         let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
 
         assert!(text.contains("read · src/a.rs"), "{text}");
         assert!(text.contains('✓'), "{text}");
-        assert!(text.contains('⚙'), "{text}");
+        // Categoria da tool: leitura usa ◆, não o ⚙ genérico.
+        assert!(text.contains('◆'), "{text}");
+        // A duração vem do evento e aparece alinhada à direita.
+        assert!(text.contains("0,2s"), "{text}");
+    }
+
+    #[test]
+    fn tool_run_of_three_gains_a_header_with_live_placar() {
+        let now = std::time::Instant::now();
+        let mut lines = vec![message(Role::User, "vai")];
+        let tool = |id: &str, name: &str, ok: Option<bool>| ChatEntry::Tool {
+            call_id: id.into(),
+            name: name.into(),
+            summary: "x".into(),
+            ok,
+            started: now,
+            duration: ok.map(|_| std::time::Duration::from_millis(100)),
+        };
+        lines.push(tool("p1", "pipeline", Some(false)));
+        lines.push(tool("p1#0.0", "read", Some(true)));
+        lines.push(tool("c2", "exec", Some(true)));
+
+        let rows = transcript_rows(&lines, 80, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        // O placar conta só o pai: a sub-chamada p1#0.0 não infla o total.
+        assert!(text.contains("2 tools"), "{text}");
+        assert!(text.contains("1✓ 1✗"), "{text}");
+        // A sub-chamada aparece indentada sob o pai.
+        assert!(text.contains("└ "), "{text}");
+    }
+
+    #[test]
+    fn short_tool_run_has_no_group_header() {
+        let now = std::time::Instant::now();
+        let lines = vec![
+            message(Role::User, "leia"),
+            ChatEntry::Tool {
+                call_id: "c1".into(),
+                name: "read".into(),
+                summary: "a.rs".into(),
+                ok: Some(true),
+                started: now,
+                duration: Some(std::time::Duration::from_millis(100)),
+            },
+            ChatEntry::Tool {
+                call_id: "c2".into(),
+                name: "read".into(),
+                summary: "b.rs".into(),
+                ok: Some(true),
+                started: now,
+                duration: Some(std::time::Duration::from_millis(100)),
+            },
+        ];
+        let rows = transcript_rows(&lines, 80, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(!text.contains("tools ·"), "{text}");
+    }
+
+    #[test]
+    fn tool_in_flight_shows_spinner_and_elapsed_time() {
+        let started = std::time::Instant::now();
+        let lines = vec![ChatEntry::Tool {
+            call_id: "c1".into(),
+            name: "exec".into(),
+            summary: "cargo test".into(),
+            ok: None,
+            started,
+            duration: None,
+        }];
+        let early = transcript_layout_at(
+            &lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            started,
+        );
+        let later = transcript_layout_at(
+            &lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            started + std::time::Duration::from_secs(2),
+        );
+        let early_text = early
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let later_text = later
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // O tempo cresce sem evento novo: quem muda é o now do tick.
+        assert!(early_text.contains("0,0s"), "{early_text}");
+        assert!(later_text.contains("2,0s"), "{later_text}");
+        assert_ne!(early_text, later_text);
+    }
+
+    #[test]
+    fn narrow_width_drops_the_time_but_keeps_the_tool_name() {
+        let now = std::time::Instant::now();
+        let lines = vec![ChatEntry::Tool {
+            call_id: "c1".into(),
+            name: "read".into(),
+            summary: "src/a.rs".into(),
+            ok: Some(true),
+            started: now,
+            duration: Some(std::time::Duration::from_secs(3)),
+        }];
+        let rows = transcript_rows(&lines, 40, false, &mut crate::markdown::Cache::default());
+        let text = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+
+        assert!(text.contains("read · src/a.rs"), "{text}");
+        assert!(!text.contains("3,0s"), "tempo não deveria aparecer: {text}");
+    }
+
+    #[test]
+    fn draw_details_shows_tool_placar_beside_context() {
+        let mut state = ChatState::default();
+        state.set_context(28_800, 32_000);
+        for id in ["c1", "c2", "c3"] {
+            state.push_tool_started(id, "read", "a.rs");
+            state.finish_tool(id, id != "c2", None);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "modelo", "prov", frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(row.contains("⚙ 3 1✗"), "{row}");
+        assert!(row.contains("ctx 28.8k/32k"), "{row}");
     }
 
     #[test]
@@ -2422,6 +2680,46 @@ mod tests {
         assert!(rows[1].contains("uma mensagem longa"), "{rows:?}");
         assert!(rows[2].contains("que nao cabe"), "{rows:?}");
         terminal.backend_mut().assert_cursor_position((15, 2));
+    }
+
+    /// O espaço digitado no fim do rascunho precisa andar o cursor na hora. A
+    /// quebra por palavras descartava o espaço final, então `"oi "` desenhava
+    /// `"oi"` e a tecla só surtia efeito quando a próxima letra chegava.
+    #[test]
+    fn trailing_space_moves_the_composer_cursor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        let mut state = ChatState::default();
+        state.input = "oi ".into();
+
+        terminal
+            .draw(|frame| draw_composer(frame, &state, Rect::new(0, 0, 24, 3), false))
+            .unwrap();
+
+        // borda + "› " + "oi" e a coluna do espaço recém-digitado.
+        terminal.backend_mut().assert_cursor_position((6, 1));
+    }
+
+    #[test]
+    fn repeated_spaces_are_rendered_in_the_composer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        let mut state = ChatState::default();
+        state.input = "a  b".into();
+
+        terminal
+            .draw(|frame| draw_composer(frame, &state, Rect::new(0, 0, 24, 3), false))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..24).map(|x| buffer[(x, 1)].symbol()).collect::<String>();
+        assert!(row.contains("a  b"), "{row:?}");
+        // borda + "› " + "a  b": o segundo espaço também anda o cursor.
+        terminal.backend_mut().assert_cursor_position((7, 1));
     }
 
     #[test]
@@ -2649,7 +2947,7 @@ mod composer_hint_tests {
         let idle = rows(&ChatState::default(), 48);
         assert!(
             idle.iter()
-                .any(|row| row.contains("/models troca o modelo")),
+                .any(|row| row.contains("/models modelo") && row.contains("/sdd retoma")),
             "{idle:?}"
         );
         assert!(

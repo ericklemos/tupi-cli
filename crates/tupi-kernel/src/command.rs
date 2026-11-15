@@ -49,6 +49,11 @@ pub enum Command {
     Memory {
         action: MemoryAction,
     },
+    /// `/sdd <slug>`: reativa o plano persistido, entra no modo Sdd e
+    /// devolve o controle ao usuário — não abre turno.
+    ResumeSdd {
+        slug: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,13 @@ pub enum CommandOutcome {
     MemoryForgotten {
         id: String,
         found: bool,
+    },
+    /// `/sdd <slug>` aceito: o plano foi retomado e o modo já é o informado.
+    SddResumed {
+        slug: String,
+        title: String,
+        mode: tupi_domain::AgentMode,
+        open_tasks: usize,
     },
     Noop,
 }

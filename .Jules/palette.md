@@ -32,3 +32,20 @@ Apenas aprendizados críticos de UX/acessibilidade do dashboard (`crates/tupi-we
 
 **Action:** ao renderizar conteúdo do modelo no dashboard, escape antes de `innerHTML` (`escapeHtml`) e identifique o autor por rótulo textual + cor (nunca só cor), com `white-space: pre-wrap` no corpo para preservar quebras; o padrão `<li class="msg msg-<role>">` + coluna fixa de rótulo é reutilizável em qualquer lista de diálogo.
 
+## 2026-11-14 - Na TUI, "ao vivo" não é problema de render: é de loop
+
+**Learning:** `run_with_dashboard` (`crates/tupi-tui/src/run.rs`) desenha uma vez no topo do laço e então **bloqueia** em `tokio::select!` com apenas duas fontes: teclado e `EventBus`. Não existe relógio. Consequência prática: nenhuma animação, cronômetro ou spinner desta TUI pode ser implementada só no render — sem uma branch de `sleep` no select, o `now` passado a `transcript_layout_at` só muda quando chega evento, e a duração de uma tool congelaria exatamente enquanto ela roda, que é quando o usuário mais precisa do sinal. O `now: Instant` que `transcript_rows`/`metrics.header` já recebem é a costura pronta: quem anima é o tick, não o desenho. E o tick precisa ser condicional (`tools_in_flight() > 0` ou `processing()`), porque esta TUI roda também sobre SSH e redesenhar em tela ociosa é desperdício puro.
+
+**Action:** antes de aceitar qualquer pedido de "tempo real" na TUI, verifique se o loop tem fonte de tempo; se não tiver, a task de tick é pré-requisito da de render, nunca o contrário. Duração de operação vem do executor (medida onde a tool roda) e viaja no evento — derivar `Instant` no consumidor dá errado porque o evento atravessa o bus e é lido tarde.
+
+## 2026-11-14 - O render do transcript existia em duas cópias que podiam divergir
+
+**Learning:** `transcript_layout_at` (a que `draw_transcript` usa) e `transcript_rows_at` (usada pela seleção por arraste e pelos testes) eram duas implementações paralelas do MESMO layout. Trocar o formato da linha de tool só na primeira deixou a TUI desenhando `◆ read · a.rs 0,2s ✓` enquanto o teste — e a cópia por mouse — seguia vendo `⚙ read · a.rs ✓`. Numa interface onde o usuário copia texto do transcript, duas cópias do render são um bug de correção, não de estética: o texto copiado não é o texto exibido. `transcript_rows_at` agora delega para `transcript_layout_at` e devolve `.rows`.
+
+**Action:** qualquer mudança visual no transcript nasce em `transcript_layout_at` e `transcript_rows_at` deve continuar sendo um delegador magro. Se aparecer necessidade de variar algo entre desenho e seleção, isso é sinal de que a variação deve ser parâmetro (`now`, `width`), não uma segunda função.
+
+## 2026-11-14 - Fechar spec SDD dispara execução automática que pode morrer no meio
+
+**Learning:** `sdd action=close` não só arquiva a spec: ele **executa** as subtasks. No `tui-tool-usage` a execução parou em "limite de 24 passos" na T1.2, mas o relatório dizia "1/20 subtasks ok" enquanto o código real já tinha ido bem além (publishers preenchidos, `cargo check --workspace` limpo). O progresso reportado pelo SDD é grosseiro e **mente para baixo**; o único juiz é compilar e rodar testes das crates afetadas. O dano concreto que sobrou: `crates/tupi-web/src/events_tests.rs` continuava construindo `Event::ToolFinished` sem o campo novo, e isso só aparece em `cargo test` — `cargo check` não compila `cfg(test)`. A execução também apagou `.Jules/palette.md` da árvore de trabalho (recuperável em `git show HEAD:.Jules/palette.md`).
+
+**Action:** depois de qualquer `sdd close` ou execução interrompida, rode `cargo test -p` nas crates cujos **testes** constroem os tipos alterados, e confira que arquivos de estado do agente (`.Jules/`) sobreviveram. Ao adicionar campo obrigatório em enum de domínio, procure também as construções dentro de `#[cfg(test)]`.

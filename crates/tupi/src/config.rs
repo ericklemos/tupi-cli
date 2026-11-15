@@ -282,6 +282,43 @@ mod context_tests {
     }
 }
 
+#[test]
+fn local_embedding_is_needed_for_space_even_without_docs() {
+    assert!(local_embedding_enabled(true, &[], None));
+    assert!(!local_embedding_enabled(false, &[], None));
+    assert!(!local_embedding_enabled(true, &[], Some("off")));
+}
+
+#[test]
+fn docs_download_keeps_the_legacy_behavior() {
+    assert!(should_download(true, false, None));
+}
+
+#[test]
+fn space_alone_does_not_download_without_the_flag() {
+    assert!(!should_download(false, true, None));
+}
+
+#[test]
+fn space_alone_downloads_with_the_flag() {
+    assert!(should_download(false, true, Some("download")));
+}
+
+/// Autoriza baixar o GGUF: docs mantêm o legado; space exige a flag.
+pub fn should_download(docs: bool, space: bool, value: Option<&str>) -> bool {
+    docs || (space && matches!(value.map(str::trim), Some("download")))
+}
+
+/// O embedder local é necessário quando há docs declarados ou `space` ligado.
+pub fn local_embedding_enabled(
+    space: bool,
+    folders: &[std::path::PathBuf],
+    value: Option<&str>,
+) -> bool {
+    let disabled = matches!(value.map(str::trim), Some("off" | "0" | "false"));
+    !disabled && (space || !folders.is_empty())
+}
+
 pub fn docs_embedding_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
     !folders.is_empty() && !matches!(value.map(str::trim), Some("off" | "0" | "false"))
 }

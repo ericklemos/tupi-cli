@@ -141,7 +141,14 @@ fn is_expandable(kind: &str, language: Language) -> bool {
     match language {
         Language::Rust => matches!(
             kind,
-            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item"
+            "function_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
         ),
         Language::Kotlin => matches!(
             kind,
@@ -215,7 +222,16 @@ fn is_scope(kind: &str, language: Language) -> bool {
     match language {
         Language::Rust => matches!(
             kind,
-            "function_item" | "impl_item" | "struct_item" | "enum_item" | "trait_item" | "mod_item"
+            "function_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "mod_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "union_item"
         ),
         Language::Kotlin => matches!(
             kind,
@@ -250,7 +266,8 @@ fn symbol_name(node: Node<'_>, source: &[u8], language: Language) -> String {
         && node.kind() == "impl_item"
         && let Some(type_node) = node.child_by_field_name("type")
     {
-        return format!("impl {}", type_node.utf8_text(source).unwrap_or(""));
+        let ty = type_node.utf8_text(source).unwrap_or("");
+        return format!("impl {}", bare_container_name(ty));
     }
     if let Some(name) = node.child_by_field_name("name") {
         let name = name.utf8_text(source).unwrap_or("");
@@ -279,9 +296,9 @@ fn qualified_name(node: Node<'_>, source: &[u8], symbol: &str, language: Languag
     let mut current = node.parent();
     while let Some(parent) = current {
         let container = match (language, parent.kind()) {
-            (Language::Rust, "impl_item") => parent
-                .child_by_field_name("type")
-                .map(|type_node| type_node.utf8_text(source).unwrap_or("").to_string()),
+            (Language::Rust, "impl_item") => parent.child_by_field_name("type").map(|type_node| {
+                bare_container_name(type_node.utf8_text(source).unwrap_or("")).to_string()
+            }),
             (Language::Rust, "mod_item")
             | (Language::Kotlin, "class_declaration")
             | (Language::Kotlin, "object_declaration") => parent
@@ -332,6 +349,12 @@ fn signature(node: Node<'_>, source: &[u8], language: Language) -> String {
         let end = body.start_byte().saturating_sub(node.start_byte());
         return text[..end].trim().to_string();
     }
+    // `const`/`static` guardam o inicializador em `value`, não em `body`. Sem
+    // isso a assinatura engoliria o valor inteiro até o próximo `;`.
+    if let Some(value) = node.child_by_field_name("value") {
+        let end = value.start_byte().saturating_sub(node.start_byte());
+        return text[..end].trim().to_string();
+    }
     if let Some(index) = text.find('{') {
         return text[..index].trim().to_string();
     }
@@ -339,6 +362,15 @@ fn signature(node: Node<'_>, source: &[u8], language: Language) -> String {
         return text[..=index].trim().to_string();
     }
     text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Nome do tipo sem argumentos genéricos: `Exposure<'_>` → `Exposure`.
+///
+/// `impl` com genéricos guarda o nó `type` inteiro no AST; sem normalizar, o
+/// container de `Exposure::admits` viraria `Exposure<'_>` e o símbolo
+/// qualificado não seria encontrado.
+fn bare_container_name(text: &str) -> &str {
+    text.split('<').next().unwrap_or(text).trim()
 }
 
 /// Uma assinatura multiline em uma linha. Só quebras e indentação são colapsadas;
@@ -502,5 +534,34 @@ mod tests {
         for snippet in snippets {
             assert!(!snippet.code.is_empty());
         }
+    }
+
+    #[test]
+    fn consts_are_indexed_as_snippets() {
+        let source = "pub const CORE_TOOLS: &[&str] = &[\n    \"read\",\n    \"search\",\n];\n";
+        let snippets = AstChunker::new().snippets(Path::new("a.rs"), source);
+        let core = snippets
+            .iter()
+            .find(|snippet| snippet.symbol_name == "CORE_TOOLS")
+            .unwrap_or_else(|| panic!("faltou CORE_TOOLS: {snippets:?}"));
+
+        assert_eq!(core.qualified_name, "CORE_TOOLS");
+        assert_eq!(core.start_line, 1);
+        assert_eq!(core.end_line, 4);
+        assert!(core.signature.contains("pub const CORE_TOOLS"));
+        assert!(core.code.contains("\"search\""));
+    }
+
+    #[test]
+    fn a_generic_impl_method_uses_the_bare_container_name() {
+        let source =
+            "impl Exposure<'_> {\n    fn admits(&self) -> bool {\n        true\n    }\n}\n";
+        let snippets = AstChunker::new().snippets(Path::new("a.rs"), source);
+        let admits = snippets
+            .iter()
+            .find(|snippet| snippet.symbol_name == "admits")
+            .unwrap_or_else(|| panic!("faltou admits: {snippets:?}"));
+
+        assert_eq!(admits.qualified_name, "Exposure::admits");
     }
 }

@@ -1,3 +1,4 @@
+pub mod space;
 mod support;
 mod tools;
 
@@ -67,6 +68,11 @@ pub struct ToolsOptions {
     pub docs_folders: Vec<std::path::PathBuf>,
     /// Slot do embedder local; None mantém a busca lexical.
     pub embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
+    /// Dispara o worker de background do índice; testes desligam.
+    pub space_worker: bool,
+    /// Índice vetorial local; None mantém a busca lexical.
+    pub space: Option<Arc<crate::space::SpaceIndex>>,
+
     /// Slot do gerador local de resumos; None desliga os resumos.
     pub generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
 }
@@ -74,6 +80,7 @@ pub struct ToolsOptions {
 impl Default for ToolsOptions {
     fn default() -> Self {
         Self {
+            space_worker: true,
             state_dir: None,
             watcher: true,
             exec_cache: true,
@@ -83,6 +90,7 @@ impl Default for ToolsOptions {
             sdd_executor: None,
             docs_folders: Vec::new(),
             embedder: None,
+            space: None,
             generator: None,
         }
     }
@@ -93,6 +101,8 @@ impl ToolsOptions {
     pub fn hermetic(state_dir: std::path::PathBuf) -> Self {
         Self {
             state_dir: Some(state_dir),
+            space: None,
+            space_worker: false,
             watcher: false,
             exec_cache: false,
             web_cache: false,
@@ -174,6 +184,12 @@ pub fn register_with(
     ));
     let parse_cache = Arc::new(crate::graph::ParseCache::new());
     let graph = crate::graph::GraphCache::shared_with_parse_cache(&root_dir, parse_cache.clone());
+    if options.space_worker
+        && let (Some(space), Some(embedder)) = (options.space.clone(), options.embedder.clone())
+    {
+        crate::space::build::spawn(root_dir.clone(), space, embedder);
+    }
+
     if watcher {
         start_watcher(&root_dir, graph.clone());
     }
@@ -201,6 +217,8 @@ pub fn register_with(
         )
         .with_parse_cache(parse_cache)
         .with_graph_cache(graph.clone())
+        .with_optional_space(options.space.clone())
+        .with_optional_embedder(options.embedder.clone())
         .with_backtrack(backtrack),
     ));
     registry.register(Arc::new(

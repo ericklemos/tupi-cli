@@ -30,6 +30,38 @@ pub(crate) fn shared() -> Result<&'static LlamaBackend, InferError> {
     Ok(BACKEND.get_or_init(|| backend))
 }
 
+/// Uma GPU (dedicada ou integrada) está disponível neste build e máquina.
+pub(crate) fn gpu_offload_available() -> bool {
+    llama_cpp_2::list_llama_ggml_backend_devices()
+        .iter()
+        .any(|device| {
+            matches!(
+                device.device_type,
+                llama_cpp_2::LlamaBackendDeviceType::Gpu
+                    | llama_cpp_2::LlamaBackendDeviceType::IntegratedGpu
+            )
+        })
+}
+
+/// Camadas a mandar para a GPU. 999 cobre qualquer modelo atual; o llama.cpp
+/// põe na VRAM o que couber e mantém o resto mapeado na RAM.
+pub(crate) const ALL_GPU_LAYERS: u32 = 999;
+
+pub(crate) fn gpu_layers(has_gpu: bool) -> u32 {
+    if has_gpu { ALL_GPU_LAYERS } else { 0 }
+}
+
+/// Parâmetros de carga: GPU com offload quando existe; CPU caso contrário.
+/// use_mmap mantém os pesos na RAM e só as camadas vão para a VRAM.
+pub(crate) fn model_params() -> llama_cpp_2::model::params::LlamaModelParams {
+    let params = llama_cpp_2::model::params::LlamaModelParams::default().with_use_mmap(true);
+    if gpu_offload_available() {
+        params.with_n_gpu_layers(gpu_layers(true))
+    } else {
+        params.with_n_gpu_layers(gpu_layers(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::shared;
@@ -40,6 +72,12 @@ mod tests {
         let second = shared().expect("segundo init reaproveita o backend");
 
         assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn gpu_layers_offloads_everything_only_with_a_gpu() {
+        assert_eq!(super::gpu_layers(false), 0);
+        assert_eq!(super::gpu_layers(true), 999);
     }
 
     #[test]

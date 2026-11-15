@@ -103,6 +103,11 @@ const SCALE_ONE: u64 = 1_000_000;
 const SCALE_MIN: u64 = 500_000;
 const SCALE_MAX: u64 = 4_000_000;
 
+/// Reemissões automáticas quando o provedor corta a resposta no teto de tokens.
+/// Duas bastam para uma resposta grande dividida em pedaços; mais que isso
+/// viraria loop gastando contexto sem ganho.
+const MAX_TRUNCATION_RETRIES: usize = 2;
+
 fn observed_scale(estimated: usize, charged: u64) -> Option<u64> {
     if estimated == 0 || charged == 0 {
         return None;
@@ -383,6 +388,8 @@ pub struct App {
     prefix: String,
     show_prompts: AtomicBool,
     max_tool_steps: usize,
+    /// Teto de tokens por resposta do modelo. Zero deixa o padrão do provedor.
+    max_tokens: usize,
     /// Teto de tokens estimados do contexto enviado ao modelo. Zero desliga a
     /// poda e volta ao comportamento antigo (histórico inteiro, sempre).
     context_budget: AtomicUsize,
@@ -469,6 +476,120 @@ impl App {
         Ok(CommandOutcome::ModeChanged { mode })
     }
 
+    /// `/sdd <slug>`: reativa o plano persistido, injeta o contexto no
+    /// histórico e devolve o controle ao usuário. Não abre turno.
+    ///
+    /// Plano `Draft` volta para o modo SDD (planejamento). Plano `Closed` já
+    /// tem spec fechada, então retoma direto em execução com o handoff — o
+    /// mesmo estado que `sdd(action="close")` deixa. Sem isso o usuário ficaria
+    /// preso no modo SDD, onde `sdd` recusa tanto `close` quanto `execute`.
+    fn resume_sdd(&self, slug: &str) -> Result<CommandOutcome, CommandError> {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            return Err(CommandError::Internal("uso: /sdd <slug>".to_string()));
+        }
+        if self.active.load(Ordering::SeqCst) != 0 {
+            return Err(CommandError::Busy);
+        }
+
+        let store = self.sdd_store.as_ref().ok_or_else(|| {
+            CommandError::Internal(
+                "retomada de plano SDD indisponível: app sem SddStore".to_string(),
+            )
+        })?;
+        // `FsSddStore` ignora o repo_key hoje, então a ausência dele não
+        // impede a retomada.
+        let repo_key = self.repo_key.clone().unwrap_or_default();
+        let plan = store
+            .load(&repo_key, slug)
+            .map_err(CommandError::Internal)?
+            .ok_or_else(|| {
+                CommandError::Internal(format!("plano SDD `{slug}` não existe em .tupi/sdd"))
+            })?;
+        let status = match plan.status {
+            tupi_tools::sdd::SddPlanStatus::Completed => Some("completed"),
+            tupi_tools::sdd::SddPlanStatus::Draft
+            | tupi_tools::sdd::SddPlanStatus::Closed
+            | tupi_tools::sdd::SddPlanStatus::Failed => None,
+        };
+        if let Some(status) = status {
+            return Err(CommandError::Internal(format!(
+                "plano SDD `{slug}` está {status} e não pode ser retomado"
+            )));
+        }
+
+        // Rascunho volta ao planejamento. Plano já fechado (ou cuja execução
+        // falhou) retoma direto em execução com o handoff — o mesmo estado que
+        // `sdd(action="close")` deixa, e o único em que `execute` funciona.
+        let execution_resume = matches!(
+            plan.status,
+            tupi_tools::sdd::SddPlanStatus::Closed | tupi_tools::sdd::SddPlanStatus::Failed
+        );
+        let target = if execution_resume {
+            tupi_kernel::AgentMode::Execution
+        } else {
+            tupi_kernel::AgentMode::Sdd
+        };
+        if target != tupi_kernel::AgentMode::Sdd
+            && self.mode() == tupi_kernel::AgentMode::Sdd
+            && self.sdd_flow_started.load(Ordering::SeqCst)
+        {
+            return Err(CommandError::Internal(
+                "conclua o SDD em andamento antes de retomar outro plano".to_string(),
+            ));
+        }
+
+        // Grava o slug ativo antes de mudar o modo e desfaz se a troca falhar:
+        // um comando recusado não pode deixar o store apontando para o plano.
+        let previous_active = store
+            .active_slug(&repo_key)
+            .map_err(CommandError::Internal)?;
+        store
+            .set_active_slug(&repo_key, Some(&plan.slug))
+            .map_err(CommandError::Internal)?;
+        if let Err(error) = self.apply_mode(target) {
+            let _ = store.set_active_slug(&repo_key, previous_active.as_deref());
+            return Err(error);
+        }
+        // Só o planejamento trava a saída do modo; a execução é livre.
+        self.sdd_flow_started
+            .store(target == tupi_kernel::AgentMode::Sdd, Ordering::SeqCst);
+
+        let open_tasks = plan
+            .tasks
+            .iter()
+            .filter(|task| task.status != tupi_tools::sdd::SddTaskStatus::Done)
+            .count();
+        let brief = if execution_resume {
+            crate::sdd::format_execution_handoff(&plan)
+        } else {
+            crate::sdd::format_resume_brief(&plan)
+        };
+        self.session.push_message(Message::user(brief));
+
+        // A TUI limpa o notice ao aplicar `ModeChanged`; publicar o aviso
+        // depois do evento garante que ele sobreviva à atualização do rodapé.
+        let message = if execution_resume {
+            format!(
+                "SDD retomado em execução: {} (`{}`) · {open_tasks} task(s) aberta(s) — digite \"continue\"",
+                plan.title, plan.slug
+            )
+        } else {
+            format!(
+                "SDD retomado: {} (`{}`) · {open_tasks} task(s) aberta(s) — digite \"continue\"",
+                plan.title, plan.slug
+            )
+        };
+        self.events.publish(Event::Notice { message });
+
+        Ok(CommandOutcome::SddResumed {
+            slug: plan.slug,
+            title: plan.title,
+            mode: target,
+            open_tasks,
+        })
+    }
+
     pub fn with_store(
         registry: ProviderRegistry,
         provider_id: impl Into<String>,
@@ -527,6 +648,7 @@ impl App {
             prefix,
             show_prompts: AtomicBool::new(show_prompts),
             max_tool_steps: MAX_TOOL_STEPS,
+            max_tokens: 0,
             context_budget: AtomicUsize::new(tupi_domain::context::DEFAULT_CONTEXT_TOKENS),
             context_target: AtomicUsize::new(0),
             context_recent_results: AtomicUsize::new(
@@ -609,6 +731,14 @@ impl App {
             }
         }
         self.send_message(workflow.invocation(extra))
+    }
+
+    /// Teto de tokens por resposta do modelo. Zero deixa o padrão do provedor.
+    pub fn with_max_tokens(mut self: Arc<Self>, max_tokens: usize) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("App recém-criado")
+            .max_tokens = max_tokens;
+        self
     }
 
     /// Ajusta o limite de passos de tool call por turno.
@@ -768,6 +898,7 @@ impl App {
         let sdd_repo_key = self.repo_key.clone();
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
         let max_tool_steps = self.max_tool_steps;
+        let max_tokens = self.max_tokens;
         let context_budget = self.context_budget.load(Ordering::SeqCst);
         let context_target = self.context_target.load(Ordering::SeqCst);
         let context_recent_results = self.context_recent_results.load(Ordering::SeqCst);
@@ -844,6 +975,7 @@ impl App {
             let mut failure_http: Option<u16> = None;
             let mut step = 0;
             let mut tool_calls_count = 0usize;
+            let mut truncation_retries = 0usize;
             let mut prompt_tokens = None;
             let mut cached_tokens = None;
             let mut completion_tokens = None;
@@ -948,11 +1080,13 @@ impl App {
                         ));
                     }
                 }
-                let request = ChatRequest::new(model.clone(), messages).with_tools(if final_step {
-                    Vec::new()
-                } else {
-                    specs.clone()
-                });
+                let request = ChatRequest::new(model.clone(), messages)
+                    .with_tools(if final_step {
+                        Vec::new()
+                    } else {
+                        specs.clone()
+                    })
+                    .with_max_tokens(max_tokens);
 
                 if show_prompts {
                     events.publish(Event::PromptMessages {
@@ -974,10 +1108,16 @@ impl App {
                             body_chars: clipped.chars,
                             body_bytes: clipped.bytes,
                             truncated: clipped.truncated,
+                            body_omitted: clipped.omitted,
                             estimate_tokens: prompt_estimate,
                             estimate_scaled: scaled_estimate(prompt_estimate, scale),
                             messages: request.messages.len(),
                             tools: request.tools.len(),
+                            tool_names: request
+                                .tools
+                                .iter()
+                                .map(|spec| spec.name.clone())
+                                .collect(),
                         },
                     ));
                 }
@@ -993,6 +1133,7 @@ impl App {
                 let mut step_cached_tokens = None;
                 let mut step_completion_tokens = None;
                 let mut step_tool_names: Vec<String> = Vec::new();
+                let mut finish_reason: Option<String> = None;
 
                 match provider.stream_chat(request).await {
                     Err(error) => {
@@ -1008,6 +1149,10 @@ impl App {
                                         first_token_at = Some(std::time::Instant::now());
                                     }
                                     match event {
+                                        ProviderEvent::Started => {}
+                                        ProviderEvent::Finished(reason) => {
+                                            finish_reason = Some(reason);
+                                        }
                                         ProviderEvent::Text(text) => {
                                             if telemetry.is_enabled() {
                                                 delta_count += 1;
@@ -1093,6 +1238,7 @@ impl App {
                             prompt_tokens: step_prompt_tokens,
                             cached_tokens: step_cached_tokens,
                             completion_tokens: step_completion_tokens,
+                            finish_reason: finish_reason.clone(),
                             ok: failure.is_none(),
                             error: failure.clone(),
                             error_kind: failure_kind.map(|kind| kind.to_string()),
@@ -1103,6 +1249,42 @@ impl App {
 
                 if !streamed_text.is_empty() {
                     final_text = streamed_text.clone();
+                }
+
+                // Provedor cortou a resposta no teto de tokens. As tool calls
+                // que vieram junto podem estar incompletas (JSON truncado),
+                // então nada desta chamada roda: registra o corte, descarta as
+                // calls e pede a reemissão. Sem isso um `patch` cortado ao
+                // meio vira "argumento inválido" ou, pior, uma edição parcial.
+                let truncated = matches!(
+                    finish_reason.as_deref(),
+                    Some("length") | Some("max_tokens")
+                );
+                if truncated && !stream_failed && failure.is_none() {
+                    if !streamed_text.is_empty() {
+                        session.push_message(Message::assistant(streamed_text));
+                    }
+                    events.publish(Event::Notice {
+                        message: format!(
+                            "resposta cortada no limite de {max_tokens} tokens — nada desta chamada foi executado"
+                        ),
+                    });
+                    if truncation_retries < MAX_TRUNCATION_RETRIES && !final_step {
+                        truncation_retries += 1;
+                        session.push_message(Message::new(
+                            Role::System,
+                            format!(
+                                "A resposta anterior foi cortada pelo limite de {max_tokens} tokens antes de terminar. Nada dela foi executado. Reemita a resposta/chamada completa; se o conteúdo for grande, divida em passos menores."
+                            ),
+                        ));
+                        continue;
+                    }
+                    close_unanswered(
+                        &session,
+                        &pending,
+                        "resposta truncada: chamada não executada",
+                    );
+                    break;
                 }
 
                 if final_step {
@@ -1235,6 +1417,7 @@ impl App {
                         name: call.name.clone(),
                         ok,
                         summary: summary.clone(),
+                        duration_us: crate::telemetry::micros(duration).max(1),
                     });
 
                     if telemetry.is_enabled() {
@@ -1353,9 +1536,9 @@ impl App {
                         cancelled,
                         steps: step,
                         tool_calls: tool_calls_count,
-                        prompt_tokens,
-                        cached_tokens,
-                        completion_tokens,
+                        total_prompt_tokens: prompt_tokens,
+                        total_cached_tokens: cached_tokens,
+                        total_completion_tokens: completion_tokens,
                         error: failure.clone(),
                         error_kind: failure_kind.map(|kind| kind.to_string()),
                     },
@@ -1557,6 +1740,7 @@ impl CommandHandler for App {
                 Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
                 Command::SetModel { model } => self.set_model(model),
                 Command::Memory { action } => Ok(self.memory_command(action)),
+                Command::ResumeSdd { slug } => self.resume_sdd(&slug),
                 Command::ToggleMode => {
                     let next = match self.mode() {
                         tupi_kernel::AgentMode::Execution => tupi_kernel::AgentMode::Sdd,
@@ -1821,6 +2005,49 @@ impl QueryHandler for App {
                     Ok(QueryResult::Models(provider.list_models().await?))
                 }
                 Query::ListWorkflows => Ok(QueryResult::Workflows(self.workflows.list())),
+                // O kernel só fixa o contrato: resumir os planos (e filtrar por
+                // status) é responsabilidade da camada app.
+                Query::ListSddSpecs => {
+                    use tupi_domain::sdd::{SddSpecStatus, SddSpecSummary};
+                    use tupi_tools::sdd::{SddPlanStatus, SddTaskStatus};
+
+                    let store = self.sdd_store.as_ref().ok_or_else(|| {
+                        QueryError::Internal(
+                            "listagem de planos SDD indisponível: app sem SddStore".to_string(),
+                        )
+                    })?;
+                    // `FsSddStore` ignora o repo_key hoje, então a ausência dele
+                    // não impede a listagem.
+                    let repo_key = self.repo_key.clone().unwrap_or_default();
+                    let plans = store.list(&repo_key).map_err(QueryError::Internal)?;
+                    let specs = plans
+                        .into_iter()
+                        .filter_map(|plan| {
+                            // `Closed` é plano fechado para execução e
+                            // `Failed` é execução que pode ser retomada: ambos
+                            // continuam na lista. Só `Completed` sai.
+                            let status = match plan.status {
+                                SddPlanStatus::Draft | SddPlanStatus::Closed => {
+                                    SddSpecStatus::Draft
+                                }
+                                SddPlanStatus::Completed => SddSpecStatus::Completed,
+                                SddPlanStatus::Failed => SddSpecStatus::Failed,
+                            };
+                            let summary = SddSpecSummary::new(
+                                plan.slug,
+                                plan.title,
+                                status,
+                                plan.tasks
+                                    .iter()
+                                    .filter(|task| task.status != SddTaskStatus::Done)
+                                    .count(),
+                                plan.tasks.len(),
+                            );
+                            summary.is_resumable().then_some(summary)
+                        })
+                        .collect();
+                    Ok(QueryResult::SddSpecs(specs))
+                }
             }
         }
         .await;

@@ -20,8 +20,10 @@ impl SearchTool {
         let budget = params.budget_tokens.unwrap_or(self.default_budget_tokens);
         let repeat_allowed = params.repeat.as_deref() == Some("allow");
 
+        let snapshot = self.space.as_ref().and_then(|space| space.snapshot());
+        let dense_possible = snapshot.is_some() && self.current_embedder().is_some();
         let matches = self.scanner.search(&terms, params.path.as_deref())?;
-        if matches.is_empty() {
+        if matches.is_empty() && !dense_possible {
             return Ok(format!(
                 "Nenhum resultado encontrado para `{}`.",
                 params.query.trim()
@@ -69,14 +71,50 @@ impl SearchTool {
             snippets.extend(file_snippets);
         }
 
-        if snippets.is_empty() {
+        if snippets.is_empty() && !dense_possible {
             return Ok(format!(
                 "Termos encontrados, porém nenhum bloco de código pôde ser delimitado para `{}`.",
                 params.query.trim()
             ));
         }
 
-        let mut ranked = LexicalRanker::new().rank_indices(&terms, &snippets);
+        let dense_indices = if dense_possible {
+            let snapshot = snapshot.as_ref().expect("snapshot checado");
+            self.dense_snippets(
+                snapshot,
+                &params.query,
+                params.path.as_deref(),
+                &mut snippets,
+                &mut files,
+                &mut file_indices,
+                &mut matched_hashes,
+            )
+        } else {
+            Vec::new()
+        };
+        if snippets.is_empty() {
+            return Ok(format!(
+                "Nenhum resultado encontrado para `{}`.",
+                params.query.trim()
+            ));
+        }
+        let lexical_ranked = LexicalRanker::new().rank_indices(&terms, &snippets);
+        let mut ranked: Vec<(usize, f32)> = if dense_indices.is_empty() {
+            lexical_ranked
+        } else {
+            let lexical_indices: Vec<usize> = lexical_ranked
+                .into_iter()
+                .filter(|(_, score)| *score > 0.0)
+                .map(|(index, _)| index)
+                .collect();
+            let fused =
+                super::fusion::rrf(&lexical_indices, &dense_indices, 3.0, 60.0, snippets.len());
+            fused
+                .into_iter()
+                .enumerate()
+                .map(|(position, index)| (index, 1.0 - position as f32 * 0.001))
+                .collect()
+        };
         if !repeat_allowed {
             ranked.sort_by(|&(idx_a, score_a), &(idx_b, score_b)| {
                 let (_, _, ref rel_a, ref hash_a) = files[file_indices[idx_a]];
@@ -259,6 +297,15 @@ impl SearchTool {
             .record_query(&terms, params.path.as_deref(), matched_hashes);
 
         let mut out = format!("### Resultados da busca\n{completeness}\n\n");
+        if let Some(snapshot) = snapshot.as_ref()
+            && snapshot.entries.len() < snapshot.expected_symbols
+        {
+            out.push_str(&format!(
+                "espaço: {}/{} símbolos indexados (build em andamento)\n\n",
+                snapshot.entries.len(),
+                snapshot.expected_symbols
+            ));
+        }
         if query_seen {
             out.push_str(
                 "> **Backtrack**: busca equivalente já realizada nesta sessão; priorizando pontos ainda não abertos.\n\n",

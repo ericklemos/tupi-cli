@@ -97,6 +97,9 @@ struct StreamState {
     parser: SseParser,
     pending: VecDeque<String>,
     calls: ToolCallAccumulator,
+    /// Último `finish_reason` visto. "length" indica corte no teto de tokens.
+    finish_reason: Option<String>,
+    started: bool,
     done: bool,
 }
 
@@ -166,6 +169,8 @@ impl Provider for DeepSeekProvider {
             parser: SseParser::new(),
             pending: VecDeque::new(),
             calls: ToolCallAccumulator::new(),
+            finish_reason: None,
+            started: false,
             done: false,
         };
 
@@ -173,16 +178,17 @@ impl Provider for DeepSeekProvider {
             loop {
                 if let Some(payload) = state.pending.pop_front() {
                     if is_done(&payload) {
-                        if let Some(calls) = state.calls.finish() {
-                            return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
-                        }
-                        return None;
+                        state.done = true;
+                        continue;
                     }
 
                     match extract_chunk(&payload) {
                         Ok(chunk) => {
                             for delta in chunk.tool_calls {
                                 state.calls.merge(delta);
+                            }
+                            if chunk.finish_reason.is_some() {
+                                state.finish_reason = chunk.finish_reason.clone();
                             }
                             if chunk.prompt_tokens.is_some()
                                 || chunk.cached_tokens.is_some()
@@ -200,11 +206,6 @@ impl Provider for DeepSeekProvider {
                             if let Some(text) = chunk.text {
                                 return Some((Ok(ProviderEvent::Text(text)), state));
                             }
-                            if chunk.finish_reason.is_some()
-                                && let Some(calls) = state.calls.finish()
-                            {
-                                return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
-                            }
                             continue;
                         }
                         Err(error) => return Some((Err(error), state)),
@@ -214,6 +215,9 @@ impl Provider for DeepSeekProvider {
                 if state.done {
                     if let Some(calls) = state.calls.finish() {
                         return Some((Ok(ProviderEvent::ToolCalls(calls)), state));
+                    }
+                    if let Some(reason) = state.finish_reason.take() {
+                        return Some((Ok(ProviderEvent::Finished(reason)), state));
                     }
                     return None;
                 }
@@ -231,7 +235,13 @@ impl Provider for DeepSeekProvider {
                         return Some((Err(ProviderError::Network(error.to_string())), state));
                     }
                     Ok(Ok(None)) => state.done = true,
-                    Ok(Ok(Some(bytes))) => state.pending.extend(state.parser.push(&bytes)),
+                    Ok(Ok(Some(bytes))) => {
+                        state.pending.extend(state.parser.push(&bytes));
+                        if !state.started {
+                            state.started = true;
+                            return Some((Ok(ProviderEvent::Started), state));
+                        }
+                    }
                 }
             }
         });
@@ -285,6 +295,10 @@ pub fn build_body(request: &ChatRequest) -> serde_json::Value {
 
     if !request.tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tupi_kernel::tools_payload(&request.tools));
+    }
+
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(max_tokens);
     }
 
     body
@@ -398,6 +412,27 @@ mod tests {
     }
 
     #[test]
+    fn body_carries_the_configured_max_tokens() {
+        let request =
+            ChatRequest::new("deepseek-flash", vec![Message::user("oi")]).with_max_tokens(1234);
+        let body = build_body(&request);
+
+        assert_eq!(body["max_tokens"], 1234);
+    }
+
+    #[test]
+    fn body_omits_max_tokens_when_unset_or_zero() {
+        let unset = build_body(&ChatRequest::new(
+            "deepseek-flash",
+            vec![Message::user("oi")],
+        ));
+        assert!(unset.get("max_tokens").is_none());
+
+        let zero = ChatRequest::new("deepseek-flash", vec![Message::user("oi")]).with_max_tokens(0);
+        assert!(build_body(&zero).get("max_tokens").is_none());
+    }
+
+    #[test]
     fn assistant_tool_calls_are_serialized() {
         let call = ToolCall {
             id: "c1".into(),
@@ -477,6 +512,45 @@ mod tests {
         assert_eq!(calls[1].name, "second");
     }
 
+    #[tokio::test]
+    async fn stream_starts_with_started_before_the_first_text() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ola\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let provider = DeepSeekProvider::new("sk-test").with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "deepseek-flash",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, ProviderEvent::Started);
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second, ProviderEvent::Text("ola".to_string()));
+    }
+
     #[test]
     fn accumulator_generates_an_id_when_the_provider_omits_it() {
         let mut accumulator = ToolCallAccumulator::new();
@@ -489,5 +563,59 @@ mod tests {
 
         let calls = accumulator.finish().unwrap();
         assert_eq!(calls[0].id, "call_3");
+    }
+
+    #[tokio::test]
+    async fn stream_reports_the_finish_reason_after_tool_calls() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"cortando\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\"\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let provider = DeepSeekProvider::new("sk-test").with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "deepseek-flash",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+
+        assert_eq!(events[0], ProviderEvent::Started);
+        assert!(events.contains(&ProviderEvent::Text("cortando".to_string())));
+        assert!(events.contains(&ProviderEvent::ToolCalls(vec![ToolCall {
+            id: "c1".to_string(),
+            name: "read".to_string(),
+            arguments: "{\"path\"".to_string(),
+        }])));
+        assert_eq!(
+            events.last(),
+            Some(&ProviderEvent::Finished("length".to_string())),
+            "events: {events:?}"
+        );
     }
 }

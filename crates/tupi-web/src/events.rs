@@ -212,6 +212,7 @@ fn map_event(event: Event, seq: &AtomicU64) -> Vec<WebEvent> {
             name,
             ok,
             summary,
+            duration_us: _,
         } => {
             let mut events = vec![WebEvent::ToolFinished {
                 seq: next(),

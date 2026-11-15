@@ -319,6 +319,10 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
         }]);
     }
 
+    if let Some(max_tokens) = request.max_tokens {
+        request_payload["generationConfig"] = json!({ "maxOutputTokens": max_tokens });
+    }
+
     json!({
         "project": project_id,
         "model": resolve_api_model(&request.model),
@@ -643,6 +647,7 @@ struct StreamState {
     ready_events: VecDeque<ProviderEvent>,
     accumulated_calls: Vec<ToolCall>,
     last_usage: Option<(Option<u64>, Option<u64>, Option<u64>)>,
+    started: bool,
     done: bool,
 }
 
@@ -837,6 +842,7 @@ impl Provider for AntigravityProvider {
             ready_events: VecDeque::new(),
             accumulated_calls: Vec::new(),
             last_usage: None,
+            started: false,
             done: false,
         };
 
@@ -897,6 +903,10 @@ impl Provider for AntigravityProvider {
 
                 match state.response.chunk().await {
                     Ok(Some(bytes)) => {
+                        if !state.started {
+                            state.started = true;
+                            state.ready_events.push_back(ProviderEvent::Started);
+                        }
                         for event in state.parser.push(&bytes) {
                             state.pending.push_back(event);
                         }
@@ -1316,6 +1326,23 @@ mod tests {
         assert!(body["requestId"].as_str().unwrap().starts_with("agent-"));
         assert_eq!(body["request"]["contents"][0]["role"], "user");
         assert_eq!(body["request"]["contents"][0]["parts"][0]["text"], "ola");
+    }
+
+    #[test]
+    fn body_carries_max_output_tokens() {
+        let request = ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("oi")])
+            .with_max_tokens(900);
+        let body = build_body(&request, "proj-1");
+
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 900);
+    }
+
+    #[test]
+    fn body_omits_max_output_tokens_when_unset() {
+        let request = ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("oi")]);
+        let body = build_body(&request, "proj-1");
+
+        assert!(body["request"].get("generationConfig").is_none());
     }
 
     #[test]
@@ -1798,6 +1825,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                ProviderEvent::Started,
                 ProviderEvent::Text("ola".to_string()),
                 ProviderEvent::Usage {
                     prompt_tokens: Some(10),
@@ -1856,6 +1884,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                ProviderEvent::Started,
                 ProviderEvent::Text("ola".to_string()),
                 ProviderEvent::Text(" mundo".to_string()),
                 ProviderEvent::Usage {

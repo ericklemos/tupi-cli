@@ -10,6 +10,31 @@ Você está em modo SDD (somente leitura; edições e comandos estão bloqueados
 3. Quando tiver contexto suficiente, avise em linguagem natural e pergunte se o usuário deseja continuar o debate ou fechar a spec.
 4. Só chame `sdd(action="close")` após confirmação explícita do usuário."#;
 
+/// Fatos da task/subtask, sem as regras do papel de quem vai executar.
+/// Compartilhado entre o brief de execução e o de retomada.
+fn push_next_step(
+    out: &mut String,
+    task: &tupi_tools::sdd::SddTask,
+    subtask: Option<&tupi_tools::sdd::SddSubtask>,
+) {
+    out.push_str(&format!("## Task {} — {}\n", task.id, task.title));
+    if !task.details.trim().is_empty() {
+        out.push_str(&format!("Detalhes: {}\n", task.details.trim()));
+    }
+    for nuance in &task.nuances {
+        out.push_str(&format!("Nuance: {nuance}\n"));
+    }
+    if let Some(sub) = subtask {
+        out.push_str(&format!("\n## Subtarefa: {} — {}\n", sub.id, sub.title));
+        if !sub.acceptance.trim().is_empty() {
+            out.push_str(&format!("Aceite: {}\n", sub.acceptance.trim()));
+        }
+        if !sub.touches.is_empty() {
+            out.push_str(&format!("Arquivos: {}\n", sub.touches.join(", ")));
+        }
+    }
+}
+
 /// Brief enxuto de uma subtask para o agente de implementação.
 pub fn format_subtask_brief(
     plan: &tupi_tools::sdd::SddPlan,
@@ -37,22 +62,8 @@ pub fn format_subtask_brief(
             out.push_str(&format!("- {item}\n"));
         }
     }
-    out.push_str(&format!("\n## Task {} — {}\n", task.id, task.title));
-    if !task.details.trim().is_empty() {
-        out.push_str(&format!("Detalhes: {}\n", task.details.trim()));
-    }
-    for nuance in &task.nuances {
-        out.push_str(&format!("Nuance: {nuance}\n"));
-    }
-    if let Some(sub) = subtask {
-        out.push_str(&format!("\n## Subtarefa: {} — {}\n", sub.id, sub.title));
-        if !sub.acceptance.trim().is_empty() {
-            out.push_str(&format!("Aceite: {}\n", sub.acceptance.trim()));
-        }
-        if !sub.touches.is_empty() {
-            out.push_str(&format!("Arquivos: {}\n", sub.touches.join(", ")));
-        }
-    }
+    out.push('\n');
+    push_next_step(&mut out, task, subtask);
     out.push_str(
         "\nRegras:\n- Implemente apenas esta subtarefa; não toque no que pertence a outras.\n- Outros agentes podem estar trabalhando em paralelo em outras partes do repositório.\n- Não edite o plano nem chame sdd.\n- Ao terminar, responda em até 3 linhas com o que mudou e como verificou.\n",
     );
@@ -108,24 +119,7 @@ pub fn format_execution_handoff(plan: &SddPlan) -> String {
         }
         None => out.push_str("SDD fechado. Inicie a execução seguindo exclusivamente o plano destilado abaixo (não reabra documentação já resolvida).\n\n"),
     }
-    out.push_str(&format!(
-        "# {} (`{}`)\nObjetivo: {}\n",
-        plan.title, plan.slug, plan.goal
-    ));
-
-    if !plan.constraints.is_empty() {
-        out.push_str("\nRestrições:\n");
-        for item in &plan.constraints {
-            out.push_str(&format!("- {item}\n"));
-        }
-    }
-
-    if !plan.nuances.is_empty() {
-        out.push_str("\nNuances:\n");
-        for item in &plan.nuances {
-            out.push_str(&format!("- {item}\n"));
-        }
-    }
+    push_plan_heading(&mut out, plan);
 
     out.push_str("\nTasks:\n");
     for task in &plan.tasks {
@@ -159,6 +153,98 @@ pub fn format_execution_handoff(plan: &SddPlan) -> String {
     out
 }
 
+fn plan_status_label(status: tupi_tools::sdd::SddPlanStatus) -> &'static str {
+    match status {
+        tupi_tools::sdd::SddPlanStatus::Draft => "draft",
+        tupi_tools::sdd::SddPlanStatus::Closed => "closed",
+        tupi_tools::sdd::SddPlanStatus::Completed => "completed",
+        tupi_tools::sdd::SddPlanStatus::Failed => "failed",
+    }
+}
+
+/// Cabeçalho comum aos briefs derivados do plano: título, objetivo,
+/// restrições e nuances. Compartilhado com `format_execution_handoff` para
+/// que os dois textos não divirjam.
+fn push_plan_heading(out: &mut String, plan: &SddPlan) {
+    out.push_str(&format!(
+        "# {} (`{}`)\nObjetivo: {}\n",
+        plan.title, plan.slug, plan.goal
+    ));
+
+    if !plan.constraints.is_empty() {
+        out.push_str("\nRestrições:\n");
+        for item in &plan.constraints {
+            out.push_str(&format!("- {item}\n"));
+        }
+    }
+
+    if !plan.nuances.is_empty() {
+        out.push_str("\nNuances:\n");
+        for item in &plan.nuances {
+            out.push_str(&format!("- {item}\n"));
+        }
+    }
+}
+
+/// Brief injetado no histórico por `/sdd <slug>`.
+///
+/// Não é um turno: a primeira linha proíbe responder e pede que o agente
+/// aguarde o próximo pedido (por exemplo, "continue"). O restante reaproveita
+/// o cabeçalho do handoff de execução e o brief da próxima subtarefa.
+pub fn format_resume_brief(plan: &SddPlan) -> String {
+    let mut out = String::from(
+        "Contexto de retomada do plano SDD, injetado pelo comando /sdd. \
+         Não responda a esta mensagem e não comece a executar por conta própria: \
+         aguarde o próximo pedido do usuário (por exemplo, \"continue\").\n\n",
+    );
+    out.push_str(&format!("Status: {}\n", plan_status_label(plan.status)));
+    push_plan_heading(&mut out, plan);
+
+    let open_tasks: Vec<&tupi_tools::sdd::SddTask> = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status != SddTaskStatus::Done)
+        .collect();
+    if plan.tasks.is_empty() {
+        out.push_str("\nO plano ainda não tem tasks definidas.\n");
+    } else if open_tasks.is_empty() {
+        out.push_str("\nTodas as tasks já estão concluídas.\n");
+    } else {
+        out.push_str("\nTasks abertas:\n");
+        for task in &open_tasks {
+            let status = match task.status {
+                SddTaskStatus::Done => "done",
+                SddTaskStatus::InProgress => "in_progress",
+                SddTaskStatus::Open => "open",
+            };
+            out.push_str(&format!("- [{}] {} — {}\n", status, task.id, task.title));
+            if let Some(sub) = task
+                .subtasks
+                .iter()
+                .find(|sub| sub.status != SddSubtaskStatus::Done)
+            {
+                out.push_str(&format!(
+                    "  Próxima subtarefa: {} — {}\n",
+                    sub.id, sub.title
+                ));
+            }
+        }
+    }
+
+    if let Some((task, subtask)) = open_tasks.iter().find_map(|task| {
+        let next = task
+            .subtasks
+            .iter()
+            .find(|sub| sub.status != SddSubtaskStatus::Done);
+        Some((*task, next))
+    }) {
+        out.push_str("\n## Próximo passo\n\n");
+        push_next_step(&mut out, task, subtask);
+    }
+
+    out
+}
+
 pub fn compose_prefix(base: &str, mode: AgentMode) -> String {
     match mode {
         AgentMode::Execution => base.to_string(),
@@ -169,5 +255,33 @@ pub fn compose_prefix(base: &str, mode: AgentMode) -> String {
                 format!("{base}\n\n{SDD_POSTURE_PROMPT}")
             }
         }
+    }
+}
+
+/// Prefixo do agente de implementação: o prompt base do projeto (Descoberta,
+/// Convergência, AGENTS.md) mais as regras do papel de implementador.
+pub fn compose_agent_prefix(base: &str) -> String {
+    if base.trim().is_empty() {
+        crate::sdd_api::AGENT_PREFIX.to_string()
+    } else {
+        format!("{base}\n\n{}", crate::sdd_api::AGENT_PREFIX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_prefix_carries_the_project_prompt_and_the_role() {
+        let composed = compose_agent_prefix("PROMPT DO PROJETO");
+
+        assert!(composed.starts_with("PROMPT DO PROJETO"));
+        assert!(composed.ends_with(crate::sdd_api::AGENT_PREFIX));
+    }
+
+    #[test]
+    fn agent_prefix_falls_back_to_the_role_when_the_project_prompt_is_empty() {
+        assert_eq!(compose_agent_prefix("   "), crate::sdd_api::AGENT_PREFIX);
     }
 }

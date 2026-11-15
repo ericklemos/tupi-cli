@@ -334,7 +334,6 @@ impl Store {
 }
 
 mod sdd;
-pub use sdd::*;
 
 #[cfg(test)]
 mod tests {

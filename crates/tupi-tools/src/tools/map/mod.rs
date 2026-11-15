@@ -48,6 +48,16 @@ impl MapTool {
     }
 }
 
+/// `.` e `./` significam a raiz: sem normalizar, o filtro por prefixo devolve
+/// zero arquivos. `./src` vira `src`, para casar com os caminhos relativos.
+fn path_prefix(path: Option<&str>) -> Option<&str> {
+    let prefix = path
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty() && *prefix != ".")?;
+    let prefix = prefix.strip_prefix("./").unwrap_or(prefix);
+    (!prefix.is_empty()).then_some(prefix)
+}
+
 fn filtered<'a>(graph: &'a CallGraph, prefix: Option<&str>, include_tests: bool) -> Vec<&'a Def> {
     graph
         .defs
@@ -176,11 +186,7 @@ impl Tool for MapTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let prefix = params
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|prefix| !prefix.is_empty());
+        let prefix = path_prefix(params.path.as_deref());
         if let Some(prefix) = prefix
             && (prefix.starts_with('/') || prefix.split('/').any(|part| part == ".."))
         {
@@ -323,6 +329,31 @@ mod tests {
         let error =
             Tool::call(&tool(dir.path()), serde_json::json!({"path": "../fora"})).unwrap_err();
         assert!(matches!(error, ToolError::OutsideRoot(_)));
+    }
+
+    #[test]
+    fn a_dot_path_means_the_whole_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+        let map = tool(dir.path());
+        let whole = Tool::call(&map, serde_json::json!({"depth": "files"})).unwrap();
+        let dot = Tool::call(&map, serde_json::json!({"depth": "files", "path": "."})).unwrap();
+        let dot_slash =
+            Tool::call(&map, serde_json::json!({"depth": "files", "path": "./"})).unwrap();
+        assert_eq!(dot, whole);
+        assert_eq!(dot_slash, whole);
+    }
+
+    #[test]
+    fn a_dot_slash_prefix_is_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "pub fn helper() {}\n");
+        let out = Tool::call(
+            &tool(dir.path()),
+            serde_json::json!({"depth": "files", "path": "./src"}),
+        )
+        .unwrap();
+        assert!(out.contains("src/a.rs"));
     }
 
     #[test]

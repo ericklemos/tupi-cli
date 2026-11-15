@@ -18,7 +18,7 @@ env:
 
 jobs:
   test:
-    name: Test (ubuntu-22.04)
+    name: Test (ubuntu-22.04, cpu)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -26,16 +26,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-ubuntu-22.04
+          key: test-ubuntu-22.04-cpu
       - name: Configure git identity for tests that commit
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-default-features
 
   build-check:
-    name: Build check (${{ matrix.os }})
+    name: Build check (${{ matrix.os }}, cpu)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -47,7 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: check-${{ matrix.os }}
+          key: check-${{ matrix.os }}-cpu
       - name: Locate libclang (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -57,10 +57,10 @@ jobs:
             "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
       - name: cargo check
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --locked --no-default-features
 
   clippy:
-    name: Clippy
+    name: Clippy (cpu)
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -70,6 +70,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: clippy
+          key: clippy-cpu
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked --no-default-features
+

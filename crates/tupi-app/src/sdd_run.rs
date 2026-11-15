@@ -1,6 +1,5 @@
 //! Agent turn runner and SDD plan orchestrator.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -10,7 +9,7 @@ use tupi_domain::{Event, Message, Role, ToolCall};
 use tupi_kernel::{ChatRequest, EventBus, Provider, ProviderEvent, ToolRegistry};
 use tupi_tools::sdd::{
     AcceptanceTest, SddPlan, SddPlanStatus, SddStore, SddSubtask, SddSubtaskStatus, SddTask,
-    SddTaskStatus, write_mirror,
+    SddTaskStatus,
 };
 
 use crate::app::run_tool;
@@ -23,6 +22,8 @@ pub(crate) struct AgentTurn<'a> {
     pub prefix: &'a str,
     pub tools: &'a ToolRegistry,
     pub max_steps: usize,
+    /// Teto de tokens por resposta. Zero deixa o padrão do provedor.
+    pub max_tokens: usize,
     pub timeout: Duration,
     pub cancel: Arc<AtomicBool>,
     pub in_flight: Arc<tokio::sync::Notify>,
@@ -58,28 +59,109 @@ pub(crate) async fn run_agent(turn: AgentTurn<'_>, brief: &str) -> AgentOutcome 
 }
 
 async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> AgentOutcome {
-    for _ in 0..turn.max_steps {
+    // Mesmo freio do turno principal: avisa a partir dos 60% e, no último
+    // passo, retira as tools para que o modelo seja obrigado a concluir em
+    // texto em vez de morrer no limite.
+    let brake_from = turn.max_steps.saturating_mul(3) / 5;
+    for step in 1..=turn.max_steps {
         if turn.cancel.load(Ordering::SeqCst) {
             return AgentOutcome::failure("cancelado");
         }
-        let request = ChatRequest {
-            model: turn.model.to_string(),
-            messages: messages.clone(),
-            tools: turn.tools.specs(),
-        };
+        let final_step = step >= turn.max_steps;
+        let mut request_messages = messages.clone();
+        if step >= brake_from.max(1) {
+            let warning = if final_step {
+                "Freio de passos: última chamada, sem tools. Responda agora, em texto, \
+                 com o que mudou, os arquivos e como verificou. Se não terminou, diga \
+                 exatamente o que falta e em qual arquivo parou."
+                    .to_string()
+            } else {
+                format!(
+                    "Freio de passos: restam {} de {} chamadas. Pare de explorar e comece \
+                     a implementar agora; só chame tool se for indispensável.",
+                    turn.max_steps.saturating_sub(step),
+                    turn.max_steps
+                )
+            };
+            request_messages.push(Message::new(Role::System, warning));
+        }
+        let specs = turn.tools.specs();
+        tracing::debug!(
+            step,
+            max_steps = turn.max_steps,
+            final_step,
+            tools = ?specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            "passo do agente SDD"
+        );
+        let request = ChatRequest::new(turn.model.to_string(), request_messages)
+            .with_tools(if final_step { Vec::new() } else { specs })
+            .with_max_tokens(turn.max_tokens);
         let mut stream = match turn.provider.stream_chat(request).await {
             Ok(stream) => stream,
             Err(error) => return AgentOutcome::failure(error.to_string()),
         };
         let mut text = String::new();
         let mut calls = Vec::new();
+        let mut finish_reason: Option<String> = None;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(ProviderEvent::Text(chunk)) => text.push_str(&chunk),
                 Ok(ProviderEvent::ToolCalls(inner)) => calls.extend(inner),
+                Ok(ProviderEvent::Finished(reason)) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(error) => return AgentOutcome::failure(error.to_string()),
             }
+        }
+
+        // Resposta cortada no teto de tokens: as calls podem estar incompletas
+        // (JSON truncado), então nada desta etapa roda. Guarda o texto, pede a
+        // reemissão e gasta o passo; no último passo, falha com a causa real.
+        if matches!(
+            finish_reason.as_deref(),
+            Some("length") | Some("max_tokens")
+        ) {
+            if !text.is_empty() {
+                messages.push(Message::assistant(text));
+            }
+            if final_step {
+                return AgentOutcome::failure(format!(
+                    "resposta cortada no limite de {} tokens",
+                    turn.max_tokens
+                ));
+            }
+            messages.push(Message::new(
+                Role::System,
+                format!(
+                    "A resposta anterior foi cortada pelo limite de {} tokens antes de terminar. Nada dela foi executado. Reemita a resposta/chamada completa; se o conteúdo for grande, divida em passos menores.",
+                    turn.max_tokens
+                ),
+            ));
+            continue;
+        }
+        if final_step {
+            // Sem tools no request, chamadas tardias são ignoradas: o contrato
+            // do último passo é responder em texto.
+            if calls.is_empty() || !text.trim().is_empty() {
+                tracing::debug!(
+                    step,
+                    text_chars = text.chars().count(),
+                    "agente SDD concluiu no freio"
+                );
+                return AgentOutcome {
+                    ok: true,
+                    text,
+                    error: None,
+                };
+            }
+            tracing::warn!(
+                step,
+                max_steps = turn.max_steps,
+                "agente SDD pediu tool no último passo, sem tools disponíveis"
+            );
+            return AgentOutcome::failure(format!(
+                "o agente parou no limite de {} passos sem resposta final",
+                turn.max_steps
+            ));
         }
         if calls.is_empty() {
             return AgentOutcome {
@@ -102,9 +184,19 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
                 Ok(content) => content,
                 Err(error) => format!("erro: {error}"),
             };
+            tracing::debug!(
+                step,
+                tool = %call.name,
+                result_chars = content.chars().count(),
+                "tool do agente SDD"
+            );
             messages.push(Message::tool(&call.id, content));
         }
     }
+    tracing::warn!(
+        max_steps = turn.max_steps,
+        "agente SDD esgotou o orçamento de passos"
+    );
     AgentOutcome::failure(format!("limite de {} passos", turn.max_steps))
 }
 
@@ -114,7 +206,6 @@ pub type DocsAgentFactory =
     Arc<dyn Fn() -> (ToolRegistry, Arc<tupi_tools::DocsTool>) + Send + Sync>;
 
 pub(crate) struct RunContext {
-    pub root: PathBuf,
     pub store: Arc<dyn SddStore>,
     pub repo_key: String,
     pub tools: ToolRegistry,
@@ -125,6 +216,8 @@ pub(crate) struct RunContext {
     pub agent_prefix: String,
     pub max_parallel: usize,
     pub agent_max_steps: usize,
+    /// Teto de tokens por resposta dos agentes SDD. Zero deixa o padrão.
+    pub max_tokens: usize,
     pub agent_timeout: Duration,
     pub events: EventBus,
     pub request_id: u64,
@@ -346,6 +439,7 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
             prefix: crate::sdd::DOCS_AGENT_PREFIX,
             tools: &tools,
             max_steps: ctx.agent_max_steps,
+            max_tokens: ctx.max_tokens,
             timeout: ctx.agent_timeout,
             cancel: ctx.cancel.clone(),
             in_flight: ctx.in_flight.clone(),
@@ -443,6 +537,7 @@ async fn run_one(ctx: &RunContext, plan: &SddPlan, sub_id: &str) -> (AgentOutcom
             prefix: &ctx.agent_prefix,
             tools: &tools,
             max_steps: ctx.agent_max_steps,
+            max_tokens: ctx.max_tokens,
             timeout: ctx.agent_timeout,
             cancel: ctx.cancel.clone(),
             in_flight: ctx.in_flight.clone(),
@@ -451,14 +546,18 @@ async fn run_one(ctx: &RunContext, plan: &SddPlan, sub_id: &str) -> (AgentOutcom
         &brief,
     )
     .await;
+    // A duração sai do executor da subtarefa: quem consome o evento não tem
+    // como medir isso depois que ele passa pelo bus.
+    let elapsed = started.elapsed();
     ctx.events.publish(Event::ToolFinished {
         request_id: ctx.request_id,
         call_id: format!("sdd#{sub_id}"),
         name: "agent".to_string(),
         ok: outcome.ok,
         summary: summarize_outcome(&outcome),
+        duration_us: crate::telemetry::micros(elapsed).max(1),
     });
-    (outcome, started.elapsed())
+    (outcome, elapsed)
 }
 
 async fn record_result(
@@ -824,6 +923,45 @@ mod tests {
         }]))
     }
 
+    /// Modelo que só para de chamar tool quando o request deixa de oferecer
+    /// tools — o comportamento que o freio de passos precisa domar.
+    struct StubbornProvider {
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    impl StubbornProvider {
+        fn new() -> (Arc<Self>, Arc<Mutex<Vec<ChatRequest>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    requests: requests.clone(),
+                }),
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StubbornProvider {
+        fn id(&self) -> &str {
+            "stubborn"
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let events = if request.tools.is_empty() {
+                vec![text_event("concluído no último passo")]
+            } else {
+                vec![call_event("c1")]
+            };
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
     fn docs_factory(root: &std::path::Path) -> DocsAgentFactory {
         let root = root.to_path_buf();
         Arc::new(move || {
@@ -868,7 +1006,6 @@ mod tests {
             vec![text_event("documentei o fluxo")],
         ]);
         let mut ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             ToolRegistry::new(),
@@ -909,6 +1046,7 @@ mod tests {
             prefix: "sys",
             tools,
             max_steps,
+            max_tokens: 0,
             timeout: Duration::from_secs(5),
             cancel,
             in_flight: Arc::new(tokio::sync::Notify::new()),
@@ -929,6 +1067,109 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.error);
         assert_eq!(outcome.text, "feito");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_forced_to_answer_when_the_budget_ends() {
+        let (provider, requests) = StubbornProvider::new();
+        let provider: Arc<dyn Provider> = provider;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool { hits: hits.clone() }));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_agent(fixture(&provider, &tools, 3, cancel), "brief").await;
+
+        assert!(outcome.ok, "{:?}", outcome.error);
+        assert_eq!(outcome.text, "concluído no último passo");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "as tools só rodam antes do último passo"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !requests[0].tools.is_empty(),
+            "o primeiro passo ainda oferece tools"
+        );
+        assert!(
+            requests[2].tools.is_empty(),
+            "o último passo precisa forçar a resposta em texto"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_receives_the_step_brake_before_the_budget_runs_out() {
+        let (provider, requests) = StubbornProvider::new();
+        let provider: Arc<dyn Provider> = provider;
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool {
+            hits: Arc::new(AtomicUsize::new(0)),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_agent(fixture(&provider, &tools, 5, cancel), "brief").await;
+
+        assert!(outcome.ok, "{:?}", outcome.error);
+        let requests = requests.lock().unwrap();
+        let brake = |index: usize| {
+            requests[index].messages.iter().any(|message| {
+                message.role == Role::System && message.content.contains("Freio de passos")
+            })
+        };
+        assert!(!brake(1), "sem freio antes dos 60% do orçamento");
+        assert!(brake(2), "o freio entra a partir dos 60% do orçamento");
+        assert!(brake(4), "o último passo também leva o freio");
+        assert!(
+            requests[4]
+                .messages
+                .last()
+                .is_some_and(|message| message.content.contains("última chamada")),
+            "o freio final manda responder em texto"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_discards_tool_calls_cut_by_the_token_limit() {
+        let provider = Scripted::new(vec![
+            vec![
+                Ok(ProviderEvent::Text("vou editar".to_string())),
+                Ok(ProviderEvent::ToolCalls(vec![
+                    ToolCall {
+                        id: "c1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "c2".to_string(),
+                        name: "echo".to_string(),
+                        arguments: "{\"path\"".to_string(),
+                    },
+                ])),
+                Ok(ProviderEvent::Finished("length".to_string())),
+            ],
+            vec![
+                Ok(ProviderEvent::Text("pronto".to_string())),
+                Ok(ProviderEvent::Finished("stop".to_string())),
+            ],
+        ]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool {
+            hits: Arc::clone(&hits),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_agent(fixture(&provider, &tools, 4, cancel), "brief").await;
+
+        assert!(outcome.ok, "{:?}", outcome.error);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "tool de uma resposta truncada não pode rodar"
+        );
+        assert_eq!(outcome.text, "pronto");
     }
 
     #[tokio::test]
@@ -1014,14 +1255,12 @@ mod tests {
     }
 
     fn run_context(
-        root: &std::path::Path,
         store: Arc<dyn SddStore>,
         provider: Arc<dyn Provider>,
         tools: ToolRegistry,
         cancel: Arc<AtomicBool>,
     ) -> RunContext {
         RunContext {
-            root: root.to_path_buf(),
             store,
             repo_key: "repo".to_string(),
             tools,
@@ -1032,6 +1271,7 @@ mod tests {
             agent_prefix: "sys".to_string(),
             max_parallel: 4,
             agent_max_steps: 4,
+            max_tokens: 0,
             agent_timeout: Duration::from_secs(5),
             events: EventBus::new(64),
             request_id: 1,
@@ -1072,7 +1312,6 @@ mod tests {
             vec![text_event("feito T2.1")],
         ]);
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             ToolRegistry::new(),
@@ -1097,12 +1336,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_without_subtasks_runs_one_agent_and_closes_the_task() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         store.save(&closed_plan(vec![task("T1", vec![])])).unwrap();
         let (provider, requests) = Scripted::new_tracked(vec![vec![text_event("feito T1")]]);
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             ToolRegistry::new(),
@@ -1120,7 +1357,6 @@ mod tests {
 
     #[tokio::test]
     async fn done_subtasks_are_skipped() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut first = subtask("T1.1");
         first.status = SddSubtaskStatus::Done;
@@ -1129,7 +1365,6 @@ mod tests {
             .unwrap();
         let (provider, requests) = Scripted::new_tracked(vec![vec![text_event("feito T1.2")]]);
         let ctx = run_context(
-            dir.path(),
             store,
             provider,
             ToolRegistry::new(),
@@ -1144,7 +1379,6 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_task_runs_subtasks_together_and_joins_before_the_next_task() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut t1 = task("T1", vec![subtask("T1.1"), subtask("T1.2")]);
         t1.parallel = true;
@@ -1153,7 +1387,6 @@ mod tests {
             .unwrap();
         let (provider, requests) = SlowProvider::new();
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider.clone(),
             ToolRegistry::new(),
@@ -1171,7 +1404,6 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_touches_degrade_the_stage_to_serial_and_notice() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut left = subtask("T1.1");
         left.touches = vec!["src/a.rs".to_string()];
@@ -1182,7 +1414,6 @@ mod tests {
         store.save(&closed_plan(vec![t1])).unwrap();
         let (provider, _requests) = SlowProvider::new();
         let ctx = run_context(
-            dir.path(),
             store,
             provider.clone(),
             ToolRegistry::new(),
@@ -1207,14 +1438,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_parallel_task_with_a_single_subtask_finishes() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut t1 = task("T1", vec![subtask("T1.1")]);
         t1.parallel = true;
         store.save(&closed_plan(vec![t1])).unwrap();
         let (provider, _requests) = SlowProvider::new();
         let ctx = run_context(
-            dir.path(),
             store,
             provider,
             ToolRegistry::new(),
@@ -1230,7 +1459,6 @@ mod tests {
 
     #[tokio::test]
     async fn acceptance_test_failure_keeps_the_subtask_open_and_stops_the_pipeline() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut sub = subtask("T1.1");
         sub.acceptance_test = Some(AcceptanceTest {
@@ -1253,7 +1481,6 @@ mod tests {
             fail: true,
         }));
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             tools,
@@ -1278,7 +1505,6 @@ mod tests {
 
     #[tokio::test]
     async fn acceptance_test_with_zero_tests_is_inconclusive() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         let mut sub = subtask("T1.1");
         sub.acceptance_test = Some(AcceptanceTest {
@@ -1295,7 +1521,6 @@ mod tests {
             fail: false,
         }));
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             tools,
@@ -1311,7 +1536,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_agent_stops_before_the_next_task() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         store
             .save(&closed_plan(vec![
@@ -1324,7 +1548,6 @@ mod tests {
             vec![text_event("não deveria rodar")],
         ]);
         let ctx = run_context(
-            dir.path(),
             store.clone(),
             provider,
             ToolRegistry::new(),
@@ -1341,7 +1564,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_stops_the_stage_and_keeps_the_next_task_open() {
-        let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(InMemorySddStore::default());
         store
             .save(&closed_plan(vec![
@@ -1355,13 +1577,7 @@ mod tests {
             cancel: cancel.clone(),
             requests: requests.clone(),
         });
-        let ctx = run_context(
-            dir.path(),
-            store.clone(),
-            provider,
-            ToolRegistry::new(),
-            cancel,
-        );
+        let ctx = run_context(store.clone(), provider, ToolRegistry::new(), cancel);
 
         let outcome = run_plan(&ctx, "auth").await;
 

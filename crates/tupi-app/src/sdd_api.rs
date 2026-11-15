@@ -36,6 +36,8 @@ pub struct SddExecRequest {
     pub agent_prefix: String,
     pub max_parallel: usize,
     pub agent_max_steps: usize,
+    /// Teto de tokens por resposta dos agentes SDD. Zero deixa o padrão.
+    pub max_tokens: usize,
     pub agent_timeout: Duration,
     pub events: EventBus,
     pub request_id: u64,
@@ -53,7 +55,6 @@ pub struct SddExecOutcome {
 /// Executa o plano fechado. Devolve o relatório mesmo em falha.
 pub async fn execute(request: SddExecRequest, slug: &str) -> SddExecOutcome {
     let ctx = RunContext {
-        root: request.root,
         store: request.store,
         repo_key: request.repo_key,
         tools: request.tools,
@@ -64,6 +65,7 @@ pub async fn execute(request: SddExecRequest, slug: &str) -> SddExecOutcome {
         agent_prefix: request.agent_prefix,
         max_parallel: request.max_parallel,
         agent_max_steps: request.agent_max_steps,
+        max_tokens: request.max_tokens,
         agent_timeout: request.agent_timeout,
         events: request.events,
         request_id: request.request_id,

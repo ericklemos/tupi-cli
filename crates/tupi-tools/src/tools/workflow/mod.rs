@@ -234,8 +234,10 @@ fn docs_directive(root: &Path, folders: &[PathBuf]) -> Option<String> {
     };
     Some(format!(
         "Documentação de projeto produzida por `archivist`/`scribe` deve ser gravada em: {}{used}. \
-         Use `{first_display}/scribe/` para o scribe e `{first_display}/rules/` para o archivist. \
-         Não grave esses artefatos em `.agents/`.",
+         O scribe preenche os arquivos canônicos em `{first_display}/` (`index.md`, `architecture.md`, \
+         `business.md`, `conventions.md` e `decisions/`) e o archivist grava regras em \
+         `{first_display}/rules/`. Consulte antes com `docs(action=\"map\")` e reindexe com \
+         `docs(action=\"refresh\")` após escrever. Não grave esses artefatos em `.agents/`.",
         list.join(", ")
     ))
 }
@@ -833,8 +835,10 @@ mod tests {
         let section = prompt_section(&workflows, &folders, root);
         assert!(section.starts_with("## Workflows"));
         assert!(section.contains("`docs`"));
-        assert!(section.contains("docs/scribe/"));
+        assert!(section.contains("architecture.md"));
+        assert!(section.contains("decisions/"));
         assert!(section.contains("docs/rules/"));
+        assert!(!section.contains("docs/scribe/"));
     }
 
     #[test]
@@ -872,8 +876,10 @@ mod tests {
         )
         .unwrap();
         assert!(read.contains("`docs`"));
-        assert!(read.contains("docs/scribe/"));
+        assert!(read.contains("architecture.md"));
+        assert!(read.contains("decisions/"));
         assert!(read.contains("docs/rules/"));
+        assert!(!read.contains("docs/scribe/"));
     }
 
     #[test]
@@ -884,7 +890,11 @@ mod tests {
             .expect("scribe viaja com o binário");
         assert!(!body.contains(".agents/results/scribe"));
         assert!(body.contains("docs_folders"));
-        assert!(body.contains("<docs_folder>/scribe/"));
+        assert!(body.contains("<docs_folder>/architecture.md"));
+        assert!(body.contains("<docs_folder>/decisions/"));
+        assert!(body.contains("docs(action=\"map\")"));
+        assert!(body.contains("docs(action=\"refresh\")"));
+        assert!(!body.contains("<docs_folder>/scribe/"));
     }
 
     #[test]
@@ -896,5 +906,8 @@ mod tests {
         assert!(!body.contains(".agents/rules"));
         assert!(body.contains("docs_folders"));
         assert!(body.contains("<docs_folder>/rules/"));
+        assert!(body.contains("docs(action=\"map\")"));
+        assert!(body.contains("docs(action=\"write\")"));
+        assert!(body.contains("docs(action=\"refresh\")"));
     }
 }

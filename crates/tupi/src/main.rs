@@ -27,7 +27,9 @@ async fn main() -> anyhow::Result<()> {
         docs_agent: Option<tupi_app::sdd_run::DocsAgentFactory>,
         max_parallel: usize,
         agent_max_steps: usize,
+        max_tokens: usize,
         agent_timeout: std::time::Duration,
+        agent_prefix: String,
         repo_key: String,
     }
 
@@ -42,9 +44,10 @@ async fn main() -> anyhow::Result<()> {
                 docs_agent: self.docs_agent.clone(),
                 provider: self.provider.clone(),
                 model: self.model.clone(),
-                agent_prefix: tupi_app::sdd_api::AGENT_PREFIX.to_string(),
+                agent_prefix: self.agent_prefix.clone(),
                 max_parallel: self.max_parallel,
                 agent_max_steps: self.agent_max_steps,
+                max_tokens: self.max_tokens,
                 agent_timeout: self.agent_timeout,
                 events: self.events.clone(),
                 request_id: 0,
@@ -60,15 +63,6 @@ async fn main() -> anyhow::Result<()> {
                 Err(outcome.report)
             }
         }
-    }
-
-    fn setting_usize(store: &tupi_store::Store, key: &str, default: usize) -> usize {
-        store
-            .setting(key)
-            .ok()
-            .flatten()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(default)
     }
 
     let cli = parse_cli_options(&std::env::args().collect::<Vec<_>>())?;
@@ -178,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
             .join(", "),
         "pastas de documentação do projeto"
     );
+    let space_enabled =
+        project.space_enabled() && std::env::var("TUPI_SPACE").ok().as_deref() != Some("off");
     let tokens = token::load_token(&root);
     tracing::debug!(
         max_tokens = tokens.max_tokens,
@@ -218,6 +214,9 @@ async fn main() -> anyhow::Result<()> {
         target = resolved_context.target,
         "janela de contexto do modelo"
     );
+    // Completa `ai.project.json` com a janela do modelo restaurado, se a
+    // entrada ainda não existir. Nunca sobrescreve valor do usuário.
+    record_model_window(&root, &provider, &model, resolved_context.budget);
     let prompt = prompt_config::load_prompt(&root);
     tracing::debug!(
         path = %prompt_config::prompt_path(&root).display(),
@@ -264,14 +263,35 @@ async fn main() -> anyhow::Result<()> {
     tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
     tool_options.docs_folders = docs_folders.clone();
+    let should_download = config::should_download(
+        config::docs_embedding_enabled(
+            &docs_folders,
+            std::env::var("TUPI_RAG_EMBEDDING").ok().as_deref(),
+        ),
+        space_enabled,
+        std::env::var("TUPI_SPACE").ok().as_deref(),
+    );
     let embedder_slot = std::sync::Arc::new(tupi_kernel::embed::EmbedderSlot::empty());
-    if config::docs_embedding_enabled(
+    if config::local_embedding_enabled(
+        space_enabled,
         &docs_folders,
         std::env::var("TUPI_RAG_EMBEDDING").ok().as_deref(),
     ) {
         let slot = std::sync::Arc::clone(&embedder_slot);
         let base = data_dir(|key| std::env::var(key).ok());
         tokio::spawn(async move {
+            if !should_download {
+                let path = tupi_infer::download::embedding_model_path(&base);
+                if !path.exists() {
+                    tracing::warn!("modelo de embeddings ausente; busca segue lexical");
+                    return;
+                }
+                match tupi_infer::LlamaEmbedder::load(&path) {
+                    Ok(embedder) => slot.set(std::sync::Arc::new(embedder)),
+                    Err(error) => tracing::warn!(%error, "embedder nao carregou"),
+                }
+                return;
+            }
             match tupi_infer::ensure_embedding_model(&base, &tupi_infer::HttpFetcher).await {
                 Ok(path) => match tupi_infer::LlamaEmbedder::load(&path) {
                     Ok(embedder) => slot.set(std::sync::Arc::new(embedder)),
@@ -282,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     tool_options.embedder = Some(embedder_slot);
+    tool_options.space =
+        space_enabled.then(|| std::sync::Arc::new(tupi_tools::space::SpaceIndex::load(&root)));
+
     if config::summaries_enabled(
         &docs_folders,
         std::env::var("TUPI_RAG_SUMMARIES").ok().as_deref(),
@@ -334,12 +357,14 @@ async fn main() -> anyhow::Result<()> {
                 agent_tools,
                 docs_agent: docs_agent.clone(),
                 max_parallel: setting_usize(&store, "sdd.max_parallel", 4),
-                agent_max_steps: setting_usize(&store, "sdd.agent_max_steps", 24),
+                agent_max_steps: sdd_agent_steps(&store, tool_limits.max_tool_steps),
+                max_tokens: tokens.max_tokens as usize,
                 agent_timeout: std::time::Duration::from_secs(setting_usize(
                     &store,
                     "sdd.agent_timeout_seconds",
                     600,
                 ) as u64),
+                agent_prefix: tupi_app::sdd::compose_agent_prefix(&prefix),
                 repo_key: repo_key.clone(),
             });
             tool_options.sdd_executor = Some(std::sync::Arc::new(
@@ -402,11 +427,19 @@ async fn main() -> anyhow::Result<()> {
         prefix,
     )
     .with_telemetry(telemetry.clone())
+    .with_max_tokens(tokens.max_tokens as usize)
     .with_max_tool_steps(tool_limits.max_tool_steps)
     .with_context_budget(context_limits.budget)
     .with_context_target(context_limits.target)
     .with_context_recent_results(context_limits.recent_results)
     .with_context_profile(context_profile)
+    .with_model_recorder({
+        let root = root.clone();
+        let base_budget = context_limits.budget;
+        std::sync::Arc::new(move |provider: &str, model: &str| {
+            record_model_window(&root, provider, model, base_budget);
+        })
+    })
     .with_debug_dir(debug_dir);
     let app = app
         .with_repo_key(repo_key)
@@ -620,6 +653,40 @@ struct CliOptions {
     web_port: u16,
 }
 
+fn setting_usize(store: &tupi_store::Store, key: &str, default: usize) -> usize {
+    store
+        .setting(key)
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Orçamento de passos dos agentes SDD: `sdd.agent_max_steps` vence; sem ele,
+/// vale o mesmo limite de passos do turno principal (`configs/tools.ron`).
+fn sdd_agent_steps(store: &tupi_store::Store, turn_steps: usize) -> usize {
+    setting_usize(store, "sdd.agent_max_steps", turn_steps)
+}
+
+/// Grava `models[provider/modelo].context_window` em `ai.project.json`.
+///
+/// Escrita best-effort: erro de I/O ou JSON inválido vira aviso no log e nunca
+/// derruba o boot nem a troca de modelo. Chave vazia não cria entrada.
+fn record_model_window(root: &std::path::Path, provider: &str, model: &str, context_window: usize) {
+    let Some(key) = project_config::ProjectConfig::model_key(provider, model) else {
+        return;
+    };
+    match project_config::ProjectConfig::record_model_window(root, &key, context_window) {
+        Ok(true) => tracing::debug!(key = %key, context_window, "janela do modelo gravada"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            key = %key,
+            "não foi possível gravar a janela do modelo"
+        ),
+    }
+}
+
 fn parse_cli_options(args: &[String]) -> anyhow::Result<CliOptions> {
     let mut options = CliOptions::default();
     let mut index = 1;
@@ -717,6 +784,78 @@ mod cli_tests {
             .is_err()
         );
         assert!(parse_cli_options(&["tupi".to_string(), "--web-port".to_string()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sdd_steps_tests {
+    use super::sdd_agent_steps;
+
+    #[test]
+    fn the_sdd_agent_budget_follows_the_turn_budget_unless_overridden() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tupi_store::Store::open(dir.path().join("tupi.redb")).unwrap();
+
+        assert_eq!(
+            sdd_agent_steps(&store, 100),
+            100,
+            "sem setting, o agente SDD usa o orçamento do turno principal"
+        );
+
+        store.save_setting("sdd.agent_max_steps", "40").unwrap();
+        assert_eq!(sdd_agent_steps(&store, 100), 40);
+    }
+}
+
+#[cfg(test)]
+mod model_window_tests {
+    use super::record_model_window;
+    use crate::project_config;
+
+    #[test]
+    fn the_boot_records_the_window_of_the_model_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        record_model_window(dir.path(), "prov_b", "model_2", 64_000);
+
+        let config = project_config::read_project(dir.path()).unwrap();
+        assert_eq!(config.models["prov_b/model_2"].context_window, Some(64_000));
+    }
+
+    #[test]
+    fn an_existing_window_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_config::project_path(dir.path()),
+            r#"{"name":"x","models":{"prov_b/model_2":{"context_window":1024}}}"#,
+        )
+        .unwrap();
+
+        record_model_window(dir.path(), "prov_b", "model_2", 64_000);
+
+        let config = project_config::read_project(dir.path()).unwrap();
+        assert_eq!(config.models["prov_b/model_2"].context_window, Some(1024));
+    }
+
+    #[test]
+    fn an_unwritable_file_does_not_break_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // `ai.project.json` como diretório força erro de I/O mesmo rodando
+        // como root, onde permissões de arquivo não restringem nada.
+        std::fs::create_dir(project_config::project_path(dir.path())).unwrap();
+
+        record_model_window(dir.path(), "prov_b", "model_2", 64_000);
+
+        assert!(matches!(
+            project_config::read_project(dir.path()),
+            Err(project_config::ProjectConfigError::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_provider_never_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        record_model_window(dir.path(), "", "model_2", 64_000);
+        assert!(!project_config::project_path(dir.path()).exists());
     }
 }
 

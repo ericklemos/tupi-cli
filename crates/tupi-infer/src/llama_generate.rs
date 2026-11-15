@@ -4,7 +4,6 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use tupi_kernel::generate::{GenerateError, Generator};
 
@@ -23,7 +22,7 @@ impl LlamaGenerator {
             llama_cpp_2::LogOptions::default().with_logs_enabled(false),
         );
         let backend = crate::backend::shared()?;
-        let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())
+        let model = LlamaModel::load_from_file(backend, path, &crate::backend::model_params())
             .map_err(|error| InferError::Unavailable(error.to_string()))?;
         Ok(Self {
             backend,

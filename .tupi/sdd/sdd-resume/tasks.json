@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "slug": "sdd-resume",
+  "updated_at": 1794711501,
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Contrato de retomada no domínio e nos buses",
+      "details": "Criar o tipo de resumo de spec e os verbos de comando/query que a TUI precisa, sem dependência de `tupi-tools` (o kernel só conhece `tupi-domain`).",
+      "nuances": [
+        "crates/tupi-domain/src/lib.rs:1-6 lista os módulos públicos; `sdd` entra ali.",
+        "`Query`/`QueryResult` moram em crates/tupi-kernel/src/query.rs:9-22 e são consumidos por `App::query` (crates/tupi-app/src/app.rs:1824-1856).",
+        "`Command`/`CommandOutcome` moram em crates/tupi-kernel/src/command.rs:19-84; toda variante nova precisa de braço em `App::handle` (crates/tupi-app/src/app.rs:1565-1819)."
+      ],
+      "parallel": false,
+      "status": "done",
+      "subtasks": [
+        {
+          "id": "T1.1",
+          "title": "Criar `tupi_domain::sdd::SddSpecSummary` com slug, título, status e contagem de tasks abertas/total",
+          "acceptance": "Struct pública, Clone + Debug + PartialEq, com SddSpecStatus { Draft, Completed, Failed } e helper is_resumable(); teste unitário em crates/tupi-domain provando que Completed/Failed não são resumíveis.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T1.2",
+          "title": "Adicionar `Query::ListSddSpecs` e `QueryResult::SddSpecs(Vec<SddSpecSummary>)`",
+          "acceptance": "Compila com match exaustivo em App::query; teste no kernel garante que QueryResult::SddSpecs carrega a lista na ordem recebida.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T1.3",
+          "title": "Adicionar `Command::ResumeSdd { slug }` e `CommandOutcome::SddResumed { slug, title, mode, open_tasks }`",
+          "acceptance": "cargo test -p tupi-kernel verde; variantes documentadas com o mesmo estilo das comentadas em crates/tupi-kernel/src/command.rs:19-52.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "App: retomar plano e expor a lista",
+      "details": "Implementar a retomada no `App`: carregar o plano, gravar o slug ativo, entrar em modo SDD, injetar o brief e responder a query de listagem.",
+      "nuances": [
+        "`self.sdd_store` é Option (crates/tupi-app/src/app.rs:369-418): sem store, devolver CommandError::Internal com mensagem clara.",
+        "`self.repo_key` também é Option; FsSddStore ignora o repo_key hoje, então None não deve impedir o fluxo.",
+        "Command::ResumeSdd deve recusar com CommandError::Busy quando self.active != 0, igual apply_mode."
+      ],
+      "parallel": false,
+      "status": "done",
+      "subtasks": [
+        {
+          "id": "T2.1",
+          "title": "Implementar `App::query(Query::ListSddSpecs)` mapeando `SddStore::list` para `SddSpecSummary`, filtrando Completed/Failed",
+          "acceptance": "Teste em crates/tupi-app/tests (com InMemorySddStore) prova que um plano Draft aparece e que Completed não aparece.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T2.2",
+          "title": "Implementar `App::handle(Command::ResumeSdd)` com `set_active_slug`, `apply_mode(Sdd)` e `sdd_flow_started = true`",
+          "acceptance": "Teste prova que após o comando: modo é Sdd, active_slug do store é o slug pedido, sdd_flow_started está ligado, e que slug inexistente/Completed devolve erro sem mudar o modo.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T2.3",
+          "title": "Escrever `tupi_app::sdd::format_resume_brief(plan)` e injetá-lo no histórico como `Message::user` na retomada",
+          "acceptance": "Teste prova que o brief contém slug, título, goal e as tasks abertas, e que o histórico da sessão ganha exatamente uma mensagem após a retomada; o brief instrui explicitamente a não ser respondido.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "TUI: /sdd no despacho e autocomplete de slugs",
+      "details": "Ligar o comando na interface: lista de slugs no `ChatState`, sugestões para `/sdd <prefixo>`, Tab completando com espaço e o braço de despacho em `run_with_dashboard`.",
+      "nuances": [
+        "O despacho atual é uma cadeia de else if sobre input em crates/tupi-tui/src/run.rs:50-533; o braço de /sdd entra antes do parse_workflow_invocation.",
+        "COMMANDS (lista que alimenta /models, /new, …) é importada no topo de crates/tupi-tui/src/state.rs:1-9 e usada em :465-467 — /sdd precisa estar nela.",
+        "Carregar a lista no boot acontece junto de state.workflows = workflow_names(&buses.queries).await (crates/tupi-tui/src/run.rs:50-60)."
+      ],
+      "parallel": false,
+      "status": "done",
+      "subtasks": [
+        {
+          "id": "T3.1",
+          "title": "Adicionar `ChatState.sdd_specs: Vec<String>` e carregá-lo no boot e após close//new via `Query::ListSddSpecs`",
+          "acceptance": "/new preserva sdd_specs como já faz com workflows; teste de estado prova a preservação.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T3.2",
+          "title": "Branch de sugestões para `/sdd ` em `refresh_suggestions` (prefixo casando os slugs, item igual ao input filtrado)",
+          "acceptance": "Testes: `/sdd ` lista todos; `/sdd au` filtra para `/sdd auth`; `/sdd zzz` fecha a lista; `/sdd` sem espaço continua oferecendo `/sdd` da lista de comandos.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T3.3",
+          "title": "Tab completa `/sdd <slug>` com espaço final e fecha a lista",
+          "acceptance": "Teste: a partir de `/sdd au`, accept_suggestion deixa input == \"/sdd auth \" e suggestions_visible() == false.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T3.4",
+          "title": "Braço `/sdd [slug]` no despacho: sem slug → notice pedindo o slug; com slug → `Command::ResumeSdd` e notice com o resumo",
+          "acceptance": "Teste de integração em crates/tupi-tui/tests (mesmo estilo de connect_command.rs) prova que /sdd aparece no autocomplete e que comando desconhecido deixa de ser emitido para `/sdd auth`.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Regressão e documentação mínima",
+      "details": "Fechar com a garantia de que o fluxo antigo não regrediu e que a regra está registrada onde o próximo agente olha.",
+      "nuances": [],
+      "parallel": false,
+      "status": "done",
+      "subtasks": [
+        {
+          "id": "T4.1",
+          "title": "Rodar `cargo test -p tupi-domain -p tupi-kernel -p tupi-app -p tupi-tui` e `cargo clippy --all-targets`",
+          "acceptance": "Tudo verde, sem #[allow] novo.",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        },
+        {
+          "id": "T4.2",
+          "title": "Documentar o comando na ajuda do system prompt e nas dicas do rodapé, se houver lista de comandos no texto",
+          "acceptance": "Texto de ajuda menciona /sdd <slug> e o comportamento de retomada (não inicia turno; digite “continue”).",
+          "touches": [],
+          "acceptance_test": null,
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}

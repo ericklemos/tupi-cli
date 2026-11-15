@@ -14,7 +14,7 @@ futures-util.workspace = true
 ratatui.workspace = true
 tui-markdown.workspace = true
 unicode-width.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
 async-trait.workspace = true

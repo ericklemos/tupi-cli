@@ -54,10 +54,10 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.target }} ${{ matrix.variant }})
     needs: version
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -65,24 +65,80 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            variant: cpu
+            features: "--no-default-features"
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            variant: vulkan
+            features: "--no-default-features --features vulkan"
+            vulkan: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            variant: cuda
+            features: "--features cuda"
+            cuda: true
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
+            variant: cpu
+            features: "--no-default-features"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+            variant: cpu
+            features: "--no-default-features"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            variant: cuda
+            features: "--features cuda"
+            cuda: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            variant: vulkan
+            features: "--no-default-features --features vulkan"
+            vulkan: true
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
+            variant: metal
+            features: "--no-default-features --features metal"
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
+            variant: metal
+            features: "--no-default-features --features metal"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.variant }}
+      - name: Install CUDA toolkit
+        if: matrix.cuda
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.2.0"
+          method: local
+          log-file-suffix: "cuda-${{ matrix.target }}.txt"
+
+      - name: Install Vulkan build dependencies (Linux)
+        if: matrix.vulkan && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.vulkan && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+          $sdk = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw "Vulkan SDK nao encontrado em C:\\VulkanSDK" }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Locate libclang (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -91,14 +147,20 @@ jobs:
           if (Test-Path (Join-Path $llvm "libclang.dll")) {
             "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+      - name: Build tupi (CUDA)
+        if: matrix.cuda
+        env:
+          CUDACXX: ${{ steps.cuda.outputs.CUDA_PATH }}/bin/nvcc
+        run: cargo build --release --locked --bin tupi ${{ matrix.features }}
       - name: Build tupi
-        run: cargo build --release --locked --bin tupi
+        if: ${{ !matrix.cuda }}
+        run: cargo build --release --locked --bin tupi ${{ matrix.features }}
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
-          name="tupi-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="tupi-${GITHUB_REF_NAME}-${{ matrix.target }}-${{ matrix.variant }}"
           mkdir -p out
           cp target/release/tupi out/tupi
           tar -czf "out/${name}.tar.gz" -C out tupi
@@ -111,7 +173,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $name = "tupi-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $name = "tupi-$env:GITHUB_REF_NAME-${{ matrix.target }}-${{ matrix.variant }}"
           New-Item -ItemType Directory -Path out -Force | Out-Null
           Copy-Item target/release/tupi.exe out/tupi.exe
           Compress-Archive -Path out/tupi.exe -DestinationPath "out/$name.zip" -Force
@@ -119,7 +181,7 @@ jobs:
           "$hash  $name.zip" | Out-File -FilePath "out/$name.zip.sha256" -Encoding ascii -NoNewline
       - uses: actions/upload-artifact@v4
         with:
-          name: tupi-${{ matrix.target }}
+          name: tupi-${{ matrix.target }}-${{ matrix.variant }}
           path: out/*
           if-no-files-found: error
           retention-days: 7
@@ -153,3 +215,4 @@ jobs:
           else
             gh release create "${TAG}" artifacts/* "${args[@]}"
           fi
+

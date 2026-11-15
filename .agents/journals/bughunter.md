@@ -78,3 +78,24 @@ binário" é config de build, não código: o nome sumido não aparece em nenhum
 deve escolher o nome nativo por memória; o nome existe só se o `.ron` existir.
 Com um nome que não existe, `merge` não tem nativo para sombrear e a asserção
 `shadowed == [Native]` falha com `[]` — sintoma que parece bug de precedência e
+
+## 2026-11-15 - Editor de uma linha reaproveitando o wrapper do transcript
+
+**Bug/Gap:** `draw_composer` quebrava `state.input` com `wrap_text`, que é
+`text.split_whitespace()`: o espaço digitado no fim do rascunho desaparecia. O
+cursor sai da última linha quebrada, então `"oi "` desenhava `"oi"` e o cursor
+ficava parado — a tecla espaço só tinha efeito visível quando a letra seguinte
+chegava. Espaços repetidos no meio (`"a  b"`) também viravam um só.
+
+**Learning:** o composer é um editor, não texto formatado. Reutilizar a quebra
+do transcript (que colapsa espaço de propósito, para markdown) num campo de
+digitação transforma "espaço não renderizado" em "cursor não anda", e nenhum
+teste de texto pegaria isso: a única asserção capaz de reprovar é sobre a
+posição do cursor (`TestBackend::assert_cursor_position`).
+
+**Action:** rascunho passa por `wrap_input` (`crates/tupi-tui/src/run.rs`), que
+preserva cada espaço e só decide *onde* quebrar. Testes:
+`run::tests::trailing_space_moves_the_composer_cursor` e
+`run::tests::repeated_spaces_are_rendered_in_the_composer`. Regra para o
+futuro: antes de reusar `wrap_text`/quebra de markdown num campo editável,
+perguntar se o espaço é conteúdo — em editor, é.

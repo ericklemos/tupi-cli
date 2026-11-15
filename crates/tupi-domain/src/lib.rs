@@ -1,5 +1,6 @@
 pub mod context;
 pub mod memory;
+pub mod sdd;
 pub mod tokens;
 mod usage;
 
@@ -181,6 +182,13 @@ pub enum Event {
         name: String,
         ok: bool,
         summary: String,
+        /// Tempo de execução da tool em **microssegundos**: é a unidade que a
+        /// telemetria da tool já usa, e micros inteiros evitam ter de
+        /// serializar `std::time::Duration`. O consumidor escolhe a unidade
+        /// final (`Duration::from_micros`). Só o executor da tool pode medir
+        /// isso: derivar de `Instant` no consumidor daria errado, porque o
+        /// evento atravessa o bus assíncrono e pode ser lido bem depois.
+        duration_us: u64,
     },
     /// Linha discreta de memória: recall injetado ou fato gravado.
     Memory {

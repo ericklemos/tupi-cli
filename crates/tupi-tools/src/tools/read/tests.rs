@@ -90,6 +90,35 @@ fn asking_for_a_symbol_returns_only_that_body() {
 }
 
 #[test]
+fn a_const_symbol_is_readable() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("tools.rs"),
+        "pub const CORE_TOOLS: &[&str] = &[\n    \"read\",\n];\n",
+    )
+    .unwrap();
+    let tool = tool_for(dir.path());
+    let text = read(&tool, "tools.rs", Some("CORE_TOOLS"), None, None).unwrap();
+
+    assert!(text.contains("CORE_TOOLS"), "{text}");
+    assert!(text.contains("\"read\""), "{text}");
+}
+
+#[test]
+fn a_method_in_a_generic_impl_is_readable_by_its_qualified_name() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("exposure.rs"),
+        "impl Exposure<'_> {\n    fn admits(&self) -> bool {\n        true\n    }\n}\n",
+    )
+    .unwrap();
+    let tool = tool_for(dir.path());
+    let text = read(&tool, "exposure.rs", Some("Exposure::admits"), None, None).unwrap();
+
+    assert!(text.contains("true"), "{text}");
+}
+
+#[test]
 fn unknown_symbol_is_an_explicit_error() {
     let dir = fixture();
     let tool = tool_for(dir.path());

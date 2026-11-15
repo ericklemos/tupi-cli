@@ -212,14 +212,9 @@ pub(crate) async fn execute(
                 let started = std::time::Instant::now();
                 let result =
                     run_tool(tools, inner_call, cancel_flag, in_flight, in_flight_count).await;
-                record_finished(
-                    telemetry,
-                    request_id,
-                    inner_call,
-                    &result,
-                    started.elapsed(),
-                );
-                publish_finished(events, request_id, inner_call, &result);
+                let duration = started.elapsed();
+                record_finished(telemetry, request_id, inner_call, &result, duration);
+                publish_finished(events, request_id, inner_call, &result, duration);
                 results[index] = Some(result);
             }
         } else {
@@ -245,7 +240,7 @@ pub(crate) async fn execute(
 
             while let Some((index, result, duration)) = pending.next().await {
                 record_finished(telemetry, request_id, &inner[index], &result, duration);
-                publish_finished(events, request_id, &inner[index], &result);
+                publish_finished(events, request_id, &inner[index], &result, duration);
                 results[index] = Some(result);
             }
         }
@@ -277,6 +272,7 @@ fn publish_finished(
     request_id: RequestId,
     call: &ToolCall,
     result: &Result<String, String>,
+    duration: std::time::Duration,
 ) {
     let (ok, summary) = match result {
         Ok(content) => (true, summarize(content)),
@@ -288,6 +284,11 @@ fn publish_finished(
         name: call.name.clone(),
         ok,
         summary,
+        // Medido ao redor da chamada que roda a tool, não no consumidor: o
+        // evento atravessa o bus e pode ser lido bem depois. O piso de 1µs
+        // mantém `duration_us > 0` numa chamada instantânea, para que zero
+        // nunca signifique "não medido".
+        duration_us: crate::telemetry::micros(duration).max(1),
     });
 }
 

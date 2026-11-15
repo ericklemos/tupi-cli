@@ -74,6 +74,7 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
     let providers = ProviderRegistry::new();
     providers.register(Arc::new(Scripted::new(vec![
         vec![
+            Ok(ProviderEvent::Started),
             Ok(ProviderEvent::Text("chamando".to_string())),
             Ok(ProviderEvent::ToolCalls(vec![ToolCall {
                 id: "c1".to_string(),
@@ -82,7 +83,11 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
             }])),
             Ok(usage()),
         ],
-        vec![Ok(ProviderEvent::Text("pronto".to_string())), Ok(usage())],
+        vec![
+            Ok(ProviderEvent::Started),
+            Ok(ProviderEvent::Text("pronto".to_string())),
+            Ok(usage()),
+        ],
     ])));
 
     let mut tools = ToolRegistry::new();
@@ -163,7 +168,15 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
     assert!(prompt["estimate_scaled"].as_u64().is_some());
     if std::env::var("TUPI_TELEMETRY_BODY").is_err() {
         assert!(prompt["body"].as_str().unwrap().is_empty());
+        assert_eq!(prompt["body_omitted"], true);
     }
+    assert!(
+        prompt["tool_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "echo")
+    );
 
     let tool = lines
         .iter()
@@ -180,8 +193,8 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
         .unwrap();
     assert_eq!(turn["ok"], true);
     assert_eq!(turn["tool_calls"], 1);
-    assert_eq!(turn["prompt_tokens"], 20);
-    assert_eq!(turn["completion_tokens"], 6);
+    assert_eq!(turn["total_prompt_tokens"], 20);
+    assert_eq!(turn["total_completion_tokens"], 6);
 
     let responses: Vec<&serde_json::Value> = lines
         .iter()
@@ -193,6 +206,11 @@ async fn a_turn_records_commands_tools_prompts_and_usage() {
         responses
             .iter()
             .all(|line| line["estimate_scaled"].as_u64().is_some())
+    );
+    assert!(
+        responses
+            .iter()
+            .all(|line| line["first_token_us"].as_u64().is_some())
     );
 
     let seqs: Vec<u64> = lines
@@ -273,6 +291,7 @@ async fn a_provider_failure_is_recorded_with_kind_and_status() {
     assert_eq!(response["ok"], false);
     assert_eq!(response["error_kind"], "http");
     assert_eq!(response["http_status"], 429);
+    assert!(response["first_token_us"].is_null());
 
     let turn = lines
         .iter()
@@ -280,4 +299,84 @@ async fn a_provider_failure_is_recorded_with_kind_and_status() {
         .unwrap();
     assert_eq!(turn["ok"], false);
     assert!(turn["error"].as_str().unwrap().contains("429"));
+}
+
+#[tokio::test]
+async fn a_truncated_response_records_the_finish_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("telemetry.jsonl");
+    let telemetry = Telemetry::open(&path);
+    let events = EventBus::new(64);
+    let mut receiver = events.subscribe();
+
+    let providers = ProviderRegistry::new();
+    providers.register(Arc::new(Scripted::new(vec![
+        vec![
+            Ok(ProviderEvent::Text("cortou".to_string())),
+            Ok(ProviderEvent::Finished("length".to_string())),
+            Ok(usage()),
+        ],
+        vec![
+            Ok(ProviderEvent::Text("pronto".to_string())),
+            Ok(ProviderEvent::Finished("stop".to_string())),
+            Ok(usage()),
+        ],
+    ])));
+
+    let app = App::with_tools(
+        providers,
+        "fake",
+        "modelo".to_string(),
+        events,
+        None,
+        ToolRegistry::new(),
+        String::new(),
+    )
+    .with_telemetry(telemetry.clone());
+
+    let CommandOutcome::Started { .. } = app
+        .handle(Command::SendMessage {
+            text: "oi".to_string(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("esperava Started");
+    };
+
+    loop {
+        match receiver.recv().await.unwrap() {
+            Event::StreamFinished { .. } => break,
+            Event::StreamFailed { message, .. } => panic!("stream falhou: {message}"),
+            _ => {}
+        }
+    }
+
+    for _ in 0..100 {
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains("\"turn_finished\"")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(app);
+    drop(telemetry);
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    let reasons: Vec<String> = body
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("linha JSON"))
+        .filter(|line| line["event"] == "provider_response")
+        .map(|line| {
+            line["finish_reason"]
+                .as_str()
+                .unwrap_or("<ausente>")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(reasons, vec!["length", "stop"]);
 }

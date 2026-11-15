@@ -17,6 +17,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-web/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-infer/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-kernel/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

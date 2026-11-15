@@ -195,6 +195,10 @@ fn collect_children(
                 | "enum_item"
                 | "trait_item"
                 | "mod_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "union_item"
         );
         let is_container = matches!(kind, "impl_item" | "trait_item" | "mod_item");
         let name = item_name(child, content);
@@ -240,6 +244,15 @@ fn body_node(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(body) = node.child_by_field_name("body") {
         return Some(body);
     }
+    if matches!(node.kind(), "const_item" | "static_item")
+        && let Some(value) = node.child_by_field_name("value")
+    {
+        return Some(value);
+    }
+    // `type` não tem corpo; o item inteiro é o que se lê.
+    if node.kind() == "type_item" {
+        return Some(node);
+    }
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .filter(|child| {
@@ -259,7 +272,7 @@ fn container_name(node: Node<'_>, content: &str) -> Option<String> {
     };
     node.child_by_field_name(field)
         .and_then(|name| name.utf8_text(content.as_bytes()).ok())
-        .map(|text| text.trim().to_string())
+        .map(|text| text.split('<').next().unwrap_or(text).trim().to_string())
         .filter(|text| !text.is_empty())
 }
 
@@ -290,6 +303,10 @@ fn display_kind(kind: &str) -> String {
         "enum_item" => "enum".to_string(),
         "trait_item" => "trait".to_string(),
         "mod_item" => "mod".to_string(),
+        "const_item" => "const".to_string(),
+        "static_item" => "static".to_string(),
+        "type_item" => "type".to_string(),
+        "union_item" => "union".to_string(),
         other => other.to_string(),
     }
 }
@@ -465,6 +482,35 @@ mod tests {
             resolver.resolve(&table, "impl Cache"),
             ResolveOutcome::Ambiguous(_)
         ));
+    }
+
+    #[test]
+    fn a_const_is_indexed_by_name() {
+        let content = "pub const CORE_TOOLS: &[&str] = &[\n    \"read\",\n];\n";
+        let table = symbols_of(content);
+        let span = span(&table, "CORE_TOOLS");
+
+        assert_eq!(&content[span.body_range.clone()], "&[\n    \"read\",\n]");
+        assert!(
+            content[span.head_range.clone()].contains("pub const CORE_TOOLS"),
+            "head: {:?}",
+            &content[span.head_range.clone()]
+        );
+        assert_eq!(span.kind, "const");
+    }
+
+    #[test]
+    fn a_generic_impl_resolves_with_the_bare_type_name() {
+        let content =
+            "impl Exposure<'_> {\n    fn admits(&self) -> bool {\n        true\n    }\n}\n";
+        let table = symbols_of(content);
+
+        match SpanResolver::new().resolve(&table, "Exposure::admits") {
+            ResolveOutcome::Found(found) => {
+                assert_eq!(&content[found.body_range.clone()], "{\n        true\n    }");
+            }
+            other => panic!("esperava Found, veio {other:?}"),
+        }
     }
 
     #[test]

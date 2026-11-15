@@ -84,6 +84,7 @@ async fn blocking_execution_runs_inside_spawn_blocking() {
         agent_prefix: "sys".to_string(),
         max_parallel: 2,
         agent_max_steps: 4,
+        max_tokens: 0,
         agent_timeout: Duration::from_secs(5),
         events: EventBus::new(16),
         request_id: 0,

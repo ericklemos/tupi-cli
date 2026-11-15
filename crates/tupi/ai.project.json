@@ -1,0 +1,12 @@
+{
+  "docs_folders": [
+    "docs"
+  ],
+  "lang": "en",
+  "models": {
+    "deepseek/deepseek-flash": {
+      "context_window": 32000
+    }
+  },
+  "name": "tupi"
+}

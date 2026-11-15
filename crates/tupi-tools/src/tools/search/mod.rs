@@ -1,3 +1,5 @@
+mod dense;
+mod fusion;
 mod params;
 
 mod query;
@@ -60,6 +62,8 @@ pub struct SearchTool {
     default_budget_tokens: usize,
     chunker: AstChunker,
     graph: Option<Arc<crate::graph::GraphCache>>,
+    space: Option<Arc<crate::space::SpaceIndex>>,
+    embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
     backtrack: Arc<crate::backtrack::BacktrackGraph>,
 }
 
@@ -78,8 +82,23 @@ impl SearchTool {
             default_budget_tokens,
             chunker: AstChunker::new(),
             graph: None,
+            space: None,
+            embedder: None,
             backtrack: Arc::new(crate::backtrack::BacktrackGraph::default()),
         }
+    }
+
+    pub fn with_optional_space(mut self, space: Option<Arc<crate::space::SpaceIndex>>) -> Self {
+        self.space = space;
+        self
+    }
+
+    pub fn with_optional_embedder(
+        mut self,
+        embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
+    ) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     pub fn with_parse_cache(mut self, cache: Arc<crate::graph::ParseCache>) -> Self {

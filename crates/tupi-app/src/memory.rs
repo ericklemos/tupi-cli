@@ -20,7 +20,7 @@ use tupi_kernel::{ChatRequest, Provider, ProviderEvent};
 
 const MAX_CANDIDATES: usize = 5;
 const MAX_CACHE: usize = 64;
-const JUDGE_TIMEOUT: Duration = Duration::from_secs(8);
+const JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct MemoryBlock {
@@ -406,7 +406,10 @@ impl Memory {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(ProviderEvent::Text(text)) => out.push_str(&text),
-                    Ok(ProviderEvent::ToolCalls(_)) | Ok(ProviderEvent::Usage { .. }) => {}
+                    Ok(ProviderEvent::Started)
+                    | Ok(ProviderEvent::Finished(_))
+                    | Ok(ProviderEvent::ToolCalls(_))
+                    | Ok(ProviderEvent::Usage { .. }) => {}
                     Err(_) => return None,
                 }
             }
@@ -659,6 +662,11 @@ mod tests {
 
         let array = "[{\"text\":\"um fato\"}]";
         assert_eq!(parse_extracted(array).len(), 1);
+    }
+
+    #[test]
+    fn the_judge_timeout_has_room_for_a_slow_provider() {
+        assert_eq!(JUDGE_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]

@@ -17,18 +17,24 @@ tupi-tui.workspace = true
 tupi-web.workspace = true
 tupi-store.workspace = true
 tupi-tools.workspace = true
-tupi-infer = { workspace = true, features = ["local-models"] }
+tupi-infer = { workspace = true, default-features = false, features = ["local-models"] }
 anyhow.workspace = true
 async-trait.workspace = true
 dotenvy.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 ron.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["tupi-infer/cuda"]
+metal = ["tupi-infer/metal"]
+vulkan = ["tupi-infer/vulkan"]
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -31,6 +31,11 @@ impl Fetcher for HttpFetcher {
     }
 }
 
+/// Caminho local do GGUF de embeddings, sem baixar nada.
+pub fn embedding_model_path(base: &Path) -> PathBuf {
+    models_dir(base, EMBEDDING_REPO).join(EMBEDDING_FILE)
+}
+
 pub async fn ensure_embedding_model(
     base: &Path,
     fetcher: &dyn Fetcher,

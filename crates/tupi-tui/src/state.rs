@@ -1,9 +1,12 @@
 pub use tupi_domain::WORKFLOWS_PREFIX;
+
+use crate::sdd::SDD_COMMAND;
 pub const COMMANDS: &[&str] = &[
     "/dashboard",
     "/models",
     "/connect",
     "/enable-show-prompts-messages",
+    SDD_COMMAND,
     WORKFLOWS_PREFIX,
 ];
 
@@ -35,6 +38,13 @@ pub enum ChatEntry {
         name: String,
         summary: String,
         ok: Option<bool>,
+        /// Quando a tool começou. Nasce aqui, no estado, e não no render:
+        /// um `Instant` criado por frame reiniciaria o cronômetro a cada
+        /// desenho e o tempo exibido seria sempre zero.
+        started: std::time::Instant,
+        /// Duração medida por quem executou a tool, entregue em
+        /// `Event::ToolFinished`. `None` enquanto roda ou se não veio.
+        duration: Option<std::time::Duration>,
     },
     Prompt {
         content: String,
@@ -72,6 +82,8 @@ pub struct ChatState {
     /// Nomes dos workflows disponíveis. Só viram sugestão depois de
     /// `/workflows/`; antes disso o namespace não existe.
     pub workflows: Vec<String>,
+    /// Slugs dos planos SDD retomáveis, usados depois de `/sdd `.
+    pub sdd_specs: Vec<String>,
     pending_memory: Vec<String>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
@@ -159,6 +171,8 @@ impl ChatState {
             name: name.to_string(),
             summary: compact_summary(summary),
             ok: None,
+            started: std::time::Instant::now(),
+            duration: None,
         });
     }
 
@@ -185,15 +199,54 @@ impl ChatState {
         }
     }
 
-    pub fn finish_tool(&mut self, call_id: &str, ok: bool) {
-        if let Some(ChatEntry::Tool { ok: slot, .. }) = self
+    pub fn finish_tool(&mut self, call_id: &str, ok: bool, elapsed: Option<std::time::Duration>) {
+        if let Some(ChatEntry::Tool {
+            ok: slot, duration, ..
+        }) = self
             .lines
             .iter_mut()
             .rev()
             .find(|entry| matches!(entry, ChatEntry::Tool { call_id: id, .. } if id == call_id))
         {
             *slot = Some(ok);
+            // A duração vem de quem executou a tool e é opcional: um evento
+            // sem medição não vira tempo inventado na tela.
+            *duration = elapsed;
         }
+    }
+
+    /// Quantas tools do turno corrente ainda não reportaram resultado.
+    ///
+    /// É o gatilho do redesenho periódico: sem tool em voo não há o que
+    /// animar, e a TUI volta a bloquear só em teclado e eventos.
+    pub fn tools_in_flight(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|entry| matches!(entry, ChatEntry::Tool { ok: None, .. }))
+            .count()
+    }
+
+    /// Total e falhas das tools do turno corrente.
+    ///
+    /// "Turno" são as `ChatEntry::Tool` consecutivas no fim do transcript: o
+    /// que o usuário lê como um lote de trabalho. Sub-chamadas de pipeline
+    /// (id com `#`) não contam, porque o pai `pipeline` já as representa.
+    pub fn turn_tool_stats(&self) -> (usize, usize) {
+        let mut total = 0;
+        let mut failures = 0;
+        for entry in self.lines.iter().rev() {
+            let ChatEntry::Tool { call_id, ok, .. } = entry else {
+                break;
+            };
+            if call_id.contains('#') {
+                continue;
+            }
+            total += 1;
+            if *ok == Some(false) {
+                failures += 1;
+            }
+        }
+        (total, failures)
     }
 
     pub fn processing(&self) -> bool {
@@ -405,6 +458,18 @@ impl ChatState {
                         && command.as_str() != input
                 })
                 .collect()
+        } else if let Some(prefix) = input
+            .strip_prefix(SDD_COMMAND)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            // `/sdd ` abre o namespace dos planos retomáveis. O item completo
+            // inclui o espaço inicial para o Tab só precisar acrescentar o fim.
+            self.sdd_specs
+                .iter()
+                .filter(|slug| slug.starts_with(prefix))
+                .map(|slug| format!("{SDD_COMMAND} {slug}"))
+                .filter(|command| command.as_str() != input)
+                .collect()
         } else if eligible {
             COMMANDS
                 .iter()
@@ -463,9 +528,28 @@ impl ChatState {
 
     pub fn accept_suggestion(&mut self) {
         if let Some(selected) = self.suggestion_selected().map(str::to_string) {
-            self.input = selected;
+            // `/sdd <slug>` precisa do espaço final: sem ele, Enter no slug
+            // nunca chega ao turno seguinte.
+            self.input = if selected.starts_with(&format!("{SDD_COMMAND} ")) {
+                format!("{selected} ")
+            } else {
+                selected
+            };
         }
         self.refresh_suggestions();
+    }
+
+    /// `/new`: limpa o transcript local preservando o modo e os catálogos que
+    /// não vêm do app (workflows e planos SDD retomáveis). O app não publica
+    /// `ModeChanged` no `/new`, então o modo local precisa continuar igual.
+    pub fn reset_for_new_session(&mut self) {
+        let workflows = std::mem::take(&mut self.workflows);
+        let sdd_specs = std::mem::take(&mut self.sdd_specs);
+        let mode = self.mode;
+        *self = ChatState::default();
+        self.workflows = workflows;
+        self.sdd_specs = sdd_specs;
+        self.mode = mode;
     }
 }
 
@@ -548,11 +632,16 @@ mod tests {
                 name,
                 summary,
                 ok,
+                duration,
+                ..
             } => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(name, "read");
                 assert_eq!(summary, "path=a.rs · symbol=new");
                 assert_eq!(*ok, None);
+                // O relógio nasce no estado; a duração só existe quando o
+                // executor reporta o fim.
+                assert_eq!(*duration, None);
             }
             other => panic!("esperava tool, veio {other:?}"),
         }
@@ -568,16 +657,47 @@ mod tests {
         state.push_tool_started("c1", "read", "path=a.rs");
         state.push_tool_started("c2", "peek", "handle=h_1");
 
-        state.finish_tool("c1", true);
+        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(250)));
 
         match &state.lines[0] {
-            ChatEntry::Tool { ok, summary, .. } => {
+            ChatEntry::Tool {
+                ok,
+                summary,
+                duration,
+                ..
+            } => {
                 assert_eq!(*ok, Some(true));
                 assert_eq!(summary, "path=a.rs");
+                assert_eq!(*duration, Some(std::time::Duration::from_millis(250)));
             }
             other => panic!("esperava tool, veio {other:?}"),
         }
-        assert!(matches!(&state.lines[1], ChatEntry::Tool { ok: None, .. }));
+        assert!(matches!(
+            &state.lines[1],
+            ChatEntry::Tool {
+                ok: None,
+                duration: None,
+                ..
+            }
+        ));
+        assert_eq!(state.tools_in_flight(), 1);
+        assert_eq!(state.turn_tool_stats(), (2, 0));
+    }
+
+    #[test]
+    fn tool_stats_count_failures_and_ignore_pipeline_children() {
+        let mut state = ChatState::default();
+        state.push_tool_started("p1", "pipeline", "2 passos");
+        state.push_tool_started("p1#0.0", "read", "a.rs");
+        state.push_tool_started("c2", "exec", "cargo test");
+
+        state.finish_tool("p1#0.0", true, None);
+        state.finish_tool("p1", false, None);
+        state.finish_tool("c2", true, None);
+
+        // A sub-chamada de pipeline não infla o placar do turno.
+        assert_eq!(state.turn_tool_stats(), (2, 1));
+        assert_eq!(state.tools_in_flight(), 0);
     }
 
     #[test]
@@ -696,6 +816,81 @@ mod tests {
         state.refresh_suggestions();
 
         assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn sdd_slugs_appear_only_after_the_space() {
+        let mut state = ChatState {
+            sdd_specs: vec!["auth".into(), "tui-tabs".into()],
+            input: "/sdd ".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/sdd auth"));
+        assert_eq!(
+            state.suggestions,
+            Some(vec!["/sdd auth".into(), "/sdd tui-tabs".into()])
+        );
+
+        state.input = "/sdd tu".into();
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/sdd tui-tabs"));
+
+        // Um prefixo que não casa nenhum slug fecha a lista.
+        state.input = "/sdd zzz".into();
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn sdd_without_space_still_completes_from_the_command_list() {
+        let mut state = ChatState {
+            sdd_specs: vec!["auth".into()],
+            input: "/sd".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/sdd"));
+
+        // Sem o espaço não há namespace de slugs: nada vaza para a lista.
+        state.input = "/sdd".into();
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn tab_completes_an_sdd_slug_with_a_trailing_space() {
+        let mut state = ChatState {
+            sdd_specs: vec!["auth".into()],
+            input: "/sdd au".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+
+        state.accept_suggestion();
+
+        assert_eq!(state.input, "/sdd auth ");
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn new_session_preserves_the_command_catalogs() {
+        let mut state = ChatState {
+            input: "/sdd auth".into(),
+            workflows: vec!["feature".into()],
+            sdd_specs: vec!["auth".into()],
+            mode: tupi_kernel::AgentMode::Sdd,
+            ..ChatState::default()
+        };
+        state.push_user("oi");
+
+        state.reset_for_new_session();
+
+        assert!(state.lines.is_empty());
+        assert!(state.input.is_empty());
+        assert_eq!(state.workflows, vec!["feature"]);
+        assert_eq!(state.sdd_specs, vec!["auth"]);
+        assert_eq!(state.mode, tupi_kernel::AgentMode::Sdd);
     }
     #[test]
     fn assistant_metrics_track_first_token_and_estimate() {

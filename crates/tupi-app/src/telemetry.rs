@@ -18,7 +18,7 @@ use tupi_kernel::{
     Command, CommandError, CommandOutcome, ProviderError, Query, QueryError, QueryResult,
 };
 
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 const CHANNEL_CAPACITY: usize = 1024;
 const MAX_TEXT_BYTES: usize = 512 * 1024;
 const PROMPT_PREVIEW_BYTES: usize = 4 * 1024;
@@ -403,6 +403,8 @@ pub struct CommandFinished {
     pub outcome: Option<String>,
     pub request: Option<u64>,
     pub model: Option<String>,
+    /// Modo efetivo depois de `set_mode` (`execution` ou `sdd`).
+    pub mode: Option<String>,
     pub enabled: Option<bool>,
     pub error: Option<String>,
     pub error_kind: Option<String>,
@@ -443,9 +445,12 @@ pub struct TurnFinished {
     pub cancelled: bool,
     pub steps: usize,
     pub tool_calls: usize,
-    pub prompt_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
+    /// Soma das requisições do turno, não o contexto final.
+    pub total_prompt_tokens: Option<u64>,
+    /// Soma das requisições do turno, não o contexto final.
+    pub total_cached_tokens: Option<u64>,
+    /// Soma das requisições do turno, não o contexto final.
+    pub total_completion_tokens: Option<u64>,
     pub error: Option<String>,
     pub error_kind: Option<String>,
 }
@@ -459,13 +464,18 @@ pub struct PromptSent {
     pub body: String,
     pub body_chars: usize,
     pub body_bytes: usize,
+    /// `body` foi cortado pelo limite de preview.
     pub truncated: bool,
+    /// `body` não foi gravado (flag de debug desligada).
+    pub body_omitted: bool,
     pub estimate_tokens: usize,
     /// `estimate_tokens` corrigido pela escala observada; é o valor que se
     /// compara com `prompt_tokens`.
     pub estimate_scaled: usize,
     pub messages: usize,
     pub tools: usize,
+    /// Nomes efetivamente enviados (o filtro por modo pode reduzir `tools`).
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -482,7 +492,7 @@ pub struct ProviderResponse {
     /// Correção de orçamento em vigor no passo (1_000_000 = sem correção).
     pub scale_ppm: u64,
     pub duration_us: u64,
-    /// Tempo até o primeiro evento do stream (texto, tool call ou usage).
+    /// Tempo até o primeiro chunk do stream (`ProviderEvent::Started`).
     /// `None` quando o stream falha antes de produzir qualquer evento.
     pub first_token_us: Option<u64>,
     pub delta_count: usize,
@@ -492,6 +502,9 @@ pub struct ProviderResponse {
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// Por que o provedor encerrou a resposta. `length`/`max_tokens` significa
+    /// que ela foi cortada no teto; sem isso a truncagem fica invisível.
+    pub finish_reason: Option<String>,
     pub ok: bool,
     pub error: Option<String>,
     pub error_kind: Option<String>,
@@ -544,6 +557,13 @@ pub struct ModelsRefreshed {
     pub error: Option<String>,
     pub error_kind: Option<String>,
     pub http_status: Option<u16>,
+}
+
+fn mode_label(mode: tupi_kernel::AgentMode) -> &'static str {
+    match mode {
+        tupi_kernel::AgentMode::Execution => "execution",
+        tupi_kernel::AgentMode::Sdd => "sdd",
+    }
 }
 
 /// Dados do comando que precisam existir antes e depois do dispatch.
@@ -639,6 +659,14 @@ impl CommandInfo {
                 extra: None,
                 model: None,
             },
+            Command::ResumeSdd { slug } => Self {
+                command: "resume_sdd".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: Some(slug.clone()),
+                model: None,
+            },
         }
     }
 
@@ -666,6 +694,7 @@ impl CommandInfo {
             outcome: None,
             request: None,
             model: None,
+            mode: None,
             enabled: None,
             error: None,
             error_kind: None,
@@ -685,6 +714,7 @@ impl CommandInfo {
                         CommandOutcome::Memory { .. } => "memory",
                         CommandOutcome::MemoryToggled { .. } => "memory_toggled",
                         CommandOutcome::MemoryForgotten { .. } => "memory_forgotten",
+                        CommandOutcome::SddResumed { .. } => "sdd_resumed",
                         CommandOutcome::Noop => "noop",
                     }
                     .to_string(),
@@ -702,8 +732,13 @@ impl CommandInfo {
                     CommandOutcome::MemoryToggled { enabled } => {
                         finished.enabled = Some(*enabled);
                     }
+                    CommandOutcome::ModeChanged { mode } => {
+                        finished.mode = Some(mode_label(*mode).to_string());
+                    }
+                    CommandOutcome::SddResumed { mode, .. } => {
+                        finished.mode = Some(mode_label(*mode).to_string());
+                    }
                     CommandOutcome::Cancelled
-                    | CommandOutcome::ModeChanged { .. }
                     | CommandOutcome::Memory { .. }
                     | CommandOutcome::MemoryForgotten { .. }
                     | CommandOutcome::SessionReset
@@ -734,6 +769,7 @@ impl QueryInfo {
                 Query::ListProviders => "list_providers",
                 Query::ListModels => "list_models",
                 Query::ListWorkflows => "list_workflows",
+                Query::ListSddSpecs => "list_sdd_specs",
             }
             .to_string(),
         }
@@ -766,6 +802,7 @@ impl QueryInfo {
                     QueryResult::Providers(providers) => providers.len(),
                     QueryResult::Models(models) => models.len(),
                     QueryResult::Workflows(workflows) => workflows.len(),
+                    QueryResult::SddSpecs(specs) => specs.len(),
                 });
             }
             Err(error) => {
@@ -833,6 +870,8 @@ pub struct Clipped {
     pub chars: usize,
     pub bytes: usize,
     pub truncated: bool,
+    /// O corpo não foi gravado (flag de debug desligada), não apenas cortado.
+    pub omitted: bool,
 }
 
 /// Corta um texto em MAX_TEXT_BYTES, sempre em limite de caractere UTF-8.
@@ -867,7 +906,8 @@ fn prompt_body_with(text: &str, include: bool) -> Clipped {
         text: String::new(),
         chars: text.chars().count(),
         bytes: text.len(),
-        truncated: !text.is_empty(),
+        truncated: false,
+        omitted: !text.is_empty(),
     }
 }
 
@@ -891,6 +931,7 @@ fn clip_to(text: &str, max_bytes: usize) -> Clipped {
             chars,
             bytes,
             truncated: false,
+            omitted: false,
         };
     }
 
@@ -904,6 +945,7 @@ fn clip_to(text: &str, max_bytes: usize) -> Clipped {
         chars,
         bytes,
         truncated: true,
+        omitted: false,
     }
 }
 
@@ -1134,11 +1176,29 @@ mod tests {
         assert!(hidden.text.is_empty());
         assert_eq!(hidden.chars, text.chars().count());
         assert_eq!(hidden.bytes, text.len());
-        assert!(hidden.truncated);
+        assert!(hidden.omitted);
+        assert!(!hidden.truncated);
 
         let shown = prompt_body_with(text, true);
         assert_eq!(shown.text, text);
+        assert!(!shown.omitted);
         assert!(!shown.truncated);
+    }
+
+    #[test]
+    fn a_mode_change_records_the_mode() {
+        let info = CommandInfo::new(&Command::SetMode {
+            mode: tupi_kernel::AgentMode::Sdd,
+        });
+        let event = info.finished(
+            Duration::ZERO,
+            &Ok(CommandOutcome::ModeChanged {
+                mode: tupi_kernel::AgentMode::Sdd,
+            }),
+        );
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["mode"], "sdd");
     }
 
     #[test]
@@ -1237,6 +1297,7 @@ mod tests {
             prompt_tokens: Some(10),
             cached_tokens: Some(2),
             completion_tokens: Some(3),
+            finish_reason: Some("stop".to_string()),
             ok: true,
             error: None,
             error_kind: None,
