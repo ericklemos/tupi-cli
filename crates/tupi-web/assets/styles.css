@@ -85,4 +85,19 @@ canvas { width: 100%; background: #0d0f13; border: 1px solid var(--line); border
 .card .value { font-size: 20px; }
 .card .label { color: var(--muted); font-size: 12px; }
 
+/* Diálogo IA ↔ usuário: autor numa coluna fixa e corpo preservando quebras. */
+#history-list li.msg {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+#history-list li.msg .tag { margin: 0; text-align: right; }
+#history-list li.msg .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+#history-list li.msg-user { border-left: 2px solid var(--accent); }
+#history-list li.msg-user .tag { color: var(--accent); }
+#history-list li.msg-assistant .tag { color: var(--ok); }
+#history-list li.msg-system .tag { color: var(--warn); }
+#history-list li.msg-tool .tag { color: var(--muted); }
+
 #timeline li { font-family: ui-monospace, monospace; font-size: 12px; }

@@ -8,6 +8,34 @@ function text(value) {
   return value === undefined || value === null ? "—" : String(value);
 }
 
+function escapeHtml(value) {
+  return String(value).replace(
+    /[&<>"]/g,
+    (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char],
+  );
+}
+
+const ROLE_LABELS = { user: "você", assistant: "tupi", system: "sistema" };
+
+function messageItem(message) {
+  const role = text(message.role);
+  const label = ROLE_LABELS[role] || role;
+  const calls = message.tool_calls || [];
+  let content = message.content ? String(message.content) : "";
+  if (!content && calls.length) {
+    content = "→ chamou " + calls.map((call) => text(call.name)).join(", ");
+  }
+  if (!content) content = "…";
+  const cutoff = content.length > 320;
+  const shown = cutoff ? content.slice(0, 320) + "…" : content;
+  const title = cutoff ? ' title="' + escapeHtml(content) + '"' : "";
+  return (
+    '<li class="msg msg-' + escapeHtml(role) + '">' +
+    '<span class="tag">' + escapeHtml(label) + "</span>" +
+    '<span class="content"' + title + ">" + escapeHtml(shown) + "</span></li>"
+  );
+}
+
 function badge(status, label) {
   const node = el("stream-status");
   node.className = "badge " + status;
@@ -110,7 +138,7 @@ async function loadWorkspace() {
 
   el("history-list").innerHTML = history.messages
     .slice(-30)
-    .map((message) => '<li><span class="tag">' + text(message.role) + "</span>" + text(message.content).slice(0, 160) + "</li>")
+    .map(messageItem)
     .join("") || '<li class="muted">sem mensagens</li>';
 }
 

@@ -1110,15 +1110,35 @@ impl Tool for SddTool {
                         "id '{target_id}' não encontrado no plano '{slug}'"
                     )));
                 }
-                if !plan.tasks.is_empty()
-                    && plan.tasks.iter().all(|t| t.status == SddTaskStatus::Done)
-                {
+                let all_done = !plan.tasks.is_empty()
+                    && plan.tasks.iter().all(|t| t.status == SddTaskStatus::Done);
+                if all_done && self.executor.is_none() {
                     plan.status = SddPlanStatus::Completed;
                 }
                 plan.updated_at = now();
                 plan.record_activity("sdd", "progress_updated", "ok");
                 self.sdd_store.save(&plan).map_err(ToolError::Other)?;
-                plan_to_sections(&plan)
+                let mut sections = plan_to_sections(&plan);
+                if all_done {
+                    if let Some(executor) = &self.executor {
+                        let body = match (executor)(&plan) {
+                            Ok(report) => report,
+                            Err(error) => format!("fechamento SDD falhou: {error}"),
+                        };
+                        let latest = self
+                            .sdd_store
+                            .load(&rk, &slug)
+                            .map_err(ToolError::Other)?
+                            .unwrap_or(plan);
+                        sections = plan_to_sections(&latest);
+                        sections.push(Section {
+                            heading: "### sdd — fechamento".to_string(),
+                            body,
+                            priority: 255,
+                        });
+                    }
+                }
+                sections
             }
         };
 
@@ -1335,6 +1355,61 @@ mod tests {
             closed.contains("closed") || closed.contains("fechada"),
             "{closed}"
         );
+    }
+
+    #[test]
+    fn progress_runs_the_executor_when_all_tasks_are_done() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemorySddStore::default());
+        let mode_cell = Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()));
+        let mut tool = SddTool::new(
+            dir.path().to_path_buf(),
+            store.clone(),
+            Some(mode_cell.clone()),
+            2000,
+        );
+        tool.call(serde_json::json!({
+            "action": "upsert_spec", "slug": "rag", "title": "RAG", "goal": "G"
+        }))
+        .unwrap();
+        tool.call(serde_json::json!({
+            "action": "set_tasks",
+            "tasks": [{
+                "id": "T1", "title": "T",
+                "subtasks": [{ "id": "T1.1", "title": "S", "acceptance": "A" }]
+            }]
+        }))
+        .unwrap();
+        tool.call(serde_json::json!({ "action": "close" })).unwrap();
+        mode_cell.store(
+            AgentMode::Execution.as_u8(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let saved = store.clone();
+        tool.executor = Some(Arc::new(move |plan: &SddPlan| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut plan = plan.clone();
+            plan.status = SddPlanStatus::Completed;
+            saved.save(&plan).unwrap();
+            Ok("docs ok".into())
+        }));
+
+        let out = tool
+            .call(serde_json::json!({
+                "action": "progress", "id": "T1.1", "status": "done"
+            }))
+            .unwrap();
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let saved = store
+            .load(&crate::paths::repo_key(dir.path()), "rag")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, SddPlanStatus::Completed);
+        assert!(out.contains("fechamento"), "{out}");
     }
 
     #[test]

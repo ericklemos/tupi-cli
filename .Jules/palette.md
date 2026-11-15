@@ -25,3 +25,10 @@ Apenas aprendizados críticos de UX/acessibilidade do dashboard (`crates/tupi-we
 **Learning:** o placeholder de `draw_composer` ensinava "/modelos troca o modelo", mas o handler de Enter só reconhece `/models` (`COMMANDS` em `crates/tupi-tui/src/state.rs:1`): quem seguia a dica recebia "comando desconhecido". O mesmo composer também escondia que Enter MUDA de significado com o turno rodando — ocioso ele abre um turno, ocupado ele enfileira (`state.enqueue`, que já aparece como "você · pendente" no transcript) e recusa comandos `/`. Na TUI não existe hover nem tooltip: as únicas superfícies de ensino são a cor do prompt, a borda/título do bloco e o placeholder, e todas são lidas de `state.status` no mesmo frame.
 
 **Action:** nenhuma dica do composer pode ser uma lista escrita à mão — placeholder, título e cor devem sair da mesma condição que o handler consulta (`state.status != Status::Idle`, `COMMANDS`). Quando o efeito do Enter muda, o composer avisa antes da tecla; `notice` depois do erro é feedback tarde demais.
+
+## 2026-11-14 - O diálogo no dashboard era o texto do modelo jogado no innerHTML
+
+**Learning:** a lista "Mensagens" do dashboard (`#history-list` em `crates/tupi-web/assets/app.js`) é a única cópia do diálogo IA ↔ usuário fora da TUI, e interpolava `message.role` (slug cru em inglês) + `message.content.slice(0, 160)` direto no `innerHTML`. Dois defeitos só visíveis com conteúdo real: qualquer `<`/`&` do modelo (código, HTML, tags) virava markup e sumia, e o corte de 160 caracteres achatava uma resposta longa em uma linha só, sem sinal de que havia mais. `MessageDto` (`crates/tupi-web/src/routes.rs:217`) não carrega timestamp, então horário no diálogo exige mexer no backend — fora do escopo do Palette.
+
+**Action:** ao renderizar conteúdo do modelo no dashboard, escape antes de `innerHTML` (`escapeHtml`) e identifique o autor por rótulo textual + cor (nunca só cor), com `white-space: pre-wrap` no corpo para preservar quebras; o padrão `<li class="msg msg-<role>">` + coluna fixa de rótulo é reutilizável em qualquer lista de diálogo.
+

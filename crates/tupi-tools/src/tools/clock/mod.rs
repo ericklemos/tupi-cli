@@ -8,13 +8,7 @@ use serde_json::Value;
 use tupi_kernel::{Tool, ToolError, ToolSpec};
 
 const WEEKDAYS: [&str; 7] = [
-    "domingo",
-    "segunda",
-    "terça",
-    "quarta",
-    "quinta",
-    "sexta",
-    "sábado",
+    "domingo", "segunda", "terça", "quarta", "quinta", "sexta", "sábado",
 ];
 
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -137,8 +131,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year_of_era = year - era * 400;
     let month = month as i64;
     let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as i64;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 1;
     era * 146_097 + day_of_era - 719_468
 }
 

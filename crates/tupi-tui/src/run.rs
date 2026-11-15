@@ -898,8 +898,11 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
     let (inner, prompt_x, prompt_y) = if compact {
         (area, area.x, area.y)
     } else {
-        let mut block = Block::bordered()
-            .border_style(Style::default().fg(if busy { accent } else { Color::DarkGray }));
+        let mut block = Block::bordered().border_style(Style::default().fg(if busy {
+            accent
+        } else {
+            Color::DarkGray
+        }));
         let title = " enter enfileira ";
         // Em terminal estreito o título comeria a borda inteira; aí ele some.
         if busy && title.len() + 2 <= area.width as usize {
@@ -2631,7 +2634,11 @@ mod composer_hint_tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..5)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
     }
 
@@ -2640,19 +2647,32 @@ mod composer_hint_tests {
     #[test]
     fn composer_announces_queueing_while_a_turn_runs() {
         let idle = rows(&ChatState::default(), 48);
-        assert!(idle.iter().any(|row| row.contains("/models troca o modelo")), "{idle:?}");
-        assert!(!idle.iter().any(|row| row.contains("enfileira")), "{idle:?}");
+        assert!(
+            idle.iter()
+                .any(|row| row.contains("/models troca o modelo")),
+            "{idle:?}"
+        );
+        assert!(
+            !idle.iter().any(|row| row.contains("enfileira")),
+            "{idle:?}"
+        );
 
         // `begin_assistant` é o caminho público que leva o estado a Streaming.
         let mut streaming = ChatState::default();
         streaming.begin_assistant();
         let busy = rows(&streaming, 48);
-        assert!(busy.iter().any(|row| row.contains("enter enfileira")), "{busy:?}");
+        assert!(
+            busy.iter().any(|row| row.contains("enter enfileira")),
+            "{busy:?}"
+        );
         assert!(!busy.iter().any(|row| row.contains("/models")), "{busy:?}");
 
         // Mesmo com texto já digitado a legenda continua valendo.
         streaming.input = "segunda pergunta".into();
         let typed = rows(&streaming, 48);
-        assert!(typed.iter().any(|row| row.contains("enter enfileira")), "{typed:?}");
+        assert!(
+            typed.iter().any(|row| row.contains("enter enfileira")),
+            "{typed:?}"
+        );
     }
 }
