@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "slug": "rust-perf-config",
-  "updated_at": 1794705350,
+  "updated_at": 1794761770,
   "tasks": [
     {
       "id": "T1",
@@ -9,7 +9,7 @@
       "details": "Declarar [profile.release] (lto, codegen-units=1, strip) e [profile.dev.package.\"*\"] opt-level para deps pesadas no Cargo.toml raiz:1-68, alem de um perfil profiling.",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "in_progress",
       "subtasks": [
         {
           "id": "T1.1",
@@ -17,7 +17,7 @@
           "acceptance": "Tempos a frio e incremental e tamanho de target/release/tupi registrados.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T1.2",
@@ -33,7 +33,7 @@
           "acceptance": "cargo test verde e testes de tupi-tools (grafo/parse) mais rapidos.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T1.4",
@@ -51,7 +51,7 @@
       "details": "Criar harness minimo de bench para build do grafo, search lexical e map, hoje inexistente.",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "done",
       "subtasks": [
         {
           "id": "T2.1",
@@ -59,7 +59,7 @@
           "acceptance": "Metrica em ms para construcao do grafo e busca lexical tipica sobre ~158 arquivos.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T2.2",
@@ -67,7 +67,7 @@
           "acceptance": "Comando unico imprime tempos de grafo e busca, sem rede.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -103,7 +103,7 @@
       "details": "Criar .cargo/config.toml (nao existe) com linker rapido (lld/mold) e caminho opt-in para target-cpu.",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "in_progress",
       "subtasks": [
         {
           "id": "T4.1",
@@ -119,7 +119,7 @@
           "acceptance": "Instrucao documentada; nenhum build padrao depende de CPU especifica.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -129,7 +129,7 @@
       "details": "tokio com features=[\"full\"] (Cargo.toml:31) e tupi-infer com local-models fixo no binario (crates/tupi/Cargo.toml:18).",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "in_progress",
       "subtasks": [
         {
           "id": "T5.1",
@@ -137,7 +137,7 @@
           "acceptance": "cargo test --workspace verde e tempo de build reduzido vs baseline T1.1.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T5.2",
@@ -155,7 +155,7 @@
       "details": "Paralelizar walk/parse do grafo (builder.rs:60-411) e eliminar build sob write lock em cache.rs:46-63.",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "done",
       "subtasks": [
         {
           "id": "T6.1",
@@ -163,7 +163,7 @@
           "acceptance": "Resultado ordenado e deterministico; ganho medido em T2.2.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T6.2",
@@ -171,7 +171,7 @@
           "acceptance": "Grafo identico nos testes de graph_builder; tempo de build do grafo reduzido.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T6.3",
@@ -179,7 +179,7 @@
           "acceptance": "Teste concorrente sem trabalho duplicado e sem serializacao antes do primeiro build.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T6.4",
@@ -187,7 +187,7 @@
           "acceptance": "Pico de RSS medido e reduzido, grafo final equivalente.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     }

@@ -1,4 +1,4 @@
-apena# Tupi
+# Tupi
 
 Chat de terminal em Rust, com TUI (ratatui), streaming e tools de leitura,
 busca, edição, escrita, execução e grafo de chamadas. O modelo trabalha no
@@ -43,6 +43,58 @@ limitado pelo mesmo orçamento.
 - Rust 1.99+
 - Uma chave da plataforma DeepSeek
 - `git` para `diff`, `why` e `patch`; `curl` para as tools de web
+
+## Instalação
+
+`tupi install` declara o diretório do executável em execução no `PATH` do
+usuário, gravando um bloco marcado no arquivo de inicialização do shell. Não
+copia o binário e nunca exige root/administrador.
+
+```bash
+# na raiz do workspace, sobre o binário recém-compilado
+cargo build --release
+./target/release/tupi install
+
+# dry run: mostra o arquivo e o bloco sem escrever nada
+./target/release/tupi install --print
+
+# força um shell quando a detecção não for confiável
+./target/release/tupi install --shell fish
+```
+
+Depois que o diretório estiver no `PATH` de um shell novo, a forma curta
+`tupi install` funciona.
+
+`--shell` aceita `auto` (padrão), `bash`, `zsh`, `fish`, `posix` e
+`powershell`. No modo `auto`, o shell vem de `$SHELL`, com fallback para os
+arquivos de inicialização que já existem:
+
+| Shell | Arquivo | Linha gravada |
+|---|---|---|
+| `zsh` | `~/.zshrc` | `export PATH="<dir>:$PATH"` |
+| `bash` | `~/.bashrc` | `export PATH="<dir>:$PATH"` |
+| `fish` | `~/.config/fish/config.fish` | `set -gx PATH "<dir>" $PATH` |
+| `posix` | `~/.profile` | `export PATH="<dir>:$PATH"` |
+| `powershell` | `$PROFILE` (`Documents/PowerShell/...`) | `$env:Path = "<dir>;$env:Path"` |
+
+O bloco é delimitado por dois marcadores fixos:
+
+```text
+# >>> tupi install >>>
+export PATH="/home/ana/.cargo/bin:$PATH"
+# <<< tupi install <<<
+```
+
+Rodar o comando de novo substitui o bloco no lugar, então ele nunca é
+duplicado e tudo fora dos marcadores fica byte a byte igual. Uma segunda
+execução com o mesmo diretório reporta `já-presente` e não escreve nada; só o
+diretório muda quando o binário se move. O relatório lista o diretório
+declarado, o arquivo tocado (`criado`, `atualizado` ou `já-presente`) e o
+comando para reabrir o shell.
+
+O `PATH` novo só vale em shells novos: reabra o terminal (ou dê `source` no
+arquivo) antes de chamar `tupi` pelo nome. `tupi install` nunca pede a chave de
+API, nunca abre o store de sessão e nunca sobe a TUI.
 
 ## Configuração
 

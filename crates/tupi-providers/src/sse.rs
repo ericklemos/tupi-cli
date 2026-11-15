@@ -62,6 +62,7 @@ pub struct ToolCallDelta {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamChunk {
     pub text: Option<String>,
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCallDelta>,
     pub finish_reason: Option<String>,
     pub usage: Option<u64>,
@@ -76,6 +77,11 @@ pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
     let text = value
         .pointer("/choices/0/delta/content")
         .and_then(|content| content.as_str())
+        .map(str::to_string);
+
+    let reasoning = value
+        .pointer("/choices/0/delta/reasoning_content")
+        .and_then(|reasoning| reasoning.as_str())
         .map(str::to_string);
 
     let finish_reason = value
@@ -124,6 +130,7 @@ pub fn extract_chunk(payload: &str) -> Result<StreamChunk, ProviderError> {
 
     Ok(StreamChunk {
         text,
+        reasoning,
         tool_calls,
         finish_reason,
         usage,
@@ -218,6 +225,24 @@ mod tests {
         assert_eq!(chunk.text.as_deref(), Some("oi"));
         assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
         assert!(chunk.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn chunk_reads_reasoning_content() {
+        let payload =
+            r#"{"choices":[{"delta":{"reasoning_content":"penso, logo","content":null}}]}"#;
+        let chunk = extract_chunk(payload).unwrap();
+
+        assert_eq!(chunk.reasoning.as_deref(), Some("penso, logo"));
+        assert_eq!(chunk.text, None);
+    }
+
+    #[test]
+    fn chunk_without_reasoning_leaves_it_empty() {
+        let payload = r#"{"choices":[{"delta":{"content":"oi"}}]}"#;
+        let chunk = extract_chunk(payload).unwrap();
+
+        assert_eq!(chunk.reasoning, None);
     }
 
     #[test]

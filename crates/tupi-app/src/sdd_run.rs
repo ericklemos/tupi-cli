@@ -101,11 +101,13 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
             Err(error) => return AgentOutcome::failure(error.to_string()),
         };
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls = Vec::new();
         let mut finish_reason: Option<String> = None;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(ProviderEvent::Text(chunk)) => text.push_str(&chunk),
+                Ok(ProviderEvent::Reasoning(chunk)) => reasoning.push_str(&chunk),
                 Ok(ProviderEvent::ToolCalls(inner)) => calls.extend(inner),
                 Ok(ProviderEvent::Finished(reason)) => finish_reason = Some(reason),
                 Ok(_) => {}
@@ -121,7 +123,7 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
             Some("length") | Some("max_tokens")
         ) {
             if !text.is_empty() {
-                messages.push(Message::assistant(text));
+                messages.push(Message::assistant(text).with_reasoning(reasoning));
             }
             if final_step {
                 return AgentOutcome::failure(format!(
@@ -170,7 +172,7 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
                 error: None,
             };
         }
-        messages.push(Message::assistant_with_calls(text, calls.clone()));
+        messages.push(Message::assistant_with_calls(text, calls.clone()).with_reasoning(reasoning));
         for call in calls {
             let content = match run_tool(
                 turn.tools,
@@ -1188,6 +1190,70 @@ mod tests {
 
         assert!(!outcome.ok);
         assert!(outcome.error.unwrap_or_default().contains("passos"));
+    }
+
+    #[tokio::test]
+    async fn agent_passes_back_reasoning_content_of_previous_steps() {
+        let (provider, requests) = Scripted::new_tracked(vec![
+            vec![
+                Ok(ProviderEvent::Reasoning("penso no passo".to_string())),
+                call_event("c1"),
+            ],
+            vec![text_event("feito")],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool {
+            hits: Arc::new(AtomicUsize::new(0)),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_agent(fixture(&provider, &tools, 4, cancel), "brief").await;
+
+        assert!(outcome.ok, "{:?}", outcome.error);
+        let requests = requests.lock().unwrap();
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("mensagem do assistente no segundo passo");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("penso no passo"),
+            "o thinking mode exige o reasoning_content de volta quando há tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_keeps_reasoning_content_after_a_truncated_answer() {
+        let (provider, requests) = Scripted::new_tracked(vec![
+            vec![
+                Ok(ProviderEvent::Reasoning("cortado".to_string())),
+                Ok(ProviderEvent::Text("vou editar".to_string())),
+                Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: "{\"path\"".to_string(),
+                }])),
+                Ok(ProviderEvent::Finished("length".to_string())),
+            ],
+            vec![text_event("pronto")],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool {
+            hits: Arc::new(AtomicUsize::new(0)),
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_agent(fixture(&provider, &tools, 4, cancel), "brief").await;
+
+        assert!(outcome.ok, "{:?}", outcome.error);
+        let requests = requests.lock().unwrap();
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("mensagem do assistente após o corte");
+        assert_eq!(assistant.reasoning_content.as_deref(), Some("cortado"));
     }
 
     #[tokio::test]

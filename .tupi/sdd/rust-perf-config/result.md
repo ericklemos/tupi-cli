@@ -8,8 +8,8 @@
 
 ## Resumo
 
-- tasks: 0/6
-- subtasks: 0/16 ok
+- tasks: 2/6
+- subtasks: 10/16 ok
 - falhas: 2
 
 ## Verificação

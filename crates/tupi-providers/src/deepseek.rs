@@ -203,6 +203,9 @@ impl Provider for DeepSeekProvider {
                                     state,
                                 ));
                             }
+                            if let Some(reasoning) = chunk.reasoning {
+                                return Some((Ok(ProviderEvent::Reasoning(reasoning)), state));
+                            }
                             if let Some(text) = chunk.text {
                                 return Some((Ok(ProviderEvent::Text(text)), state));
                             }
@@ -251,6 +254,10 @@ impl Provider for DeepSeekProvider {
 }
 
 pub fn build_body(request: &ChatRequest) -> serde_json::Value {
+    // Thinking mode + tools: o provedor exige `reasoning_content` em todo
+    // turno do assistente, inclusive quando o modelo não emitiu reasoning
+    // (aí o campo vai como string vazia). Sem ele a API responde 400.
+    let has_tools = !request.tools.is_empty();
     let messages: Vec<serde_json::Value> = request
         .messages
         .iter()
@@ -280,6 +287,15 @@ pub fn build_body(request: &ChatRequest) -> serde_json::Value {
 
             if let Some(call_id) = &message.tool_call_id {
                 value["tool_call_id"] = serde_json::Value::String(call_id.clone());
+            }
+
+            // Thinking mode + tools: o provedor exige o reasoning de volta,
+            // inclusive em turnos em que o modelo não chamou tool.
+            if message.role == tupi_domain::Role::Assistant {
+                let reasoning = message.reasoning_content.as_deref().unwrap_or("");
+                if has_tools || !reasoning.is_empty() {
+                    value["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
+                }
             }
 
             value
@@ -458,6 +474,66 @@ mod tests {
     }
 
     #[test]
+    fn body_passes_back_reasoning_content_of_assistant_messages() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        };
+        let request = ChatRequest::new(
+            "deepseek-flash",
+            vec![
+                Message::assistant_with_calls("", vec![call]).with_reasoning("penso no passo"),
+                Message::tool("c1", "resultado"),
+            ],
+        );
+        let body = build_body(&request);
+
+        assert_eq!(body["messages"][0]["reasoning_content"], "penso no passo");
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn body_omits_reasoning_content_when_absent_or_empty() {
+        let request = ChatRequest::new(
+            "deepseek-flash",
+            vec![
+                Message::assistant("sem pensar"),
+                Message::assistant("vazio").with_reasoning(""),
+            ],
+        );
+        let body = build_body(&request);
+
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn body_fills_empty_reasoning_content_on_assistant_turns_with_tools() {
+        let request = ChatRequest::new(
+            "deepseek-flash",
+            vec![
+                Message::user("oi"),
+                Message::assistant_with_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                Message::tool("c1", "resultado"),
+            ],
+        )
+        .with_tools(vec![read_spec()]);
+        let body = build_body(&request);
+
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+        assert!(body["messages"][2].get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn tool_message_serializes_call_id() {
         let request = ChatRequest::new("deepseek-flash", vec![Message::tool("c1", "resultado")]);
         let body = build_body(&request);
@@ -549,6 +625,50 @@ mod tests {
         assert_eq!(first, ProviderEvent::Started);
         let second = stream.next().await.unwrap().unwrap();
         assert_eq!(second, ProviderEvent::Text("ola".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_reports_reasoning_content_before_the_text() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"penso\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ola\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let provider = DeepSeekProvider::new("sk-test").with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "deepseek-flash",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.unwrap());
+        }
+
+        assert_eq!(events[0], ProviderEvent::Started);
+        assert_eq!(events[1], ProviderEvent::Reasoning("penso".to_string()));
+        assert_eq!(events[2], ProviderEvent::Text("ola".to_string()));
     }
 
     #[test]

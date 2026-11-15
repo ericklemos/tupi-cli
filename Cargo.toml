@@ -42,6 +42,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "s
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 anyhow = "1"
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 ratatui = "0.30.2"
 tui-markdown = "0.3.13"
 unicode-width = "0.2"

@@ -43,6 +43,9 @@ pub enum ProviderEvent {
     /// medir TTFT antes de o parser produzir texto, tool call ou usage.
     Started,
     Text(String),
+    /// Chain-of-thought do thinking mode, em deltas. Precisa ser devolvido ao
+    /// provedor junto da mensagem do assistente quando a requisição leva tools.
+    Reasoning(String),
     ToolCalls(Vec<ToolCall>),
     /// O provedor encerrou a resposta e disse por quê (`stop`, `length`, …).
     /// Vem depois de texto/tool calls e antes do fim do stream. `length`

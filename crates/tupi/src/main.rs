@@ -9,7 +9,9 @@ use tupi_tui::run::BusSet;
 mod agents_config;
 mod config;
 mod docs_scaffold;
+mod install;
 mod lang;
+mod local_models;
 mod project_config;
 mod prompt_config;
 mod startup;
@@ -65,7 +67,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let cli = parse_cli_options(&std::env::args().collect::<Vec<_>>())?;
+    // `tupi install` responde antes de qualquer inicialização pesada: não
+    // exige chave de API, não abre o redb, não baixa modelo e não sobe a TUI.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(args) = install_args(&argv) {
+        install::run(args)?;
+        return Ok(());
+    }
+
+    let cli = parse_cli_options(&argv)?;
     let dotenv_path = dotenvy::dotenv().ok();
 
     let store_path = data_dir(|key| std::env::var(key).ok()).join("tupi.redb");
@@ -286,17 +296,17 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!("modelo de embeddings ausente; busca segue lexical");
                     return;
                 }
-                match tupi_infer::LlamaEmbedder::load(&path) {
-                    Ok(embedder) => slot.set(std::sync::Arc::new(embedder)),
-                    Err(error) => tracing::warn!(%error, "embedder nao carregou"),
+                if let Some(embedder) = local_models::load_embedder(&path) {
+                    slot.set(embedder);
                 }
                 return;
             }
             match tupi_infer::ensure_embedding_model(&base, &tupi_infer::HttpFetcher).await {
-                Ok(path) => match tupi_infer::LlamaEmbedder::load(&path) {
-                    Ok(embedder) => slot.set(std::sync::Arc::new(embedder)),
-                    Err(error) => tracing::warn!(%error, "embedder nao carregou"),
-                },
+                Ok(path) => {
+                    if let Some(embedder) = local_models::load_embedder(&path) {
+                        slot.set(embedder);
+                    }
+                }
                 Err(error) => tracing::warn!(%error, "download do embedder falhou"),
             }
         });
@@ -314,10 +324,11 @@ async fn main() -> anyhow::Result<()> {
         let base = data_dir(|key| std::env::var(key).ok());
         tokio::spawn(async move {
             match tupi_infer::ensure_generation_model(&base, &tupi_infer::HttpFetcher).await {
-                Ok(path) => match tupi_infer::LlamaGenerator::load(&path) {
-                    Ok(generator) => slot.set(std::sync::Arc::new(generator)),
-                    Err(error) => tracing::warn!(%error, "gerador de resumos nao carregou"),
-                },
+                Ok(path) => {
+                    if let Some(generator) = local_models::load_generator(&path) {
+                        slot.set(generator);
+                    }
+                }
                 Err(error) => tracing::warn!(%error, "download do gerador falhou"),
             }
         });
@@ -684,6 +695,50 @@ fn record_model_window(root: &std::path::Path, provider: &str, model: &str, cont
             key = %key,
             "não foi possível gravar a janela do modelo"
         ),
+    }
+}
+
+/// Argumentos de `tupi install`, quando o subcomando é o primeiro argumento.
+///
+/// O despacho por este caminho precede `dotenvy`, a abertura do redb e a
+/// leitura da chave de API, então `tupi install` roda sem `TUPI_CLI_*`.
+fn install_args(args: &[String]) -> Option<&[String]> {
+    match args.get(1).map(String::as_str) {
+        Some("install") => Some(&args[2..]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod install_args_tests {
+    use super::install_args;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn the_subcommand_is_recognised_without_any_control_flag() {
+        let cli = args(&["tupi", "install"]);
+        assert_eq!(install_args(&cli).map(<[String]>::len), Some(0));
+    }
+
+    #[test]
+    fn every_control_flag_follows_the_subcommand() {
+        let cli = args(&["tupi", "install", "--print", "--shell", "fish"]);
+        let tail: &[String] = &cli[2..];
+        assert_eq!(install_args(&cli), Some(tail));
+    }
+
+    #[test]
+    fn the_tui_path_without_the_subcommand_is_left_alone() {
+        assert_eq!(install_args(&args(&["tupi"])), None);
+        assert_eq!(install_args(&[]), None);
+        assert_eq!(
+            install_args(&args(&["tupi", "--web", "--web-port", "7788"])),
+            None
+        );
+        assert_eq!(install_args(&args(&["tupi", "--web", "install"])), None);
     }
 }
 

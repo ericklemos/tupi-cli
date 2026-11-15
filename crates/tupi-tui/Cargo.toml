@@ -9,6 +9,7 @@ tupi-domain.workspace = true
 tupi-kernel.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
+arboard.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true

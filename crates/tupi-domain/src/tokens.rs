@@ -44,6 +44,9 @@ pub fn estimate_tokens(text: &str) -> usize {
 pub fn estimate_message(message: &crate::Message) -> usize {
     let mut total = estimate_tokens(&message.content);
     total += 4; // papel, separadores e o envelope por mensagem
+    if let Some(reasoning) = &message.reasoning_content {
+        total += estimate_tokens(reasoning);
+    }
     for call in &message.tool_calls {
         total += estimate_tokens(&call.name) + estimate_tokens(&call.arguments) + 8;
     }

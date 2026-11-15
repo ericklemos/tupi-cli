@@ -17,7 +17,7 @@ tupi-tui.workspace = true
 tupi-web.workspace = true
 tupi-store.workspace = true
 tupi-tools.workspace = true
-tupi-infer = { workspace = true, default-features = false, features = ["local-models"] }
+tupi-infer = { workspace = true, default-features = false }
 anyhow.workspace = true
 async-trait.workspace = true
 dotenvy.workspace = true
@@ -31,7 +31,12 @@ serde.workspace = true
 serde_json.workspace = true
 
 [features]
-default = ["cuda"]
+# O default é o mesmo de antes: `local-models` (llama.cpp) sempre entra e `cuda`
+# escolhe o backend. A diferença é que agora dá para desligar:
+# `cargo build -p tupi --no-default-features` compila sem `llama-cpp-2`, que é o
+# maior custo de build nativo do binário (ver docs/perf/baseline.md).
+default = ["local-models", "cuda"]
+local-models = ["tupi-infer/local-models"]
 cuda = ["tupi-infer/cuda"]
 metal = ["tupi-infer/metal"]
 vulkan = ["tupi-infer/vulkan"]

@@ -333,8 +333,6 @@ impl Store {
     }
 }
 
-mod sdd;
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

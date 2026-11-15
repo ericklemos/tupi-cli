@@ -1123,6 +1123,7 @@ impl App {
                 }
 
                 let mut streamed_text = String::new();
+                let mut streamed_reasoning = String::new();
                 let mut calls = Vec::new();
                 let mut stream_failed = false;
                 let provider_started = std::time::Instant::now();
@@ -1161,6 +1162,9 @@ impl App {
                                             streamed_text.push_str(&text);
                                             task_partial.lock().unwrap().push_str(&text);
                                             events.publish(Event::Token { request_id, text });
+                                        }
+                                        ProviderEvent::Reasoning(text) => {
+                                            streamed_reasoning.push_str(&text);
                                         }
                                         ProviderEvent::ToolCalls(tool_calls) => {
                                             if telemetry.is_enabled() {
@@ -1262,38 +1266,52 @@ impl App {
                 );
                 if truncated && !stream_failed && failure.is_none() {
                     if !streamed_text.is_empty() {
-                        session.push_message(Message::assistant(streamed_text));
+                        session.push_message(
+                            Message::assistant(streamed_text).with_reasoning(streamed_reasoning),
+                        );
                     }
+                    truncation_retries += 1;
                     events.publish(Event::Notice {
                         message: format!(
-                            "resposta cortada no limite de {max_tokens} tokens — nada desta chamada foi executado"
+                            "resposta cortada no limite de {max_tokens} tokens — nada desta chamada foi executado ({truncation_retries}/{})",
+                            MAX_TRUNCATION_RETRIES + 1
                         ),
                     });
-                    if truncation_retries < MAX_TRUNCATION_RETRIES && !final_step {
-                        truncation_retries += 1;
+                    if truncation_retries <= MAX_TRUNCATION_RETRIES && !final_step {
                         session.push_message(Message::new(
                             Role::System,
                             format!(
-                                "A resposta anterior foi cortada pelo limite de {max_tokens} tokens antes de terminar. Nada dela foi executado. Reemita a resposta/chamada completa; se o conteúdo for grande, divida em passos menores."
+                                "A resposta anterior foi cortada pelo limite de {max_tokens} tokens antes de terminar. Nada dela foi executado. Não repita a mesma resposta: reemita-a cabendo no teto — um arquivo por chamada e, se o conteúdo for grande, crie um esqueleto pequeno e complete com edições em passos menores."
                             ),
                         ));
                         continue;
                     }
+                    // Esgotou as reemissões (ou o turno acabou no último passo):
+                    // encerrar com `break` sem falha deixava o usuário com um
+                    // aviso passageiro e nenhuma resposta — parecia que o turno
+                    // tinha terminado bem. A falha nomeia a causa e a saída.
                     close_unanswered(
                         &session,
                         &pending,
                         "resposta truncada: chamada não executada",
                     );
+                    failure = Some(format!(
+                        "resposta cortada no limite de {max_tokens} tokens em {truncation_retries} tentativa(s) — nada foi executado. Aumente `max_tokens` em configs/token.ron ou peça a tarefa em partes menores."
+                    ));
                     break;
                 }
 
                 if final_step {
                     if !streamed_text.is_empty() {
-                        session.push_message(Message::assistant(streamed_text));
+                        session.push_message(
+                            Message::assistant(streamed_text).with_reasoning(streamed_reasoning),
+                        );
                     }
                 } else if !streamed_text.is_empty() || !calls.is_empty() {
-                    session
-                        .push_message(Message::assistant_with_calls(streamed_text, calls.clone()));
+                    session.push_message(
+                        Message::assistant_with_calls(streamed_text, calls.clone())
+                            .with_reasoning(streamed_reasoning),
+                    );
                     *pending.lock().unwrap() = calls.clone();
                 }
 
@@ -2143,6 +2161,45 @@ mod prefix_tests {
         assert_eq!(requests[0].messages[0].role, Role::System);
         assert_eq!(requests[0].messages[0].content, "PREFIXO");
         assert_eq!(requests[1].messages[0], requests[0].messages[0]);
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_is_replayed_in_the_next_request() {
+        let bus = EventBus::new(32);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(Scripted {
+            scripts: Mutex::new(vec![
+                vec![
+                    Ok(ProviderEvent::Reasoning("penso no passo".to_string())),
+                    Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "inexistente".to_string(),
+                        arguments: "{}".to_string(),
+                    }])),
+                ],
+                text("feito"),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let app = app_with_prefix(provider.clone(), bus, "PREFIXO");
+
+        app.handle(Command::SendMessage { text: "a".into() })
+            .await
+            .unwrap();
+        wait_for_finished(&mut rx).await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests.len() >= 2, "esperava um segundo passo");
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("mensagem do assistente no segundo passo");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("penso no passo"),
+            "o thinking mode exige o reasoning_content de volta quando há tools"
+        );
     }
 
     #[tokio::test]

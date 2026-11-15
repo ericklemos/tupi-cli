@@ -25,10 +25,14 @@ pub struct GraphBuilder {
 }
 
 struct ParsedFile {
+    path: PathBuf,
     relative: PathBuf,
-    content: String,
     language: Language,
-    tree: Option<Arc<tree_sitter::Tree>>,
+    file_hash: blake3::Hash,
+    nodes: Vec<SymbolNode>,
+    scope: Option<FileScope>,
+    calls: Vec<CallSite>,
+    bindings: Option<HashMap<String, Vec<(usize, String)>>>,
 }
 
 impl GraphBuilder {
@@ -44,99 +48,43 @@ impl GraphBuilder {
         self
     }
 
-    fn parse_tree(
-        &self,
-        path: &Path,
-        content: &str,
-        language: Language,
-        digest: blake3::Hash,
-    ) -> Option<Arc<tree_sitter::Tree>> {
-        match &self.cache {
-            Some(cache) => cache.parse_with_digest(path, language, content, digest),
-            None => parse(content, language).map(Arc::new),
-        }
-    }
-
     pub fn build(&self, root: &Path) -> Result<ProjectCodeGraph, ToolError> {
         let files = collect_files(root)?;
         let mut graph = ProjectCodeGraph::new();
-        let mut parsed = Vec::with_capacity(files.len());
 
+        // Passo 1 (serial e barato): registra todos os arquivos no resolvedor de
+        // escopo. `collect_imports` só lê o resolvedor, então registrá-lo antes
+        // permite ler/parsear em paralelo logo depois.
+        let mut targets: Vec<(PathBuf, PathBuf, Language)> = Vec::with_capacity(files.len());
         for path in files {
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let relative = PathBuf::from(crate::paths::relative(root, &path));
             let Some(language) = Language::from_path(&path) else {
                 continue;
             };
-            let file_hash = blake3::hash(content.as_bytes());
-            graph.file_hashes.insert(path.clone(), file_hash);
+            let relative = PathBuf::from(crate::paths::relative(root, &path));
             graph
                 .resolver
                 .register_file(&relative, &crate_name_for(&relative));
+            targets.push((path, relative, language));
+        }
 
-            // Parse once per file and reuse both the tree and the file hash.
-            let tree = self.parse_tree(&path, &content, language, file_hash);
-            let snippets = tree
-                .as_deref()
-                .map(|t| AstChunker::snippets_from_tree(t, &content, language))
-                .unwrap_or_default();
+        // Passo 2 (paralelo): lê, faz o hash, parseia e extrai símbolos, escopo e
+        // chamadas. Conteúdo e árvore morrem no worker; só os dados derivados
+        // sobrevivem, o que reduz o pico de RSS do grafo inteiro.
+        let parsed = parse_files(&self.queries, self.cache.as_ref(), &graph.resolver, targets);
 
-            let relative_str = relative.to_string_lossy();
-            let is_test_path =
-                relative_str.contains("/tests/") || relative_str.starts_with("tests/");
-            let mut lines_cache: Option<Vec<&str>> = None;
-
-            for snippet in snippets {
-                let is_callable =
-                    snippet.signature.contains("fn ") || snippet.signature.contains("fun ");
-                let is_public = if language == Language::Kotlin {
-                    !snippet.signature.contains("private ")
-                        && !snippet.signature.contains("internal ")
-                } else {
-                    snippet.signature.trim_start().starts_with("pub")
-                };
-                let is_test = is_test_path
-                    || snippet.code.contains("#[cfg(test)]")
-                    || snippet.code.contains("@Test")
-                    || {
-                        let lines = lines_cache.get_or_insert_with(|| content.lines().collect());
-                        has_test_attribute(lines, snippet.start_line)
-                    };
-                let is_container = snippet.signature.contains("struct ")
-                    || snippet.signature.contains("class ")
-                    || snippet.signature.contains("enum ")
-                    || snippet.signature.contains("trait ")
-                    || snippet.signature.contains("interface ");
-                let kind = if is_container {
-                    SectionKind::Container
-                } else {
-                    SectionKind::Member
-                };
-                graph.graph.add_node(SymbolNode {
-                    name: snippet.symbol_name,
-                    qualified: snippet.qualified_name.clone(),
-                    relative: relative_str.to_string(),
-                    start_line: snippet.start_line,
-                    end_line: snippet.end_line,
-                    signature: snippet.signature,
-                    is_public,
-                    is_callable,
-                    is_test,
-                    language,
-                    kind,
-                    id: SectionId::new(relative_str.as_ref(), &snippet.qualified_name),
-                    hash: blake3::hash(snippet.code.as_bytes()),
-                });
+        // Passo 3 (serial): insere nós e escopos na ordem dos arquivos, mantendo o
+        // resultado idêntico ao build serial.
+        let mut pending: Vec<(PathBuf, Language, Vec<CallSite>, Option<Bindings>)> =
+            Vec::with_capacity(parsed.len());
+        for file in parsed {
+            graph.file_hashes.insert(file.path, file.file_hash);
+            for node in file.nodes {
+                graph.graph.add_node(node);
             }
-
-            parsed.push(ParsedFile {
-                tree,
-                relative,
-                content,
-                language,
-            });
+            if let Some(scope) = file.scope {
+                graph.scopes.insert(file.relative.clone(), scope);
+            }
+            pending.push((file.relative, file.language, file.calls, file.bindings));
         }
 
         // O(N) container index by name (previously O(M * K) linear search per member).
@@ -192,21 +140,6 @@ impl GraphBuilder {
             );
         }
 
-        for file in &parsed {
-            let Some(tree) = &file.tree else {
-                continue;
-            };
-            let scope = collect_imports(
-                &self.queries,
-                file.language,
-                &tree.root_node(),
-                &file.content,
-                &file.relative,
-                &graph.resolver,
-            );
-            graph.scopes.insert(file.relative.clone(), scope);
-        }
-
         // O(N) indices replace O(F * N) caller scans and O(C * N) full-graph definition scans,
         // reducing call-resolution complexity from O(C * N) to O(C + N).
         let (call_edges, dropped_names) = {
@@ -239,11 +172,11 @@ impl GraphBuilder {
             let mut call_edges: Vec<(NodeIndex, NodeIndex, usize)> = Vec::new();
             let mut dropped_names: Vec<String> = Vec::new();
 
-            for file in &parsed {
-                let Some(tree) = &file.tree else {
+            for (relative, language, calls, bindings) in &pending {
+                if calls.is_empty() {
                     continue;
-                };
-                let file_rel = file.relative.to_string_lossy();
+                }
+                let file_rel = relative.to_string_lossy();
                 let callers = callers_by_file
                     .get(file_rel.as_ref())
                     .map(Vec::as_slice)
@@ -252,19 +185,8 @@ impl GraphBuilder {
                     continue;
                 }
 
-                let calls = collect_calls(
-                    &self.queries,
-                    file.language,
-                    &tree.root_node(),
-                    &file.content,
-                );
-                if calls.is_empty() {
-                    continue;
-                }
-
-                let scope = graph.scopes.get(&file.relative).unwrap_or(&default_scope);
-                let lang_defs = &defs_by_name[lang_slot(file.language)];
-                let mut bindings: Option<HashMap<String, Vec<(usize, String)>>> = None;
+                let scope = graph.scopes.get(relative).unwrap_or(&default_scope);
+                let lang_defs = &defs_by_name[lang_slot(*language)];
 
                 for call in calls {
                     let Some(caller) = callers.iter().copied().find(|&index| {
@@ -321,31 +243,30 @@ impl GraphBuilder {
                             }
                         }
                     }
-                    if let Some(receiver) = &call.receiver {
-                        let bindings =
-                            bindings.get_or_insert_with(|| collect_bindings(&file.content));
-                        if let Some(ty) = binding_type_at(bindings, receiver, call.line) {
-                            let prefix = format!("{ty}::");
-                            let infix = format!("::{ty}::");
-                            let typed: Vec<NodeIndex> = definitions
-                                .iter()
-                                .copied()
-                                .filter(|&index| {
-                                    graph.graph.node_weight(index).is_some_and(|node| {
-                                        node.qualified.starts_with(&prefix)
-                                            || node.qualified.contains(&infix)
-                                    })
+                    if let Some(receiver) = &call.receiver
+                        && let Some(bindings) = bindings.as_ref()
+                        && let Some(ty) = binding_type_at(bindings, receiver, call.line)
+                    {
+                        let prefix = format!("{ty}::");
+                        let infix = format!("::{ty}::");
+                        let typed: Vec<NodeIndex> = definitions
+                            .iter()
+                            .copied()
+                            .filter(|&index| {
+                                graph.graph.node_weight(index).is_some_and(|node| {
+                                    node.qualified.starts_with(&prefix)
+                                        || node.qualified.contains(&infix)
                                 })
-                                .collect();
-                            if !typed.is_empty() {
-                                definitions = std::borrow::Cow::Owned(typed);
-                            }
+                            })
+                            .collect();
+                        if !typed.is_empty() {
+                            definitions = std::borrow::Cow::Owned(typed);
                         }
                     }
 
                     let resolution = pick_target(
                         &call.name,
-                        &file.relative,
+                        relative,
                         scope,
                         &graph.resolver,
                         call.path.as_deref(),
@@ -357,7 +278,7 @@ impl GraphBuilder {
                             call_edges.push((caller, target, call.line));
                         }
                         Resolution::Ambiguous { .. } => {
-                            dropped_names.push(call.name);
+                            dropped_names.push(call.name.clone());
                         }
                         Resolution::Unknown => {}
                     }
@@ -387,25 +308,54 @@ impl GraphBuilder {
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
-    let mut files = Vec::new();
-    let walker = WalkBuilder::new(root)
+    // Walk paralelo: o diretório do walker é reaproveitado por várias threads e
+    // cada arquivo encontrado é acumulado num Mutex. A ordenação final mantém o
+    // resultado idêntico ao walk serial.
+    let files = std::sync::Mutex::new(Vec::new());
+    let failure = std::sync::Mutex::new(None::<String>);
+
+    WalkBuilder::new(root)
         .standard_filters(true)
         .hidden(true)
         .parents(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .build();
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                        let path = entry.into_path();
+                        if Language::from_path(&path).is_some()
+                            && let Ok(mut files) = files.lock()
+                        {
+                            files.push(path);
+                        }
+                    }
+                    ignore::WalkState::Continue
+                }
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock()
+                        && slot.is_none()
+                    {
+                        *slot = Some(error.to_string());
+                    }
+                    ignore::WalkState::Continue
+                }
+            })
+        });
 
-    for entry in walker {
-        let entry = entry.map_err(|error| ToolError::Other(error.to_string()))?;
-        if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            let path = entry.into_path();
-            if Language::from_path(&path).is_some() {
-                files.push(path);
-            }
-        }
+    if let Some(message) = failure
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner())
+    {
+        return Err(ToolError::Other(message));
     }
+
+    let mut files = files
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner());
     files.sort();
     Ok(files)
 }
@@ -656,3 +606,155 @@ fn has_test_attribute(lines: &[&str], start_line: usize) -> bool {
     }
     false
 }
+
+/// Lê, parseia e extrai os dados derivados de um arquivo. O conteúdo e a árvore
+/// morrem no fim da chamada: quem chama recebe só o que o grafo consome.
+#[allow(clippy::too_many_arguments)]
+fn parse_file(
+    queries: &GraphQueries,
+    cache: Option<&Arc<ParseCache>>,
+    resolver: &ScopeResolver,
+    path: PathBuf,
+    relative: PathBuf,
+    language: Language,
+) -> Option<ParsedFile> {
+    let content = std::fs::read_to_string(&path).ok()?;
+    let file_hash = blake3::hash(content.as_bytes());
+    let tree = match cache {
+        Some(cache) => cache.parse_with_digest(&path, language, &content, file_hash),
+        None => parse(&content, language).map(Arc::new),
+    };
+
+    let relative_str = relative.to_string_lossy();
+    let is_test_path = relative_str.contains("/tests/") || relative_str.starts_with("tests/");
+    let mut lines_cache: Option<Vec<&str>> = None;
+    let mut nodes = Vec::new();
+    let snippets = tree
+        .as_deref()
+        .map(|t| AstChunker::snippets_from_tree(t, &content, language))
+        .unwrap_or_default();
+
+    for snippet in snippets {
+        let is_callable = snippet.signature.contains("fn ") || snippet.signature.contains("fun ");
+        let is_public = if language == Language::Kotlin {
+            !snippet.signature.contains("private ") && !snippet.signature.contains("internal ")
+        } else {
+            snippet.signature.trim_start().starts_with("pub")
+        };
+        let is_test = is_test_path
+            || snippet.code.contains("#[cfg(test)]")
+            || snippet.code.contains("@Test")
+            || {
+                let lines = lines_cache.get_or_insert_with(|| content.lines().collect());
+                has_test_attribute(lines, snippet.start_line)
+            };
+        let is_container = snippet.signature.contains("struct ")
+            || snippet.signature.contains("class ")
+            || snippet.signature.contains("enum ")
+            || snippet.signature.contains("trait ")
+            || snippet.signature.contains("interface ");
+        let kind = if is_container {
+            SectionKind::Container
+        } else {
+            SectionKind::Member
+        };
+        nodes.push(SymbolNode {
+            name: snippet.symbol_name,
+            qualified: snippet.qualified_name.clone(),
+            relative: relative_str.to_string(),
+            start_line: snippet.start_line,
+            end_line: snippet.end_line,
+            signature: snippet.signature,
+            is_public,
+            is_callable,
+            is_test,
+            language,
+            kind,
+            id: SectionId::new(relative_str.as_ref(), &snippet.qualified_name),
+            hash: blake3::hash(snippet.code.as_bytes()),
+        });
+    }
+
+    let (scope, calls) = match &tree {
+        Some(tree) => {
+            let root_node = tree.root_node();
+            (
+                Some(collect_imports(
+                    queries, language, &root_node, &content, &relative, resolver,
+                )),
+                collect_calls(queries, language, &root_node, &content),
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    let bindings = if calls.iter().any(|call| call.receiver.is_some()) {
+        Some(collect_bindings(&content))
+    } else {
+        None
+    };
+
+    Some(ParsedFile {
+        path,
+        relative,
+        language,
+        file_hash,
+        nodes,
+        scope,
+        calls,
+        bindings,
+    })
+}
+
+/// Parse paralelo com resultado determinístico: cada worker pega o próximo
+/// índice e o vetor final é reordenado pelo índice do arquivo.
+fn parse_files(
+    queries: &GraphQueries,
+    cache: Option<&Arc<ParseCache>>,
+    resolver: &ScopeResolver,
+    targets: Vec<(PathBuf, PathBuf, Language)>,
+) -> Vec<ParsedFile> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(targets.len())
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let collected = std::sync::Mutex::new(Vec::with_capacity(targets.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, relative, language)) = targets.get(index) else {
+                        break;
+                    };
+                    let parsed = parse_file(
+                        queries,
+                        cache,
+                        resolver,
+                        path.clone(),
+                        relative.clone(),
+                        *language,
+                    );
+                    if let Some(parsed) = parsed
+                        && let Ok(mut collected) = collected.lock()
+                    {
+                        collected.push((index, parsed));
+                    }
+                }
+            });
+        }
+    });
+
+    let mut collected = collected
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner());
+    collected.sort_by_key(|(index, _)| *index);
+    collected.into_iter().map(|(_, file)| file).collect()
+}
+
+/// Ligações locais por variável, reaproveitadas entre arquivos no build paralelo.
+type Bindings = HashMap<String, Vec<(usize, String)>>;

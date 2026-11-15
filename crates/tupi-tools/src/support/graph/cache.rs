@@ -15,6 +15,9 @@ use crate::graph::parse_cache::ParseCache;
 pub struct GraphCache {
     root: PathBuf,
     graph: RwLock<Option<Arc<ProjectCodeGraph>>>,
+    /// Serializa só a *construção*: quem chega depois espera o grafo pronto em
+    /// vez de ficar bloqueado no write lock durante todo o build.
+    building: Mutex<()>,
     builder: Option<GraphBuilder>,
 }
 
@@ -24,6 +27,7 @@ impl GraphCache {
         Self {
             root,
             graph: RwLock::new(None),
+            building: Mutex::new(()),
             builder: GraphBuilder::new().ok(),
         }
     }
@@ -33,6 +37,7 @@ impl GraphCache {
         Self {
             root,
             graph: RwLock::new(None),
+            building: Mutex::new(()),
             builder: GraphBuilder::new()
                 .ok()
                 .map(|builder| builder.with_parse_cache(cache)),
@@ -50,14 +55,24 @@ impl GraphCache {
             return graph.clone();
         }
 
+        // Single-flight: só uma thread executa `build`; as concorrentes dormem no
+        // mutex de construção (barato) e releem o grafo pronto. O write lock fica
+        // retido apenas para publicar o resultado.
+        let _building = self
+            .building
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Ok(graph) = self.graph.read()
+            && let Some(graph) = graph.as_ref()
+        {
+            return graph.clone();
+        }
+
+        let built = Arc::new(self.build());
         let mut slot = self
             .graph
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(graph) = slot.as_ref() {
-            return graph.clone();
-        }
-        let built = Arc::new(self.build());
         *slot = Some(built.clone());
         built
     }
@@ -166,6 +181,7 @@ mod tests {
             root: PathBuf::from("."),
             builder: None,
             graph: RwLock::new(None),
+            building: Mutex::new(()),
         };
         assert!(cache.get().defs.is_empty());
     }

@@ -149,7 +149,12 @@ fn answered_step() -> Vec<Result<ProviderEvent, ProviderError>> {
     ]
 }
 
-async fn run_turn(app: &Arc<App>, receiver: &mut tokio::sync::broadcast::Receiver<Event>) {
+/// Roda um turno e devolve a falha, se houver: `None` quando o turno termina
+/// sem erro, `Some(mensagem)` quando publica `StreamFailed`.
+async fn run_turn_outcome(
+    app: &Arc<App>,
+    receiver: &mut tokio::sync::broadcast::Receiver<Event>,
+) -> Option<String> {
     let CommandOutcome::Started { .. } = app
         .handle(Command::SendMessage {
             text: "oi".to_string(),
@@ -162,10 +167,16 @@ async fn run_turn(app: &Arc<App>, receiver: &mut tokio::sync::broadcast::Receive
 
     loop {
         match receiver.recv().await.unwrap() {
-            Event::StreamFinished { .. } => break,
-            Event::StreamFailed { message, .. } => panic!("stream falhou: {message}"),
+            Event::StreamFinished { .. } => return None,
+            Event::StreamFailed { message, .. } => return Some(message),
             _ => {}
         }
+    }
+}
+
+async fn run_turn(app: &Arc<App>, receiver: &mut tokio::sync::broadcast::Receiver<Event>) {
+    if let Some(message) = run_turn_outcome(app, receiver).await {
+        panic!("stream falhou: {message}");
     }
 }
 
@@ -264,5 +275,54 @@ async fn an_empty_truncated_answer_is_retried_instead_of_ending_the_turn_mute() 
             .any(|message| message.content == "pronto"),
         "o turno vazio deveria ser refeito, não encerrado: {:?}",
         session.messages
+    );
+}
+
+/// Três cortes seguidos esgotam os retries. O turno não pode terminar como se
+/// tivesse respondido: sem texto, sem erro, o usuário só vê o aviso e o
+/// processo para como se nada tivesse acontecido.
+#[tokio::test]
+async fn exhausted_truncation_retries_fail_the_turn_with_the_real_cause() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let providers = ProviderRegistry::new();
+    providers.register(Arc::new(Scripted::new(vec![
+        truncated_step(),
+        truncated_step(),
+        truncated_step(),
+    ])));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(CountingTool {
+        calls: Arc::clone(&calls),
+    }));
+
+    let events = EventBus::new(64);
+    let mut receiver = events.subscribe();
+    let app = App::with_tools(
+        providers,
+        "fake",
+        "modelo".to_string(),
+        events,
+        None,
+        tools,
+        String::new(),
+    )
+    .with_max_tokens(64);
+
+    let failure = run_turn_outcome(&app, &mut receiver).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "tool de resposta truncada nunca roda"
+    );
+    let message = failure.expect("retries esgotados precisam falhar, não encerrar mudo");
+    assert!(
+        message.contains("64"),
+        "a falha precisa nomear o teto: {message}"
+    );
+    assert!(
+        message.contains("cortada"),
+        "a falha precisa nomear a causa: {message}"
     );
 }

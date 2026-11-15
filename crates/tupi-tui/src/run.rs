@@ -90,8 +90,9 @@ pub async fn run_with_dashboard(
                                         .and_then(|selection| selected_text(&state, selection))
                                         .filter(|text| !text.is_empty())
                                     {
-                                        terminal.copy(&text)?;
-                                        state.notice = Some("copiado".to_string());
+                                        let route = terminal.copy(&text)?;
+                                        state.notice =
+                                            Some(crate::clipboard::copy_notice(route).to_string());
                                         continue;
                                     }
                                     break;
@@ -110,7 +111,7 @@ pub async fn run_with_dashboard(
                                             }
                                             None => {
                                                 state.notice = Some(
-                                                    "clipboard: nenhum leitor (instale wl-clipboard)"
+                                                    "clipboard: sem acesso (instale wl-clipboard)"
                                                         .to_string(),
                                                 )
                                             }

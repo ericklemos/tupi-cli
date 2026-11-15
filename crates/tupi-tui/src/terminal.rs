@@ -52,24 +52,29 @@ impl TerminalGuard {
         self.terminal.draw(render).map(|_| ())
     }
 
-    pub fn copy(&mut self, text: &str) -> io::Result<()> {
+    pub fn copy(&mut self, text: &str) -> io::Result<crate::clipboard::CopyRoute> {
         use std::io::Write;
 
+        if crate::clipboard::copy_to_system(text) {
+            return Ok(crate::clipboard::CopyRoute::Clipboard);
+        }
+
+        // Sem clipboard do sistema, o escape OSC 52 é a última rota. Vários
+        // terminais o ignoram, então a rota volta para quem chamou: o rodapé só
+        // anuncia "copiado" quando o sistema assumiu o conteúdo.
         let sequence = crate::clipboard::osc52(text);
-        let escaped = self
+        let written = self
             .terminal
             .backend_mut()
             .write_all(sequence.as_bytes())
             .and_then(|()| self.terminal.backend_mut().flush())
             .is_ok();
 
-        // OSC 52 é ignorado por vários terminais; o helper do sistema cobre
-        // esses casos. Se ao menos um caminho funcionou, a cópia valeu.
-        if crate::clipboard::copy_to_system(text) || escaped {
-            return Ok(());
+        if written {
+            Ok(crate::clipboard::CopyRoute::Terminal)
+        } else {
+            Err(io::Error::other("clipboard indisponível"))
         }
-
-        Err(io::Error::other("clipboard indisponível"))
     }
 }
 

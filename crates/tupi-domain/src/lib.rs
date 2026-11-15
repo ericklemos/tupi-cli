@@ -45,6 +45,9 @@ pub struct Message {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
+    /// Chain-of-thought devolvido pelo provedor em thinking mode. O DeepSeek
+    /// exige que ele volte no corpo da requisição quando há `tools`.
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -54,6 +57,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -77,6 +81,12 @@ impl Message {
             tool_call_id: Some(call_id.into()),
             ..Self::new(Role::Tool, content)
         }
+    }
+
+    /// Anexa o reasoning do provedor. Vazio é aceito mas não é enviado de volta.
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
     }
 }
 

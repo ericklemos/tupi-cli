@@ -408,6 +408,7 @@ impl Memory {
                     Ok(ProviderEvent::Text(text)) => out.push_str(&text),
                     Ok(ProviderEvent::Started)
                     | Ok(ProviderEvent::Finished(_))
+                    | Ok(ProviderEvent::Reasoning(_))
                     | Ok(ProviderEvent::ToolCalls(_))
                     | Ok(ProviderEvent::Usage { .. }) => {}
                     Err(_) => return None,
