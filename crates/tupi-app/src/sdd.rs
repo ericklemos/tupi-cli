@@ -1,5 +1,6 @@
 use tupi_domain::AgentMode;
-use tupi_store::{SddPlan, SddSubtaskStatus, SddTaskStatus};
+use tupi_tools::sdd::{SddPlan, SddSubtaskStatus, SddTaskStatus};
+pub const DOCS_AGENT_PREFIX: &str = "Você é o agente de documentação do Tupi. Leia o plano, consulte docs antes de escrever, só escreva sob docs_folders e responda uma conclusão curta.";
 
 pub const SDD_POSTURE_PROMPT: &str = r#"## Modo SDD (Planejamento)
 
@@ -90,8 +91,10 @@ pub fn format_execution_handoff(plan: &SddPlan) -> String {
         .ok()
         .and_then(|cwd| {
             std::fs::read_to_string(
-                cwd.join(".agents/tupi/sdd")
-                    .join(format!("{}.execution.md", plan.slug)),
+                cwd.join(".tupi")
+                    .join("sdd")
+                    .join(&plan.slug)
+                    .join("result.md"),
             )
             .ok()
         })

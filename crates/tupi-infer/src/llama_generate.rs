@@ -12,7 +12,7 @@ use crate::InferError;
 
 /// Gerador de texto curto servido por llama.cpp sobre o GGUF do LFM3.
 pub struct LlamaGenerator {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
     lock: Mutex<()>,
 }
@@ -22,9 +22,8 @@ impl LlamaGenerator {
         llama_cpp_2::send_logs_to_tracing(
             llama_cpp_2::LogOptions::default().with_logs_enabled(false),
         );
-        let backend =
-            LlamaBackend::init().map_err(|error| InferError::Unavailable(error.to_string()))?;
-        let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())
+        let backend = crate::backend::shared()?;
+        let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())
             .map_err(|error| InferError::Unavailable(error.to_string()))?;
         Ok(Self {
             backend,
@@ -41,9 +40,8 @@ impl LlamaGenerator {
         let mut context = self
             .model
             .new_context(
-                &self.backend,
-                LlamaContextParams::default()
-                    .with_n_ctx(std::num::NonZeroU32::new(2048)),
+                self.backend,
+                LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(2048)),
             )
             .map_err(|error| GenerateError::Inference(error.to_string()))?;
         let n_ctx = context.n_ctx() as usize;

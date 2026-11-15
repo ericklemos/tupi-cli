@@ -93,7 +93,10 @@ fn heading_at(lines: &[&str], i: usize) -> Option<(usize, String, usize)> {
 
 fn atx(line: &str) -> Option<(usize, String)> {
     let trimmed = line.trim_start();
-    let level = trimmed.chars().take_while(|character| *character == '#').count();
+    let level = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
     if level == 0 || level > 6 {
         return None;
     }
@@ -219,11 +222,7 @@ fn flush_chunk(
         return;
     }
     let start = current.iter().map(|piece| piece.start).min().unwrap_or(1);
-    let end = current
-        .iter()
-        .map(|piece| piece.end)
-        .max()
-        .unwrap_or(start);
+    let end = current.iter().map(|piece| piece.end).max().unwrap_or(start);
     let explicit = current.iter().any(|piece| piece.explicit);
     let text = if explicit || end > lines.len() {
         current
@@ -290,7 +289,11 @@ mod tests {
     }
 
     fn spec() -> ChunkSpec {
-        ChunkSpec { max_tokens: 50, target_tokens: 30, min_tokens: 5 }
+        ChunkSpec {
+            max_tokens: 50,
+            target_tokens: 30,
+            min_tokens: 5,
+        }
     }
 
     #[test]

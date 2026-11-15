@@ -120,8 +120,9 @@ mod tests {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return;
         };
-        let path = home
-            .join(".tupi/models/LiquidAI/LFM2.5-Embedding-350M-GGUF/LFM2.5-Embedding-350M-Q8_0.gguf");
+        let path = home.join(
+            ".tupi/models/LiquidAI/LFM2.5-Embedding-350M-GGUF/LFM2.5-Embedding-350M-Q8_0.gguf",
+        );
         if !path.exists() {
             return;
         }
@@ -140,12 +141,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requer o GGUF LFM3 verificado"]
     fn real_generation_model_produces_a_line() {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return;
         };
         let path = home.join(".tupi/models/LiquidAI/LFM3-1.7B-GGUF/LFM3-1.7B-Q4_K_M.gguf");
         if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if bytes != tupi_infer::LFM3_BYTES {
             return;
         }
         let generator = tupi_infer::LlamaGenerator::load(&path).expect("modelo carrega");

@@ -14,12 +14,32 @@ function badge(status, label) {
   node.textContent = label;
 }
 
-document.querySelectorAll("#tabs button").forEach((button) => {
-  button.addEventListener("click", () => {
-    document.querySelectorAll("#tabs button").forEach((item) => item.classList.remove("active"));
-    document.querySelectorAll("main .panel").forEach((item) => item.classList.remove("active"));
-    button.classList.add("active");
-    el("panel-" + button.dataset.tab).classList.add("active");
+const tabs = [...document.querySelectorAll('#tabs [role="tab"]')];
+
+function selectTab(tab, moveFocus = false) {
+  for (const item of tabs) {
+    const selected = item === tab;
+    item.classList.toggle("active", selected);
+    item.setAttribute("aria-selected", String(selected));
+    item.tabIndex = selected ? 0 : -1;
+    el("panel-" + item.dataset.tab).classList.toggle("active", selected);
+  }
+  if (moveFocus) tab.focus();
+}
+
+tabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => selectTab(tab));
+  tab.addEventListener("keydown", (event) => {
+    const last = tabs.length - 1;
+    const target = {
+      ArrowRight: tabs[index === last ? 0 : index + 1],
+      ArrowLeft: tabs[index === 0 ? last : index - 1],
+      Home: tabs[0],
+      End: tabs[last],
+    }[event.key];
+    if (!target) return;
+    event.preventDefault();
+    selectTab(target, true);
   });
 });
 

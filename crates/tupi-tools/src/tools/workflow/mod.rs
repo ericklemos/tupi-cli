@@ -116,6 +116,8 @@ pub(crate) struct WorkflowRon {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub agent: Option<String>,
     pub body: String,
 }
 
@@ -125,28 +127,32 @@ fn parse(
     path: Option<PathBuf>,
     source: WorkflowSource,
 ) -> Workflow {
-    let (name, description, body) = if let Ok(ron_parsed) = ron::from_str::<WorkflowRon>(text) {
-        let name = if !ron_parsed.name.trim().is_empty() {
-            ron_parsed.name
+    let (name, description, agent, body) =
+        if let Ok(ron_parsed) = ron::from_str::<WorkflowRon>(text) {
+            let name = if !ron_parsed.name.trim().is_empty() {
+                ron_parsed.name
+            } else {
+                default_name.to_string()
+            };
+            let desc = if !ron_parsed.description.trim().is_empty() {
+                ron_parsed.description
+            } else {
+                first_paragraph(&ron_parsed.body)
+            };
+            (name, desc, ron_parsed.agent, ron_parsed.body)
         } else {
-            default_name.to_string()
+            let (front_description, front_agent, body) = split_front_matter(text);
+            let desc = front_description
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| first_paragraph(&body));
+            (default_name.to_string(), desc, front_agent, body)
         };
-        let desc = if !ron_parsed.description.trim().is_empty() {
-            ron_parsed.description
-        } else {
-            first_paragraph(&ron_parsed.body)
-        };
-        (name, desc, ron_parsed.body)
-    } else {
-        let (front, body) = split_front_matter(text);
-        let desc = front
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| first_paragraph(&body));
-        (default_name.to_string(), desc, body)
-    };
+    let agent = agent
+        .or_else(|| matches!(&source, WorkflowSource::Native).then(|| "execution".to_string()));
     Workflow {
         name,
         description: truncate(&description, DESCRIPTION_CHARS),
+        agent,
         source,
         path,
         body,
@@ -154,28 +160,30 @@ fn parse(
     }
 }
 
-fn split_front_matter(text: &str) -> (Option<String>, String) {
+fn split_front_matter(text: &str) -> (Option<String>, Option<String>, String) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text
         .strip_prefix("---\r\n")
         .or_else(|| text.strip_prefix("---\n"))
     else {
-        return (None, text.to_string());
+        return (None, None, text.to_string());
     };
     let Some(end) = rest.find("\n---") else {
-        return (None, text.to_string());
+        return (None, None, text.to_string());
     };
     let head = &rest[..end];
     let body = rest[end..]
         .trim_start_matches("\n---")
         .trim_start_matches(['\r', '\n'])
         .to_string();
-    let description = head.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("description:")?.trim();
-        let value = value.trim_matches('"').trim();
-        (!value.is_empty()).then(|| value.to_string())
-    });
-    (description, body)
+    let extract = |key: &str| {
+        head.lines().find_map(|line| {
+            let value = line.trim().strip_prefix(key)?.trim();
+            let value = value.trim_matches('"').trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+    };
+    (extract("description:"), extract("agent:"), body)
 }
 
 fn first_paragraph(body: &str) -> String {
@@ -205,21 +213,56 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-pub fn prompt_section(workflows: &[Workflow]) -> String {
+fn docs_directive(root: &Path, folders: &[PathBuf]) -> Option<String> {
+    let first = folders.first()?;
+    let display = |folder: &Path| {
+        folder
+            .strip_prefix(root)
+            .unwrap_or(folder)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let list: Vec<String> = folders
+        .iter()
+        .map(|folder| format!("`{}`", display(folder)))
+        .collect();
+    let first_display = display(first);
+    let used = if folders.len() > 1 {
+        " (a primeira é a usada)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "Documentação de projeto produzida por `archivist`/`scribe` deve ser gravada em: {}{used}. \
+         Use `{first_display}/scribe/` para o scribe e `{first_display}/rules/` para o archivist. \
+         Não grave esses artefatos em `.agents/`.",
+        list.join(", ")
+    ))
+}
+
+pub fn prompt_section(workflows: &[Workflow], docs_folders: &[PathBuf], root: &Path) -> String {
     if workflows.is_empty() {
         return String::new();
     }
-    let names: Vec<&str> = workflows
+    let names: Vec<String> = workflows
         .iter()
-        .map(|workflow| workflow.name.as_str())
+        .map(|workflow| match &workflow.agent {
+            Some(agent) => format!("{} ({agent})", workflow.name),
+            None => workflow.name.clone(),
+        })
         .collect();
-    format!(
+    let mut section = format!(
         "## Workflows\n\n\
          Procedimentos prontos (nativo, global ou local). O usuário invoca com\n\
          `/workflows/<nome>`; a tool `workflow` lista as descrições\n\
          (`action=list`) e carrega os passos (`action=read`). Disponíveis: {}.",
         names.join(", ")
-    )
+    );
+    if let Some(directive) = docs_directive(root, docs_folders) {
+        section.push_str("\n\n");
+        section.push_str(&directive);
+    }
+    section
 }
 
 pub struct Catalog {
@@ -256,6 +299,7 @@ pub struct WorkflowTool {
     root_dir: PathBuf,
     store: Arc<ResponseStore>,
     default_budget_tokens: usize,
+    docs_folders: Vec<PathBuf>,
 }
 
 impl WorkflowTool {
@@ -264,7 +308,13 @@ impl WorkflowTool {
             root_dir,
             store,
             default_budget_tokens,
+            docs_folders: Vec::new(),
         }
+    }
+
+    pub fn with_docs_folders(mut self, docs_folders: Vec<PathBuf>) -> Self {
+        self.docs_folders = docs_folders;
+        self
     }
 }
 
@@ -310,6 +360,9 @@ impl Tool for WorkflowTool {
                         workflow.name,
                         workflow.source.as_str()
                     ));
+                    if let Some(agent) = &workflow.agent {
+                        body.push_str(&format!(" — agente: {agent}"));
+                    }
                     if !workflow.description.is_empty() {
                         body.push_str(&format!(": {}", workflow.description));
                     }
@@ -344,7 +397,14 @@ impl Tool for WorkflowTool {
                                 .collect();
                             body.push_str(&format!("> sombreia: {}\n", sources.join(", ")));
                         }
+                        if let Some(agent) = &workflow.agent {
+                            body.push_str(&format!("> agente: {agent}\n"));
+                        }
                         body.push('\n');
+                        if let Some(directive) = docs_directive(&self.root_dir, &self.docs_folders)
+                        {
+                            body.push_str(&format!("> documentação: {directive}\n\n"));
+                        }
                         body.push_str(workflow.body.trim());
                         body.push('\n');
                         (
@@ -451,26 +511,34 @@ mod tests {
         let root = dir.path();
         write(
             &root.join("global-agents"),
-            "review",
-            "review global .agents\n",
+            "sentinel",
+            "sentinel global .agents\n",
         );
-        write(&root.join("global-tupi"), "review", "review global .tupi\n");
+        write(
+            &root.join("global-tupi"),
+            "sentinel",
+            "sentinel global .tupi\n",
+        );
         write(
             &root.join("local-agents"),
-            "review",
-            "review local .agents\n",
+            "sentinel",
+            "sentinel local .agents\n",
         );
-        write(&root.join("local-tupi"), "review", "review local .tupi\n");
+        write(
+            &root.join("local-tupi"),
+            "sentinel",
+            "sentinel local .tupi\n",
+        );
 
         let workflows = catalog_with(root, &layers(root));
-        let review = workflows
+        let sentinel = workflows
             .iter()
-            .find(|workflow| workflow.name == "review")
+            .find(|workflow| workflow.name == "sentinel")
             .unwrap();
-        assert_eq!(review.source, WorkflowSource::LocalTupi);
-        assert_eq!(review.body.trim(), "review local .tupi");
+        assert_eq!(sentinel.source, WorkflowSource::LocalTupi);
+        assert_eq!(sentinel.body.trim(), "sentinel local .tupi");
         assert_eq!(
-            review.shadowed,
+            sentinel.shadowed,
             vec![
                 WorkflowSource::Native,
                 WorkflowSource::GlobalAgents,
@@ -484,18 +552,18 @@ mod tests {
     fn tupi_beats_agents_in_the_same_scope() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(&root.join("local-agents"), "feature", "dos agentes\n");
-        write(&root.join("local-tupi"), "feature", "do tupi\n");
+        write(&root.join("local-agents"), "skeptic", "dos agentes\n");
+        write(&root.join("local-tupi"), "skeptic", "do tupi\n");
 
         let workflows = catalog_with(root, &layers(root));
-        let feature = workflows
+        let skeptic = workflows
             .iter()
-            .find(|workflow| workflow.name == "feature")
+            .find(|workflow| workflow.name == "skeptic")
             .unwrap();
-        assert_eq!(feature.source, WorkflowSource::LocalTupi);
-        assert_eq!(feature.body.trim(), "do tupi");
+        assert_eq!(skeptic.source, WorkflowSource::LocalTupi);
+        assert_eq!(skeptic.body.trim(), "do tupi");
         assert_eq!(
-            feature.shadowed,
+            skeptic.shadowed,
             vec![WorkflowSource::Native, WorkflowSource::LocalAgents]
         );
     }
@@ -506,18 +574,18 @@ mod tests {
         let root = dir.path();
         write(
             &root.join("local-agents"),
-            "fix-bug",
+            "bughunter",
             "---\ndescription: meu fix\n---\n\ncorpo\n",
         );
 
         let workflows = catalog_with(root, &layers(root));
-        let fix = workflows
+        let bughunter = workflows
             .iter()
-            .find(|workflow| workflow.name == "fix-bug")
+            .find(|workflow| workflow.name == "bughunter")
             .unwrap();
-        assert_eq!(fix.source, WorkflowSource::LocalAgents);
-        assert_eq!(fix.description, "meu fix");
-        assert_eq!(fix.shadowed, vec![WorkflowSource::Native]);
+        assert_eq!(bughunter.source, WorkflowSource::LocalAgents);
+        assert_eq!(bughunter.description, "meu fix");
+        assert_eq!(bughunter.shadowed, vec![WorkflowSource::Native]);
     }
 
     #[test]
@@ -570,9 +638,10 @@ mod tests {
 
     #[test]
     fn a_windows_front_matter_is_understood() {
-        let (description, body) =
+        let (description, agent, body) =
             split_front_matter("---\r\ndescription: windows\r\n---\r\n\rcorpo");
         assert_eq!(description.as_deref(), Some("windows"));
+        assert_eq!(agent, None);
         assert_eq!(body, "corpo");
     }
 
@@ -597,7 +666,7 @@ mod tests {
 
         let list = call(&tool, serde_json::json!({"action": "list"})).unwrap();
         assert!(list.contains("`deploy` (local (.tupi)): sobe a versão"));
-        assert!(list.contains("`feature` (nativo)"));
+        assert!(list.contains("`bolt` (nativo)"));
 
         let read = call(
             &tool,
@@ -626,7 +695,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("NÃO"));
-        assert!(out.contains("`feature`"));
+        assert!(out.contains("`spark`"));
     }
 
     #[test]
@@ -655,9 +724,9 @@ mod tests {
     #[test]
     fn the_prompt_section_lists_names_without_bodies() {
         let workflows = catalog(Path::new("/nao/existe"));
-        let section = prompt_section(&workflows);
+        let section = prompt_section(&workflows, &[], Path::new("/projeto"));
         assert!(section.starts_with("## Workflows"));
-        assert!(section.contains("feature"));
+        assert!(section.contains("alchemist"));
         assert!(section.contains("skeptic"));
         assert!(!section.contains("impact_check"));
         assert!(!section.contains("falsificador"));
@@ -716,7 +785,116 @@ mod tests {
             );
             let ron = parsed.unwrap();
             assert_eq!(ron.name.as_str(), *name);
+            let agent = ron.agent.as_deref().unwrap_or_default();
+            assert!(
+                matches!(agent, "execution" | "sdd"),
+                "workflow nativo {name} precisa declarar agent (execution ou sdd); achei {agent:?}"
+            );
             assert!(!ron.body.trim().is_empty(), "corpo vazio em {name}");
         }
+    }
+
+    /// O catálogo que viaja no binário é contrato com três consumidores: o
+    /// prompt do sistema (via `prompt_section`), o autocomplete da TUI e os
+    /// testes de precedência. Um `.ron` removido ou renomeado em
+    /// `configs/workflows/` desaparece dos três em silêncio, então a lista de
+    /// nomes fica fixada aqui.
+    #[test]
+    fn the_shipped_catalog_is_exactly_the_agent_workflows() {
+        let names: Vec<&str> = NATIVE.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alchemist",
+                "archivist",
+                "artisan",
+                "bolt",
+                "bughunter",
+                "disco",
+                "gatekeeper",
+                "janitor",
+                "observer",
+                "optimizer",
+                "palette",
+                "scribe",
+                "sentinel",
+                "skeptic",
+                "solver",
+                "spark",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_prompt_section_lists_the_configured_docs_folders() {
+        let root = Path::new("/projeto");
+        let workflows = catalog(Path::new("/nao/existe"));
+        let folders = vec![PathBuf::from("/projeto/docs")];
+        let section = prompt_section(&workflows, &folders, root);
+        assert!(section.starts_with("## Workflows"));
+        assert!(section.contains("`docs`"));
+        assert!(section.contains("docs/scribe/"));
+        assert!(section.contains("docs/rules/"));
+    }
+
+    #[test]
+    fn the_prompt_section_marks_the_first_folder_as_the_used_one() {
+        let root = Path::new("/projeto");
+        let workflows = catalog(Path::new("/nao/existe"));
+        let folders = vec![
+            PathBuf::from("/projeto/docs"),
+            PathBuf::from("/projeto/wiki"),
+        ];
+        let section = prompt_section(&workflows, &folders, root);
+        assert!(section.contains("`docs`, `wiki` (a primeira é a usada)"));
+    }
+
+    #[test]
+    fn the_prompt_section_omits_the_docs_line_without_folders() {
+        let workflows = catalog(Path::new("/nao/existe"));
+        let section = prompt_section(&workflows, &[], Path::new("/projeto"));
+        assert!(!section.contains("docs/scribe/"));
+    }
+
+    #[test]
+    fn read_reports_the_configured_docs_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join(".tupi/workflows"),
+            "deploy",
+            "# Deploy\n\n1. suba\n",
+        );
+        let tool = tool(dir.path()).with_docs_folders(vec![dir.path().join("docs")]);
+
+        let read = call(
+            &tool,
+            serde_json::json!({"action": "read", "name": "deploy"}),
+        )
+        .unwrap();
+        assert!(read.contains("`docs`"));
+        assert!(read.contains("docs/scribe/"));
+        assert!(read.contains("docs/rules/"));
+    }
+
+    #[test]
+    fn scribe_writes_docs_under_the_configured_folders() {
+        let (_, body) = NATIVE
+            .iter()
+            .find(|(name, _)| *name == "scribe")
+            .expect("scribe viaja com o binário");
+        assert!(!body.contains(".agents/results/scribe"));
+        assert!(body.contains("docs_folders"));
+        assert!(body.contains("<docs_folder>/scribe/"));
+    }
+
+    #[test]
+    fn archivist_writes_rules_under_the_configured_folders() {
+        let (_, body) = NATIVE
+            .iter()
+            .find(|(name, _)| *name == "archivist")
+            .expect("archivist viaja com o binário");
+        assert!(!body.contains(".agents/rules"));
+        assert!(body.contains("docs_folders"));
+        assert!(body.contains("<docs_folder>/rules/"));
     }
 }

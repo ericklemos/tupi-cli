@@ -8,9 +8,9 @@ pub(crate) use support::{
 
 pub use tools::sdd;
 pub(crate) use tools::{
-    assert, context_graph, diff, edit, env, exec, facts, fetch, impact, map, patch, peek, read,
-    read_many, relocate, research, search, setup, shell, state, test_many, trace, websearch, why,
-    workflow, write, write_many,
+    assert, clock, context_graph, diff, edit, env, exec, facts, fetch, impact, map, patch, peek,
+    read, read_many, relocate, research, search, setup, shell, state, test_many, trace, websearch,
+    why, workflow, write, write_many,
 };
 
 pub use ast::{AstChunker, AstSnippet};
@@ -37,11 +37,13 @@ use std::time::Duration;
 use tupi_kernel::ToolRegistry;
 
 use crate::ledger::DeliveryLedger;
+pub use agent_tools::{DocsAgentOptions, register_docs_agent};
 pub use paths::repo_key;
 pub use sdd::{
     InMemorySddStore, SddPlan, SddPlanStatus, SddStore, SddSubtask, SddSubtaskStatus, SddTask,
     SddTaskStatus, SddTool,
 };
+pub use tools::docs::{DocsRefresh, DocsTool, DocsWrite};
 
 pub use agent_tools::{AgentToolsOptions, register_agent};
 #[derive(Clone)]
@@ -105,6 +107,47 @@ impl ToolsOptions {
 }
 
 /// Registra o catálogo de produção.
+/// Um símbolo extraído do repositório para o índice vetorial do spike `space`.
+pub struct CorpusItem {
+    pub relative: String,
+    pub symbol: String,
+    pub qualified: String,
+    pub signature: String,
+    pub code: String,
+}
+
+/// Extrai os símbolos de código do repositório inteiro.
+///
+/// Spike `space`: é a semente do indexador denso; não é API estável.
+pub fn symbol_corpus(root: &std::path::Path) -> std::io::Result<Vec<CorpusItem>> {
+    use std::collections::HashMap;
+
+    let graph = crate::graph::GraphCache::shared(root).get();
+    let mut contents: HashMap<String, String> = HashMap::new();
+    let mut items = Vec::new();
+    for def in graph.defs.iter() {
+        if def.is_test {
+            continue;
+        }
+        let content = contents.entry(def.relative.clone()).or_insert_with(|| {
+            std::fs::read_to_string(root.join(&def.relative)).unwrap_or_default()
+        });
+        let Some(code) =
+            crate::tools::docs::store::slice_lines(content, def.start_line, def.end_line)
+        else {
+            continue;
+        };
+        items.push(CorpusItem {
+            relative: def.relative.clone(),
+            symbol: def.name.clone(),
+            qualified: def.qualified.clone(),
+            signature: def.signature.clone(),
+            code,
+        });
+    }
+    Ok(items)
+}
+
 pub fn register(root_dir: std::path::PathBuf, registry: &mut ToolRegistry) {
     register_with(root_dir, registry, ToolsOptions::default());
 }
@@ -160,11 +203,10 @@ pub fn register_with(
         .with_graph_cache(graph.clone())
         .with_backtrack(backtrack),
     ));
-    registry.register(Arc::new(WorkflowTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
+    registry.register(Arc::new(
+        WorkflowTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
+            .with_docs_folders(options.docs_folders.clone()),
+    ));
     registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(EditTool::new(
             root_dir.clone(),
@@ -285,7 +327,8 @@ pub fn register_with(
         mode_cell,
         DEFAULT_BUDGET_TOKENS,
     )
-    .with_response_store(store.clone()).with_docs(!options.docs_folders.is_empty());
+    .with_response_store(store.clone())
+    .with_docs(!options.docs_folders.is_empty());
     sdd_tool.executor = options.sdd_executor.clone();
     registry.register(Arc::new(sdd_tool));
     if !options.docs_folders.is_empty() {
@@ -311,6 +354,7 @@ pub fn register_with(
         }
     };
     registry.register(Arc::new(state));
+    registry.register(Arc::new(crate::clock::ClockTool::new()));
     registry.register(Arc::new(crate::env::EnvTool::new()));
     registry.register(Arc::new(PeekTool::new(
         store.clone(),
@@ -353,7 +397,15 @@ mod agent_tools;
 /// `write`/`patch` ficam aqui porque `edit` só cobre símbolo Rust: sem eles
 /// `.md`, `.toml` e `.json` seriam somente leitura no modo exec.
 pub const CORE_TOOLS: &[&str] = &[
-    "edit", "exec", "map", "patch", "read", "read_many", "search", "write",
+    "clock",
+    "edit",
+    "exec",
+    "map",
+    "patch",
+    "read",
+    "read_many",
+    "search",
+    "write",
 ];
 
 /// Quais tools do catálogo ficam visíveis ao modelo.
@@ -523,7 +575,11 @@ mod tests {
         assert!(with.has("docs"));
 
         let mut without = tupi_kernel::ToolRegistry::new();
-        register_with(dir.path().to_path_buf(), &mut without, ToolsOptions::default());
+        register_with(
+            dir.path().to_path_buf(),
+            &mut without,
+            ToolsOptions::default(),
+        );
         assert!(!without.has("docs"));
     }
 

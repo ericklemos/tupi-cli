@@ -77,10 +77,7 @@ impl DocsIndex {
 
     pub fn refresh(&self, embedder: Option<&dyn Embedder>, max_embeds: usize) -> RefreshReport {
         let folders = self.relative_folders();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.loaded {
             state.index = store::load_index(&self.root_dir)
                 .filter(|index| index.schema == 1 && index.folders == folders)
@@ -100,7 +97,9 @@ impl DocsIndex {
         let _ = store::ensure_gitignore(&self.root_dir);
 
         let token_limit = embedder
-            .map_or(FALLBACK_MAX_TOKENS, |embedder| embedder.max_doc_tokens().min(HARD_MAX_TOKENS))
+            .map_or(FALLBACK_MAX_TOKENS, |embedder| {
+                embedder.max_doc_tokens().min(HARD_MAX_TOKENS)
+            })
             .max(1);
         let spec = ChunkSpec {
             max_tokens: token_limit,
@@ -108,7 +107,10 @@ impl DocsIndex {
             min_tokens: MIN_TOKENS.min(token_limit / 4).max(1),
         };
         let token_len = |text: &str| {
-            embedder.map_or_else(|| estimate_tokens(text), |embedder| embedder.token_len(text))
+            embedder.map_or_else(
+                || estimate_tokens(text),
+                |embedder| embedder.token_len(text),
+            )
         };
 
         let old: HashMap<String, FileEntry> = state
@@ -364,18 +366,23 @@ impl DocsIndex {
     }
 
     pub fn map_sections(&self, path: Option<&str>, max_files: usize) -> Vec<Section> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut body = format!(
             "- arquivos: {}\n- chunks: {}\n- pulados: {}",
             state.index.files.len(),
-            state.index.files.iter().map(|file| file.chunks.len()).sum::<usize>(),
+            state
+                .index
+                .files
+                .iter()
+                .map(|file| file.chunks.len())
+                .sum::<usize>(),
             state.index.skipped.len()
         );
         for skipped in &state.index.skipped {
-            body.push_str(&format!("\n- pulado: {} ({})", skipped.path, skipped.reason));
+            body.push_str(&format!(
+                "\n- pulado: {} ({})",
+                skipped.path, skipped.reason
+            ));
         }
         let mut sections = vec![Section {
             heading: "### docs — mapa".to_string(),
@@ -423,17 +430,15 @@ impl DocsIndex {
     }
 
     pub fn status_text(&self, report: &RefreshReport, embedder: Option<&dyn Embedder>) -> String {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let model = state
             .index
             .embedding
             .as_ref()
             .map(|meta| format!("{} ({} dims)", meta.model, meta.dim))
             .or_else(|| {
-                embedder.map(|embedder| format!("{} ({} dims)", embedder.model_id(), embedder.dim()))
+                embedder
+                    .map(|embedder| format!("{} ({} dims)", embedder.model_id(), embedder.dim()))
             })
             .unwrap_or_else(|| "nenhum (busca lexical)".to_string());
         let mut text = format!(
@@ -452,7 +457,12 @@ impl DocsIndex {
         );
         text.push_str(&format!(
             "\n- resumos: {} prontos, {} pendentes",
-            state.index.files.iter().filter(|file| file.summary.is_some()).count(),
+            state
+                .index
+                .files
+                .iter()
+                .filter(|file| file.summary.is_some())
+                .count(),
             state.pending.len()
         ));
         if let Some(error) = &report.error {
@@ -467,10 +477,7 @@ impl DocsIndex {
         start: Option<usize>,
         end: Option<usize>,
     ) -> Result<Option<String>, ToolError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if !state.index.files.iter().any(|file| file.path == path) {
             return Ok(None);
         }
@@ -483,7 +490,7 @@ impl DocsIndex {
         })
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn files_len(&self) -> usize {
         self.state
             .lock()
@@ -492,7 +499,7 @@ impl DocsIndex {
             .files
             .len()
     }
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn pending_summaries(&self) -> usize {
         self.state
             .lock()
@@ -501,7 +508,7 @@ impl DocsIndex {
             .len()
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn summaries_ready(&self) -> usize {
         self.state
             .lock()
@@ -520,17 +527,11 @@ impl DocsIndex {
         max_tokens: usize,
     ) -> Option<SummaryOutcome> {
         let path = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.pending.pop_front()?
         };
         let (hash, headings, excerpt) = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let file = state.index.files.iter().find(|file| file.path == path)?;
             if let Some(summary) = &file.summary {
                 return Some(SummaryOutcome {
@@ -562,10 +563,7 @@ impl DocsIndex {
         let current = std::fs::read(self.root_dir.join(&path))
             .map(|bytes| store::hash_hex(&bytes))
             .unwrap_or_default();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if current != hash {
             state.pending.push_back(path.clone());
             return Some(SummaryOutcome {
@@ -574,12 +572,7 @@ impl DocsIndex {
                 error: Some("arquivo mudou".to_string()),
             });
         }
-        if let Some(file) = state
-            .index
-            .files
-            .iter_mut()
-            .find(|file| file.path == path)
-        {
+        if let Some(file) = state.index.files.iter_mut().find(|file| file.path == path) {
             file.summary = summary.clone();
             let _ = store::save_index(&self.root_dir, &state.index);
         }
@@ -590,7 +583,7 @@ impl DocsIndex {
         })
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn chunks_len(&self) -> usize {
         self.state
             .lock()
@@ -602,10 +595,7 @@ impl DocsIndex {
             .sum()
     }
     pub fn lexical_hits(&self, query: &str, limit: usize) -> Vec<super::search::Hit> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         super::search::lexical(&state.index, query, limit)
     }
     pub fn query(
@@ -614,10 +604,7 @@ impl DocsIndex {
         limit: usize,
         embedder: Option<&dyn Embedder>,
     ) -> Vec<super::search::Hit> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let depth = 50.min(limit.max(1).saturating_mul(10));
         let lexical_hits = super::search::lexical(&state.index, text, depth);
         let Some(embedder) = embedder else {
@@ -635,11 +622,12 @@ impl DocsIndex {
         &self,
         hit: &super::search::Hit,
     ) -> Option<(String, usize, usize, String, blake3::Hash)> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let file = state.index.files.iter().find(|file| file.path == hit.path)?;
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let file = state
+            .index
+            .files
+            .iter()
+            .find(|file| file.path == hit.path)?;
         let chunk = file.chunks.get(hit.chunk)?;
         let full = std::fs::read_to_string(self.root_dir.join(&file.path)).ok()?;
         let text = store::slice_lines(&full, chunk.start, chunk.end)?;
@@ -689,7 +677,11 @@ mod tests {
     #[test]
     fn first_refresh_indexes_text_and_skips_binary_and_large() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "docs/guia.md", "# Guia\n\nA cobranca e mensal.\n");
+        write(
+            dir.path(),
+            "docs/guia.md",
+            "# Guia\n\nA cobranca e mensal.\n",
+        );
         write(dir.path(), "docs/bin.dat", "abc\0def");
         write(dir.path(), "docs/grande.md", &"x".repeat(2 * 1024 * 1024));
         let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("docs")]);
@@ -731,7 +723,10 @@ mod tests {
     #[test]
     fn missing_folder_is_reported_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let index = DocsIndex::new(dir.path().to_path_buf(), vec![dir.path().join("nao-existe")]);
+        let index = DocsIndex::new(
+            dir.path().to_path_buf(),
+            vec![dir.path().join("nao-existe")],
+        );
         let report = index.refresh(None, 0);
         assert_eq!(report.files, 0);
         assert!(report.error.is_none());
@@ -788,7 +783,9 @@ mod tests {
         index.refresh(None, 0);
         let generator = FakeGenerator::default();
 
-        let outcome = index.process_one_summary(&generator, 160, 64).expect("outcome");
+        let outcome = index
+            .process_one_summary(&generator, 160, 64)
+            .expect("outcome");
 
         assert_eq!(outcome.path, "docs/a.md");
         assert_eq!(outcome.summary.as_deref(), Some("Resumo de teste."));
@@ -817,7 +814,9 @@ mod tests {
             path: dir.path().join("docs/a.md"),
         };
 
-        let outcome = index.process_one_summary(&generator, 160, 64).expect("outcome");
+        let outcome = index
+            .process_one_summary(&generator, 160, 64)
+            .expect("outcome");
 
         assert!(outcome.summary.is_none());
         assert_eq!(index.summaries_ready(), 0);

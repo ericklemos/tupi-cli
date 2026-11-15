@@ -21,6 +21,10 @@ pub struct ModelConfig {
 pub struct ProjectConfig {
     /// Nome do projeto.
     pub name: String,
+    /// Língua da documentação. Ausente na leitura é preenchido a partir do
+    /// locale do sistema por `load_or_create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Lang>,
     /// Pastas com documentação do projeto, relativas ao root.
     ///
     /// Entradas vazias, absolutas ou com `..` são recusadas na carga.
@@ -35,6 +39,9 @@ pub struct ProjectConfig {
     pub dashboard_web_port: Option<u16>,
 }
 
+pub use crate::lang::Lang;
+/// Pasta de documentação padrão quando `docs_folders` está ausente ou vazio.
+const DEFAULT_DOCS_FOLDER: &str = "docs";
 impl ProjectConfig {
     /// Pastas de documentação resolvidas contra `root`, na ordem do arquivo.
     pub fn docs_folders(&self, root: &Path) -> Vec<PathBuf> {
@@ -137,12 +144,13 @@ impl ProjectConfig {
             serde_json::json!(context_window),
         );
 
-        let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(object)).map_err(
-            |source| ProjectConfigError::Serialize {
-                path: path.clone(),
-                source,
-            },
-        )?;
+        let mut text =
+            serde_json::to_string_pretty(&serde_json::Value::Object(object)).map_err(|source| {
+                ProjectConfigError::Serialize {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
         text.push('\n');
         std::fs::write(&path, text).map_err(|source| ProjectConfigError::Write { path, source })?;
         Ok(true)
@@ -183,6 +191,8 @@ pub enum ProjectConfigError {
         "docs_folders inválido em {path}: {entry:?} precisa ser um caminho relativo ao root, não vazio e sem `..`"
     )]
     InvalidDocsFolder { path: PathBuf, entry: String },
+    #[error("lang inválido em {path}: {value:?} precisa ser `pt-BR` ou `en`")]
+    InvalidLang { path: PathBuf, value: String },
 }
 
 pub fn project_path(root: &Path) -> PathBuf {
@@ -227,11 +237,34 @@ pub fn parse_project(text: &str, path: &Path) -> Result<ProjectConfig, ProjectCo
                 folders.push(normalized);
             }
         }
+        // Lista ausente ou vazia usa o default do projeto: `docs/`.
+        if folders.is_empty() {
+            return Ok(vec![DEFAULT_DOCS_FOLDER.to_string()]);
+        }
         Ok(folders)
     }
 
-    let parsed: ProjectConfig =
+    let value: serde_json::Value =
         serde_json::from_str(text).map_err(|source| ProjectConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // `lang` é validado aqui, e não pelo serde, para o erro carregar o caminho
+    // do arquivo e o valor recusado, como em `docs_folders`.
+    if let Some(raw) = value.get("lang").filter(|raw| !raw.is_null()) {
+        let raw = match raw {
+            serde_json::Value::String(raw) => raw.clone(),
+            other => other.to_string(),
+        };
+        if Lang::parse(&raw).is_none() {
+            return Err(ProjectConfigError::InvalidLang {
+                path: path.to_path_buf(),
+                value: raw,
+            });
+        }
+    }
+    let parsed: ProjectConfig =
+        serde_json::from_value(value).map_err(|source| ProjectConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
@@ -257,7 +290,7 @@ pub fn read_project(root: &Path) -> Result<ProjectConfig, ProjectConfigError> {
 pub fn load_or_create(root: &Path) -> ProjectConfig {
     let path = project_path(root);
     match read_project(root) {
-        Ok(config) => config,
+        Ok(config) => crate::lang::record(&path, config),
         Err(ProjectConfigError::Read { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -281,7 +314,8 @@ pub fn load_or_create(root: &Path) -> ProjectConfig {
 fn fallback(root: &Path) -> ProjectConfig {
     ProjectConfig {
         name: fallback_name(root),
-        docs_folders: Vec::new(),
+        lang: Some(Lang::from_system()),
+        docs_folders: vec![DEFAULT_DOCS_FOLDER.to_string()],
         models: Default::default(),
         dashboard_web_port: None,
     }
@@ -322,6 +356,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = load_or_create(dir.path());
         assert_eq!(config.name, folder(dir.path()));
+        assert_eq!(config.docs_folders, vec!["docs".to_string()]);
+        assert_eq!(config.lang, Some(Lang::from_system()));
         let text = std::fs::read_to_string(project_path(dir.path())).unwrap();
         assert_eq!(
             text,
@@ -338,7 +374,10 @@ mod tests {
         let text = std::fs::read_to_string(project_path(dir.path())).unwrap();
         assert!(text.ends_with('\n'));
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["models"][key]["context_window"], serde_json::json!(4096));
+        assert_eq!(
+            value["models"][key]["context_window"],
+            serde_json::json!(4096)
+        );
 
         let config = read_project(dir.path()).unwrap();
         assert_eq!(config.name, folder(dir.path()));
@@ -395,9 +434,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         // Valor já preenchido pelo usuário nunca é sobrescrito.
-        assert!(
-            !ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096).unwrap()
-        );
+        assert!(!ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
         // Janela zero desliga a poda: não cria entrada nenhuma.
@@ -414,7 +451,10 @@ mod tests {
             assert_eq!(ProjectConfig::model_key(provider, model), None);
             let key = ProjectConfig::model_key(provider, model).unwrap_or_default();
             assert!(!ProjectConfig::record_model_window(dir.path(), &key, 4096).unwrap());
-            assert!(!path.exists(), "chave vazia não pode criar nem tocar o arquivo");
+            assert!(
+                !path.exists(),
+                "chave vazia não pode criar nem tocar o arquivo"
+            );
         }
 
         assert_eq!(
@@ -427,11 +467,11 @@ mod tests {
     fn an_existing_file_wins() {
         let dir = tempdir().unwrap();
         let path = project_path(dir.path());
-        std::fs::write(&path, r#"{"name":"outro"}"#).unwrap();
+        std::fs::write(&path, r#"{"name":"outro","lang":"en"}"#).unwrap();
         assert_eq!(load_or_create(dir.path()).name, "outro");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            r#"{"name":"outro"}"#
+            r#"{"name":"outro","lang":"en"}"#
         );
     }
 

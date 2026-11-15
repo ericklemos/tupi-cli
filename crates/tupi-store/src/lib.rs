@@ -324,8 +324,6 @@ impl Store {
                     .map_err(|error| StoreError::Table(error.to_string()))?;
                 tx.open_table(PROVIDERS)
                     .map_err(|error| StoreError::Table(error.to_string()))?;
-                tx.open_table(SDD_PLANS)
-                    .map_err(|error| StoreError::Table(error.to_string()))?;
             }
 
             tx.commit()

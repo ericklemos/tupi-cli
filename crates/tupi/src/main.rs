@@ -8,9 +8,11 @@ use tupi_tui::run::BusSet;
 
 mod agents_config;
 mod config;
+mod docs_scaffold;
+mod lang;
 mod project_config;
 mod prompt_config;
-mod sdd_store;
+mod startup;
 mod tool_config;
 
 #[tokio::main]
@@ -22,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         root: std::path::PathBuf,
         events: tupi_kernel::EventBus,
         agent_tools: std::sync::Arc<dyn Fn() -> tupi_kernel::ToolRegistry + Send + Sync>,
+        docs_agent: Option<tupi_app::sdd_run::DocsAgentFactory>,
         max_parallel: usize,
         agent_max_steps: usize,
         agent_timeout: std::time::Duration,
@@ -36,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
                 repo_key: self.repo_key.clone(),
                 tools: (self.agent_tools)(),
                 agent_tools: self.agent_tools.clone(),
+                docs_agent: self.docs_agent.clone(),
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 agent_prefix: tupi_app::sdd_api::AGENT_PREFIX.to_string(),
@@ -50,21 +54,12 @@ async fn main() -> anyhow::Result<()> {
             };
             let outcome = tokio::runtime::Handle::current()
                 .block_on(tupi_app::sdd_api::execute(request, &plan.slug));
-            write_report(&self.root, &plan.slug, &outcome.report);
             if outcome.ok {
                 Ok(outcome.report)
             } else {
                 Err(outcome.report)
             }
         }
-    }
-
-    fn write_report(root: &std::path::Path, slug: &str, report: &str) {
-        let dir = root.join(".agents/tupi/sdd");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let _ = std::fs::write(dir.join(format!("{slug}.execution.md")), report);
     }
 
     fn setting_usize(store: &tupi_store::Store, key: &str, default: usize) -> usize {
@@ -166,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
 
     let root = tool_root()?;
     let root_label = root.display().to_string();
-    let project = project_config::load_or_create(&root);
+    let project = startup::load_project_with_docs(&root);
     tracing::debug!(
         name = %project.name,
         models = project.models.len(),
@@ -231,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
     let prefix = tupi_app::prompt::compose(&prompt.system);
     let available = tupi_tools::catalog(&root);
     tracing::debug!(count = available.len(), "workflows disponíveis");
-    let workflows_section = tupi_tools::prompt_section(&available);
+    let workflows_section = tupi_tools::prompt_section(&available, &docs_folders, &root);
     let agents_section = agents_config::load_agents_section(&root);
     tracing::debug!(
         path = %agents_config::agents_path(&root).display(),
@@ -248,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let repo_key = tupi_tools::repo_key(&root);
     let sdd_store_for_tools: std::sync::Arc<dyn tupi_tools::sdd::SddStore> =
-        std::sync::Arc::new(sdd_store::RedbSddStore::new(std::sync::Arc::clone(&store)));
+        std::sync::Arc::new(tupi_tools::sdd::FsSddStore::new(root.clone()));
     let agent_root = root.clone();
     let agent_tools = std::sync::Arc::new(move || {
         let mut registry = tupi_kernel::ToolRegistry::new();
@@ -268,29 +263,6 @@ async fn main() -> anyhow::Result<()> {
     let mut tool_options = tupi_tools::ToolsOptions::default();
     tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
-    if auto_execute {
-        if let Some(provider_impl) = registry.get(&provider) {
-            let executor = std::sync::Arc::new(AgentExecutor {
-                store: sdd_store_for_tools,
-                provider: provider_impl,
-                model: model.clone(),
-                root: root.clone(),
-                events: events.clone(),
-                agent_tools,
-                max_parallel: setting_usize(&store, "sdd.max_parallel", 4),
-                agent_max_steps: setting_usize(&store, "sdd.agent_max_steps", 24),
-                agent_timeout: std::time::Duration::from_secs(setting_usize(
-                    &store,
-                    "sdd.agent_timeout_seconds",
-                    600,
-                ) as u64),
-                repo_key: repo_key.clone(),
-            });
-            tool_options.sdd_executor = Some(std::sync::Arc::new(
-                move |plan: &tupi_tools::sdd::SddPlan| executor.run(plan),
-            ));
-        }
-    }
     tool_options.docs_folders = docs_folders.clone();
     let embedder_slot = std::sync::Arc::new(tupi_kernel::embed::EmbedderSlot::empty());
     if config::docs_embedding_enabled(
@@ -314,8 +286,7 @@ async fn main() -> anyhow::Result<()> {
         &docs_folders,
         std::env::var("TUPI_RAG_SUMMARIES").ok().as_deref(),
     ) {
-        let generator_slot =
-            std::sync::Arc::new(tupi_kernel::generate::GeneratorSlot::empty());
+        let generator_slot = std::sync::Arc::new(tupi_kernel::generate::GeneratorSlot::empty());
         let slot = std::sync::Arc::clone(&generator_slot);
         let base = data_dir(|key| std::env::var(key).ok());
         tokio::spawn(async move {
@@ -331,6 +302,52 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tool_options.generator = None;
     }
+    let docs_embedder = tool_options.embedder.clone();
+    let docs_generator = tool_options.generator.clone();
+    let docs_agent: Option<tupi_app::sdd_run::DocsAgentFactory> = if docs_folders.is_empty() {
+        None
+    } else {
+        let root = root.clone();
+        let folders = docs_folders.clone();
+        Some(std::sync::Arc::new(move || {
+            let mut registry = tupi_kernel::ToolRegistry::new();
+            let docs = tupi_tools::register_docs_agent(
+                root.clone(),
+                &mut registry,
+                tupi_tools::DocsAgentOptions {
+                    docs_folders: folders.clone(),
+                    embedder: docs_embedder.clone(),
+                    generator: docs_generator.clone(),
+                },
+            );
+            (registry, docs)
+        }) as tupi_app::sdd_run::DocsAgentFactory)
+    };
+    if auto_execute {
+        if let Some(provider_impl) = registry.get(&provider) {
+            let executor = std::sync::Arc::new(AgentExecutor {
+                store: sdd_store_for_tools.clone(),
+                provider: provider_impl,
+                model: model.clone(),
+                root: root.clone(),
+                events: events.clone(),
+                agent_tools,
+                docs_agent: docs_agent.clone(),
+                max_parallel: setting_usize(&store, "sdd.max_parallel", 4),
+                agent_max_steps: setting_usize(&store, "sdd.agent_max_steps", 24),
+                agent_timeout: std::time::Duration::from_secs(setting_usize(
+                    &store,
+                    "sdd.agent_timeout_seconds",
+                    600,
+                ) as u64),
+                repo_key: repo_key.clone(),
+            });
+            tool_options.sdd_executor = Some(std::sync::Arc::new(
+                move |plan: &tupi_tools::sdd::SddPlan| executor.run(plan),
+            ));
+        }
+    }
+
     tupi_tools::register_exposed_with(
         root.clone(),
         &mut tools,
@@ -391,7 +408,10 @@ async fn main() -> anyhow::Result<()> {
     .with_context_recent_results(context_limits.recent_results)
     .with_context_profile(context_profile)
     .with_debug_dir(debug_dir);
-    let app = app.with_repo_key(repo_key).with_mode_cell(mode_cell);
+    let app = app
+        .with_repo_key(repo_key)
+        .with_mode_cell(mode_cell)
+        .with_sdd_store(sdd_store_for_tools.clone());
     let app = app.with_workflows(workflows);
     let app = app.with_memory(root.clone());
 

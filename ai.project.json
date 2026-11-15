@@ -1,5 +1,6 @@
 {
   "name": "tupi-cli",
+  "lang": "pt-br",
   "dashboard_web_port": 7788,
   "docs_folders": [
     "./docs"

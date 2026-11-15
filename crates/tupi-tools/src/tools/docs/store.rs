@@ -92,16 +92,14 @@ fn vector_path(root: &Path, path: &str) -> PathBuf {
     index_dir(root).join("vectors").join(format!("{name}.vec"))
 }
 
-pub fn load_vectors(
-    root: &Path,
-    path: &str,
-) -> std::io::Result<Option<(usize, Vec<Vec<f32>>)>> {
+pub fn load_vectors(root: &Path, path: &str) -> std::io::Result<Option<(usize, Vec<Vec<f32>>)>> {
     let bytes = match std::fs::read(vector_path(root, path)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "blob de vetores inválido");
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "blob de vetores inválido");
     if bytes.len() < 12 || &bytes[0..4] != VECTOR_MAGIC {
         return Err(invalid());
     }
@@ -217,8 +215,16 @@ mod tests {
     #[test]
     fn vector_blob_round_trips_with_dim_and_count() {
         let dir = tempfile::tempdir().unwrap();
-        save_vectors(dir.path(), "docs/a.md", 3, &[vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]).unwrap();
-        let (dim, vectors) = load_vectors(dir.path(), "docs/a.md").unwrap().expect("blob");
+        save_vectors(
+            dir.path(),
+            "docs/a.md",
+            3,
+            &[vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+        )
+        .unwrap();
+        let (dim, vectors) = load_vectors(dir.path(), "docs/a.md")
+            .unwrap()
+            .expect("blob");
         assert_eq!(dim, 3);
         assert_eq!(vectors.len(), 2);
         assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);

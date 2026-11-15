@@ -150,8 +150,80 @@ pub fn register_agent(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
+    registry.register(Arc::new(crate::clock::ClockTool::new()));
     registry.register(Arc::new(crate::peek::PeekTool::new(
         store,
         DEFAULT_BUDGET_TOKENS,
     )));
+}
+pub struct DocsAgentOptions {
+    pub docs_folders: Vec<std::path::PathBuf>,
+    pub embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
+    pub generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
+}
+
+pub fn register_docs_agent(
+    root_dir: std::path::PathBuf,
+    registry: &mut ToolRegistry,
+    options: DocsAgentOptions,
+) -> Arc<crate::tools::docs::DocsTool> {
+    let store = Arc::new(ResponseStore::new(
+        Duration::from_secs(600),
+        8 * 1024 * 1024,
+    ));
+    let ledger = Arc::new(DeliveryLedger::new(
+        crate::ledger::DEFAULT_ENTRIES,
+        crate::ledger::DEFAULT_MAX_BYTES,
+    ));
+    let parse_cache = Arc::new(ParseCache::new());
+    let graph = GraphCache::shared_with_parse_cache(&root_dir, parse_cache.clone());
+    let backtrack = Arc::new(BacktrackGraph::default());
+    let read = Arc::new(
+        crate::read::ReadTool::new(
+            root_dir.clone(),
+            store.clone(),
+            ledger.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_parse_cache(parse_cache.clone())
+        .with_graph_cache(graph.clone())
+        .with_backtrack(backtrack.clone()),
+    );
+
+    registry.register(read.clone());
+    registry.register(Arc::new(crate::read_many::ReadManyTool::new(read)));
+    registry.register(Arc::new(
+        crate::search::SearchTool::new(
+            root_dir.clone(),
+            store.clone(),
+            ledger.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_parse_cache(parse_cache)
+        .with_graph_cache(graph.clone())
+        .with_backtrack(backtrack),
+    ));
+    registry.register(Arc::new(crate::map::MapTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    registry.register(Arc::new(crate::peek::PeekTool::new(
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
+    let docs = Arc::new(
+        crate::tools::docs::DocsTool::new(
+            root_dir,
+            options.docs_folders,
+            store,
+            ledger,
+            options.embedder,
+            options.generator,
+            DEFAULT_BUDGET_TOKENS,
+        )
+        .with_write(true),
+    );
+    registry.register(docs.clone());
+    docs
 }

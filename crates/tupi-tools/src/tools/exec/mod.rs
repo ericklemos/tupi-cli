@@ -84,6 +84,7 @@ impl ExecParams {
 struct Cached {
     key: String,
     output: Output,
+    at: std::time::Instant,
 }
 
 pub struct ExecTool {
@@ -178,26 +179,27 @@ impl Tool for ExecTool {
                 .unwrap()
                 .clone()
                 .filter(|entry| &entry.key == key)
-                .map(|entry| entry.output)
+                .map(|entry| (entry.output, Some(entry.at.elapsed())))
         } else {
             None
         };
 
-        let (output, from_cache) = match cached {
-            Some(output) => (output, true),
+        let (output, age) = match cached {
+            Some(hit) => hit,
             None => {
                 let output = execute(&root, &params, timeout_for(&params))?;
                 if let Some(key) = key {
                     *self.cache.lock().unwrap() = Some(Cached {
                         key,
                         output: output.clone(),
+                        at: std::time::Instant::now(),
                     });
                 }
-                (output, false)
+                (output, None)
             }
         };
 
-        let sections = sections_for(&args, &output, from_cache);
+        let sections = sections_for(&args, &output, age);
         let budget_tokens = params.budget_tokens.unwrap_or(self.default_budget_tokens);
         Ok(finish(&self.store, sections, budget_tokens))
     }

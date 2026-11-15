@@ -62,9 +62,8 @@ pub fn lexical(index: &Index, query: &str, limit: usize) -> Vec<Hit> {
             let idf = ((count - df + 0.5) / (df + 0.5) + 1.0).ln();
             let tf = tf as f32;
             let length = chunk.tokens as f32;
-            let mut part = idf
-                * (tf * (k1 + 1.0))
-                / (tf + k1 * (1.0 - b + b * length / average.max(1.0)));
+            let mut part =
+                idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * length / average.max(1.0)));
             if normalize(&chunk.heading).contains(term) {
                 part *= 2.0;
             }
@@ -136,14 +135,10 @@ pub fn dense(
 pub fn fuse(lexical: Vec<Hit>, dense: Vec<Hit>, k: f32, limit: usize) -> Vec<Hit> {
     let mut scores: HashMap<(String, usize), f32> = HashMap::new();
     for (rank, hit) in lexical.into_iter().enumerate() {
-        *scores
-            .entry((hit.path, hit.chunk))
-            .or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
+        *scores.entry((hit.path, hit.chunk)).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
     }
     for (rank, hit) in dense.into_iter().enumerate() {
-        *scores
-            .entry((hit.path, hit.chunk))
-            .or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
+        *scores.entry((hit.path, hit.chunk)).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
     }
     let mut hits: Vec<Hit> = scores
         .into_iter()
@@ -164,11 +159,11 @@ pub fn fuse(lexical: Vec<Hit>, dense: Vec<Hit>, k: f32, limit: usize) -> Vec<Hit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use crate::tools::docs::test_support::FakeEmbedder;
-    use tupi_kernel::embed::Embedder;
     use crate::tools::docs::store::{ChunkMeta, FileEntry, Index, hash_hex};
     use crate::tools::docs::terms::terms;
+    use crate::tools::docs::test_support::FakeEmbedder;
+    use std::collections::HashMap;
+    use tupi_kernel::embed::Embedder;
 
     fn file_with_chunk(path: &str, text: &str, heading: &str) -> FileEntry {
         FileEntry {
@@ -211,8 +206,16 @@ mod tests {
     #[test]
     fn dense_finds_a_chunk_without_the_query_word() {
         let mut index = Index::empty(vec!["docs".to_string()]);
-        index.files.push(file_with_chunk("docs/a.md", "O automovel e novo.", "Texto > Frota"));
-        index.files.push(file_with_chunk("docs/b.md", "O contrato vence.", "Texto > Juridico"));
+        index.files.push(file_with_chunk(
+            "docs/a.md",
+            "O automovel e novo.",
+            "Texto > Frota",
+        ));
+        index.files.push(file_with_chunk(
+            "docs/b.md",
+            "O contrato vence.",
+            "Texto > Juridico",
+        ));
         let query = FakeEmbedder::default().embed_query("carro").unwrap();
         let vectors = HashMap::from([("docs/a.md".to_string(), vec![query.clone()])]);
         let hits = dense(&index, &vectors, &query, 5);
@@ -221,8 +224,16 @@ mod tests {
 
     #[test]
     fn rrf_keeps_both_lists_without_score_calibration() {
-        let a = Hit { path: "docs/a.md".into(), chunk: 0, score: 100.0 };
-        let b = Hit { path: "docs/b.md".into(), chunk: 0, score: 1.0 };
+        let a = Hit {
+            path: "docs/a.md".into(),
+            chunk: 0,
+            score: 100.0,
+        };
+        let b = Hit {
+            path: "docs/b.md".into(),
+            chunk: 0,
+            score: 1.0,
+        };
         let fused = fuse(vec![a], vec![b], 60.0, 2);
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].path, "docs/a.md");
@@ -233,12 +244,19 @@ mod tests {
         let embedder = FakeEmbedder::default();
         let text = "palavra ".repeat(40);
         assert!(embedder.token_len(&text) > embedder.max_query_tokens());
-        assert_eq!(embedder.truncate_query(&text).split_whitespace().count(), 32);
+        assert_eq!(
+            embedder.truncate_query(&text).split_whitespace().count(),
+            32
+        );
     }
 
     #[test]
     fn hybrid_keeps_lexical_results_when_dense_is_empty() {
-        let hit = Hit { path: "docs/a.md".into(), chunk: 0, score: 2.0 };
+        let hit = Hit {
+            path: "docs/a.md".into(),
+            chunk: 0,
+            score: 2.0,
+        };
         let fused = fuse(vec![hit], Vec::new(), 60.0, 5);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].path, "docs/a.md");

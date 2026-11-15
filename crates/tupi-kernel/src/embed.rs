@@ -51,10 +51,7 @@ impl EmbedderSlot {
     }
 
     pub fn set(&self, embedder: Arc<dyn Embedder>) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(embedder);
+        *self.0.write().unwrap_or_else(|error| error.into_inner()) = Some(embedder);
     }
 }
 
@@ -66,11 +63,21 @@ mod tests {
     fn slot_starts_empty_and_accepts_one_embedder() {
         struct Fake;
         impl Embedder for Fake {
-            fn model_id(&self) -> &str { "fake" }
-            fn dim(&self) -> usize { 2 }
-            fn max_doc_tokens(&self) -> usize { 8 }
-            fn max_query_tokens(&self) -> usize { 4 }
-            fn token_len(&self, text: &str) -> usize { text.split_whitespace().count() }
+            fn model_id(&self) -> &str {
+                "fake"
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+            fn max_doc_tokens(&self) -> usize {
+                8
+            }
+            fn max_query_tokens(&self) -> usize {
+                4
+            }
+            fn token_len(&self, text: &str) -> usize {
+                text.split_whitespace().count()
+            }
             fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
                 Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
             }

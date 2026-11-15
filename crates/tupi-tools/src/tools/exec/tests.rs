@@ -85,7 +85,7 @@ fn a_successful_output_has_no_detail_section() {
         duration: Duration::from_millis(10),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, false);
+    let sections = sections_for(&args, &raw, None);
     assert_eq!(sections.len(), 1);
     assert!(sections[0].body.contains("ok"));
 }
@@ -100,7 +100,7 @@ fn a_failure_carries_the_detail() {
         duration: Duration::from_millis(10),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, false);
+    let sections = sections_for(&args, &raw, None);
     assert_eq!(sections.len(), 1);
     assert!(sections[0].body.contains("mismatched types"));
 }
@@ -129,6 +129,68 @@ fn fingerprint_refuses_to_cache_when_file_count_exceeds_limit() {
 }
 
 #[test]
+fn fingerprint_follows_content_when_length_and_mtime_are_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rs");
+    std::fs::write(&path, "fn a() {}").unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+    let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    std::fs::write(&path, "fn b() {}").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 9);
+    assert_ne!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[test]
+fn fingerprint_covers_hidden_build_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
+    let config = dir.path().join(".cargo/config.toml");
+    std::fs::write(&config, "[build]\nrustflags = [\"--cfg\", \"a\"]\n").unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+
+    std::fs::write(&config, "[build]\nrustflags = [\"--cfg\", \"b\"]\n").unwrap();
+
+    assert_ne!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[test]
+fn fingerprint_covers_fixtures_outside_the_source_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("case.json");
+    std::fs::write(&fixture, "{\"ok\":true}").unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+
+    std::fs::write(&fixture, "{\"ok\":false}").unwrap();
+
+    assert_ne!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[test]
+fn a_cache_hit_reports_its_age_instead_of_the_original_runtime() {
+    let raw = Output {
+        stdout: String::new(),
+        stderr: String::new(),
+        success: true,
+        timed_out: false,
+        duration: Duration::from_millis(3_400),
+    };
+    let args = build_args(&params(ExecKind::Check)).unwrap();
+    let sections = sections_for(&args, &raw, Some(Duration::from_secs(125)));
+
+    let body = &sections[0].body;
+    assert!(body.contains("em cache há 2m5s"), "{body}");
+    assert!(body.contains("execução original: 3.4s"), "{body}");
+}
+
+#[test]
 fn every_compiler_error_reaches_the_model() {
     let mut stderr = String::new();
     for index in 0..40 {
@@ -144,7 +206,7 @@ fn every_compiler_error_reaches_the_model() {
         duration: Duration::from_millis(1),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, false);
+    let sections = sections_for(&args, &raw, None);
     let important: String = sections
         .iter()
         .filter(|section| section.priority >= 200)
@@ -158,4 +220,59 @@ fn every_compiler_error_reaches_the_model() {
             "erro {code} não chegou ao modelo"
         );
     }
+}
+
+#[test]
+fn fingerprint_covers_files_the_gitignore_hides() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "*.json\n").unwrap();
+    let fixture = dir.path().join("case.json");
+    std::fs::write(&fixture, "{\"ok\":true}").unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+
+    std::fs::write(&fixture, "{\"ok\":false}").unwrap();
+
+    assert_ne!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn fingerprint_follows_a_directory_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("lib.rs");
+    std::fs::write(&source, "fn a() {}").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("vendored")).unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+
+    std::fs::write(&source, "fn b() {}").unwrap();
+
+    assert_ne!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[test]
+fn fingerprint_ignores_the_agents_own_bookkeeping() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+    let state = dir.path().join(".agents").join("tupi");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("facts.jsonl"), "{\"id\":1}\n").unwrap();
+    let before = fingerprint(dir.path(), 10).unwrap();
+
+    std::fs::write(state.join("facts.jsonl"), "{\"id\":2}\n").unwrap();
+
+    assert_eq!(fingerprint(dir.path(), 10).unwrap(), before);
+}
+
+#[test]
+fn fingerprint_changes_when_the_build_environment_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+
+    let plain = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=\n").unwrap();
+    let flagged = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=--cfg a\n").unwrap();
+    let again = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=\n").unwrap();
+
+    assert_ne!(flagged, plain);
+    assert_eq!(again, plain);
 }

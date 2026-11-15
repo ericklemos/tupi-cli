@@ -3,15 +3,15 @@ use std::sync::Mutex;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::params::LlamaModelParams;
 use tupi_kernel::embed::{EmbedError, Embedder};
 
 use crate::InferError;
 
 /// Embedder denso servido por llama.cpp sobre o GGUF do LFM2.5.
 pub struct LlamaEmbedder {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
     lock: Mutex<()>,
 }
@@ -25,9 +25,8 @@ impl LlamaEmbedder {
         llama_cpp_2::send_logs_to_tracing(
             llama_cpp_2::LogOptions::default().with_logs_enabled(false),
         );
-        let backend =
-            LlamaBackend::init().map_err(|error| InferError::Unavailable(error.to_string()))?;
-        let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())
+        let backend = crate::backend::shared()?;
+        let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())
             .map_err(|error| InferError::Unavailable(error.to_string()))?;
         Ok(Self {
             backend,
@@ -45,7 +44,7 @@ impl LlamaEmbedder {
         let mut context = self
             .model
             .new_context(
-                &self.backend,
+                self.backend,
                 LlamaContextParams::default()
                     .with_embeddings(true)
                     .with_n_ctx(std::num::NonZeroU32::new(2048)),
@@ -99,7 +98,10 @@ impl Embedder for LlamaEmbedder {
     }
 
     fn token_len(&self, text: &str) -> usize {
-        self.model.vocab().tokenize(text.as_bytes(), false, true).len()
+        self.model
+            .vocab()
+            .tokenize(text.as_bytes(), false, true)
+            .len()
     }
 
     fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {

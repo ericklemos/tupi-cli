@@ -49,6 +49,7 @@ mod tests {
             workflows: vec![Workflow {
                 name: "review".into(),
                 description: String::new(),
+                agent: None,
                 source: WorkflowSource::Native,
                 path: None,
                 body: "# Review\n".into(),

@@ -109,12 +109,17 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
 }
 
 /// Tudo que o orquestrador precisa para rodar um plano fechado.
+#[allow(dead_code)]
+pub type DocsAgentFactory =
+    Arc<dyn Fn() -> (ToolRegistry, Arc<tupi_tools::DocsTool>) + Send + Sync>;
+
 pub(crate) struct RunContext {
     pub root: PathBuf,
     pub store: Arc<dyn SddStore>,
     pub repo_key: String,
     pub tools: ToolRegistry,
     pub agent_tools: Arc<dyn Fn() -> ToolRegistry + Send + Sync>,
+    pub docs_agent: Option<DocsAgentFactory>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub agent_prefix: String,
@@ -137,7 +142,12 @@ pub(crate) struct SddRunOutcome {
 /// Executa as tasks abertas do plano: uma stage por task, com join no fim.
 pub(crate) async fn run_plan(ctx: &RunContext, slug: &str) -> SddRunOutcome {
     let mut plan = match ctx.store.load(&ctx.repo_key, slug) {
-        Ok(Some(plan)) if plan.status == SddPlanStatus::Closed => plan,
+        Ok(Some(plan)) if matches!(plan.status, SddPlanStatus::Closed | SddPlanStatus::Failed) => {
+            plan
+        }
+        Ok(Some(plan)) if plan.status == SddPlanStatus::Completed => {
+            return failure("plano SDD já concluído");
+        }
         Ok(Some(_)) => return failure("plano SDD não está fechado"),
         Ok(None) => return failure("plano SDD não encontrado"),
         Err(error) => return failure(format!("falha ao carregar plano SDD: {error}")),
@@ -154,13 +164,16 @@ pub(crate) async fn run_plan(ctx: &RunContext, slug: &str) -> SddRunOutcome {
         if plan.tasks[task_index].status == SddTaskStatus::Done {
             continue;
         }
+        let task_id = plan.tasks[task_index].id.clone();
         plan.tasks[task_index].status = SddTaskStatus::InProgress;
+        {
+            let activity = plan.record_activity("runner", "task_started", "info");
+            activity.task = Some(task_id.clone());
+        }
         if !save(ctx, &plan) {
             return failure("falha ao salvar plano SDD");
         }
-        mirror(ctx, &plan);
 
-        let task_id = plan.tasks[task_index].id.clone();
         let parallel = stage_is_parallel(&plan.tasks[task_index]);
         if plan.tasks[task_index].parallel && !parallel {
             ctx.events.publish(Event::Notice {
@@ -180,6 +193,15 @@ pub(crate) async fn run_plan(ctx: &RunContext, slug: &str) -> SddRunOutcome {
                 .map(|sub| sub.id.clone())
                 .collect()
         };
+
+        for sub_id in &subtask_ids {
+            let activity = plan.record_activity("runner", "subtask_started", "info");
+            activity.task = Some(task_id.clone());
+            activity.subtask = Some(sub_id.clone());
+        }
+        if !save(ctx, &plan) {
+            return failure("falha ao salvar plano SDD");
+        }
 
         if parallel && subtask_ids.len() > 1 {
             let plan_ref = &plan;
@@ -243,8 +265,41 @@ pub(crate) async fn run_plan(ctx: &RunContext, slug: &str) -> SddRunOutcome {
             .all(|task| task.status == SddTaskStatus::Done)
     {
         plan.status = SddPlanStatus::Completed;
+        plan.record_activity("runner", "plan_completed", "ok");
+        if ctx.docs_agent.is_some() {
+            plan.docs_feedback = Some(tupi_tools::sdd::DocsFeedback {
+                status: tupi_tools::sdd::DocsFeedbackStatus::Pending,
+                files: Vec::new(),
+                reason: None,
+                reindexed: false,
+            });
+            save(ctx, &plan);
+            let feedback = run_docs_feedback(ctx, &mut plan).await;
+            plan.docs_feedback = Some(feedback);
+            if plan.conclusion.is_none() {
+                plan.conclusion = Some(format_run_report(&plan, &lines));
+            }
+        } else {
+            plan.docs_feedback = Some(tupi_tools::sdd::DocsFeedback {
+                status: tupi_tools::sdd::DocsFeedbackStatus::Skipped,
+                files: Vec::new(),
+                reason: Some("docs desabilitado".to_string()),
+                reindexed: false,
+            });
+            plan.conclusion = Some(format_run_report(&plan, &lines));
+        }
         save(ctx, &plan);
-        mirror(ctx, &plan);
+    } else if !ok {
+        plan.status = SddPlanStatus::Failed;
+        plan.record_activity("runner", "plan_failed", "failed");
+        plan.docs_feedback = Some(tupi_tools::sdd::DocsFeedback {
+            status: tupi_tools::sdd::DocsFeedbackStatus::Skipped,
+            files: Vec::new(),
+            reason: Some("plano falhou; docs não realimentados".to_string()),
+            reindexed: false,
+        });
+        plan.conclusion = Some(format_run_report(&plan, &lines));
+        save(ctx, &plan);
     }
 
     SddRunOutcome {
@@ -266,6 +321,99 @@ fn has_declared_overlap(subtasks: &[SddSubtask]) -> bool {
         }
     }
     false
+}
+
+async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::sdd::DocsFeedback {
+    let Some(factory) = &ctx.docs_agent else {
+        let activity = plan.record_activity("runner", "docs_feedback_skipped", "skipped");
+        activity.note = Some("docs desabilitado".to_string());
+        return tupi_tools::sdd::DocsFeedback {
+            status: tupi_tools::sdd::DocsFeedbackStatus::Skipped,
+            files: Vec::new(),
+            reason: Some("docs desabilitado".to_string()),
+            reindexed: false,
+        };
+    };
+
+    let _ = plan.record_activity("docs-agent", "docs_feedback_started", "info");
+    plan.conclusion = None;
+    let (tools, docs) = factory();
+    let brief = format_docs_brief(plan);
+    let outcome = run_agent(
+        AgentTurn {
+            provider: &ctx.provider,
+            model: &ctx.model,
+            prefix: crate::sdd::DOCS_AGENT_PREFIX,
+            tools: &tools,
+            max_steps: ctx.agent_max_steps,
+            timeout: ctx.agent_timeout,
+            cancel: ctx.cancel.clone(),
+            in_flight: ctx.in_flight.clone(),
+            in_flight_count: ctx.in_flight_count.clone(),
+        },
+        &brief,
+    )
+    .await;
+
+    let refresh = docs.refresh();
+    let records = docs.written_records();
+    let files: Vec<String> = records.iter().map(|record| record.path.clone()).collect();
+    let status = if !outcome.ok {
+        tupi_tools::sdd::DocsFeedbackStatus::Failed
+    } else if files.is_empty() {
+        tupi_tools::sdd::DocsFeedbackStatus::Noop
+    } else if records.iter().all(|record| record.created) {
+        tupi_tools::sdd::DocsFeedbackStatus::Created
+    } else {
+        tupi_tools::sdd::DocsFeedbackStatus::Updated
+    };
+    if outcome.ok && !outcome.text.trim().is_empty() {
+        plan.conclusion = Some(outcome.text.trim().to_string());
+    }
+
+    let write_action = if files.is_empty() {
+        "docs_feedback_skipped"
+    } else {
+        "docs_written"
+    };
+    let activity = plan.record_activity(
+        "docs-agent",
+        write_action,
+        if outcome.ok { "ok" } else { "failed" },
+    );
+    activity.files = files.clone();
+    activity.note = outcome.error.clone().or_else(|| Some(outcome.text.clone()));
+
+    let reindex = plan.record_activity(
+        "runner",
+        "docs_reindexed",
+        if refresh.error.is_none() {
+            "ok"
+        } else {
+            "failed"
+        },
+    );
+    reindex.note = refresh.error.clone();
+
+    tupi_tools::sdd::DocsFeedback {
+        status,
+        files,
+        reason: outcome.error.or_else(|| Some(outcome.text)),
+        reindexed: refresh.error.is_none(),
+    }
+}
+
+fn format_docs_brief(plan: &SddPlan) -> String {
+    format!(
+        "Você é o agente de documentação do plano SDD {slug}.\n\
+         Leia .tupi/sdd/{slug}/result.md, spec.md, tasks.json e meta.json.\n\
+         Use docs map/query/read para ver a documentação atual.\n\
+         Se o trabalho mudou conhecimento durável, atualize/crie arquivos sob docs_folders com docs write.\n\
+         Se nada mudou, não escreva nada.\n\
+         No final, responda uma conclusão curta (até 10 linhas) para result.md.\n\
+         Não altere código, testes ou arquivos fora de docs_folders.",
+        slug = plan.slug
+    )
 }
 
 async fn run_one(ctx: &RunContext, plan: &SddPlan, sub_id: &str) -> (AgentOutcome, Duration) {
@@ -323,16 +471,35 @@ async fn record_result(
     lines: &mut Vec<String>,
 ) -> bool {
     let summary = summarize_outcome(&outcome);
+    let acceptance = find_acceptance(plan, sub_id);
+    let files = find_target(plan, sub_id)
+        .and_then(|(_, sub)| sub.map(|sub| sub.touches.clone()))
+        .unwrap_or_default();
     let mut ok = outcome.ok;
     let mut acceptance_error = None;
 
     if ok {
-        if let Some(test) = find_acceptance(plan, sub_id) {
-            if let Err(error) = run_acceptance(ctx, &test).await {
+        if let Some(test) = &acceptance {
+            if let Err(error) = run_acceptance(ctx, test).await {
                 ok = false;
                 acceptance_error = Some(error);
             }
         }
+    }
+
+    if acceptance.is_some() {
+        let (action, status, note) = match &acceptance_error {
+            Some(error) => (
+                "acceptance_failed",
+                "failed",
+                format!("aceite falhou: {error}"),
+            ),
+            None => ("acceptance_succeeded", "ok", "aceite passou".to_string()),
+        };
+        let activity = plan.record_activity("runner", action, status);
+        activity.task = Some(task_id.to_string());
+        activity.subtask = Some(sub_id.to_string());
+        activity.note = Some(note);
     }
 
     if ok {
@@ -341,6 +508,12 @@ async fn record_result(
             "{sub_id} ok {:.1}s — {summary}",
             elapsed.as_secs_f32()
         ));
+        let activity = plan.record_activity("runner", "subtask_succeeded", "ok");
+        activity.task = Some(task_id.to_string());
+        activity.subtask = Some(sub_id.to_string());
+        activity.duration_ms = Some(elapsed.as_millis() as u64);
+        activity.files = files;
+        activity.note = Some(summary);
     } else {
         let reason = match acceptance_error {
             Some(error) => format!("aceite falhou: {error}"),
@@ -350,13 +523,18 @@ async fn record_result(
                 .unwrap_or_else(|| "sem detalhe".to_string()),
         };
         lines.push(format!("{sub_id} falhou: {reason}"));
+        let activity = plan.record_activity("runner", "subtask_failed", "failed");
+        activity.task = Some(task_id.to_string());
+        activity.subtask = Some(sub_id.to_string());
+        activity.duration_ms = Some(elapsed.as_millis() as u64);
+        activity.files = files;
+        activity.note = Some(reason);
     }
 
     sync_task(plan, task_id);
     if !save(ctx, plan) {
         return false;
     }
-    mirror(ctx, plan);
     ok
 }
 
@@ -404,14 +582,6 @@ fn failure(message: impl Into<String>) -> SddRunOutcome {
 
 fn save(ctx: &RunContext, plan: &SddPlan) -> bool {
     ctx.store.save(plan).is_ok()
-}
-
-fn mirror(ctx: &RunContext, plan: &SddPlan) {
-    if let Err(error) = write_mirror(&ctx.root, plan) {
-        ctx.events.publish(Event::Notice {
-            message: format!("SDD: falha ao gravar espelho: {error}"),
-        });
-    }
 }
 
 fn find_target<'a>(plan: &'a SddPlan, id: &str) -> Option<(&'a SddTask, Option<&'a SddSubtask>)> {
@@ -654,6 +824,75 @@ mod tests {
         }]))
     }
 
+    fn docs_factory(root: &std::path::Path) -> DocsAgentFactory {
+        let root = root.to_path_buf();
+        Arc::new(move || {
+            let mut registry = ToolRegistry::new();
+            let docs = tupi_tools::register_docs_agent(
+                root.clone(),
+                &mut registry,
+                tupi_tools::DocsAgentOptions {
+                    docs_folders: vec![root.join("docs")],
+                    embedder: None,
+                    generator: None,
+                },
+            );
+            (registry, docs)
+        })
+    }
+
+    fn docs_write_event(path: &str, content: &str) -> Result<ProviderEvent, ProviderError> {
+        Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+            id: "docs-write".to_string(),
+            name: "docs".to_string(),
+            arguments: serde_json::json!({
+                "action": "write",
+                "path": path,
+                "content": content
+            })
+            .to_string(),
+        }]))
+    }
+
+    #[tokio::test]
+    async fn completed_plan_runs_docs_agent_and_records_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        let store = Arc::new(tupi_tools::sdd::FsSddStore::new(dir.path()));
+        store
+            .save(&closed_plan(vec![task("T1", vec![subtask("T1.1")])]))
+            .unwrap();
+        let (provider, _requests) = Scripted::new_tracked(vec![
+            vec![text_event("feito T1.1")],
+            vec![docs_write_event("docs/guia.md", "# Guia\n")],
+            vec![text_event("documentei o fluxo")],
+        ]);
+        let mut ctx = run_context(
+            dir.path(),
+            store.clone(),
+            provider,
+            ToolRegistry::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        ctx.docs_agent = Some(docs_factory(dir.path()));
+
+        let outcome = run_plan(&ctx, "auth").await;
+
+        assert!(outcome.ok, "{}", outcome.report);
+        let saved = store.load("repo", "auth").unwrap().unwrap();
+        assert_eq!(
+            saved.docs_feedback.unwrap().status,
+            tupi_tools::sdd::DocsFeedbackStatus::Created
+        );
+        assert!(dir.path().join("docs/guia.md").exists());
+        assert!(
+            saved
+                .activities
+                .iter()
+                .any(|activity| activity.action == "docs_written")
+        );
+    }
+
     fn text_event(value: &str) -> Result<ProviderEvent, ProviderError> {
         Ok(ProviderEvent::Text(value.to_string()))
     }
@@ -770,12 +1009,13 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             closed_at: Some(1),
+            ..Default::default()
         }
     }
 
     fn run_context(
         root: &std::path::Path,
-        store: Arc<InMemorySddStore>,
+        store: Arc<dyn SddStore>,
         provider: Arc<dyn Provider>,
         tools: ToolRegistry,
         cancel: Arc<AtomicBool>,
@@ -786,6 +1026,7 @@ mod tests {
             repo_key: "repo".to_string(),
             tools,
             agent_tools: Arc::new(|| ToolRegistry::new()),
+            docs_agent: None,
             provider,
             model: "m".to_string(),
             agent_prefix: "sys".to_string(),
@@ -819,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn sequential_tasks_run_in_order_and_complete_the_plan() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(InMemorySddStore::default());
+        let store = Arc::new(tupi_tools::sdd::FsSddStore::new(dir.path()));
         let plan = closed_plan(vec![
             task("T1", vec![subtask("T1.1"), subtask("T1.2")]),
             task("T2", vec![subtask("T2.1")]),
@@ -850,8 +1091,8 @@ mod tests {
                 .iter()
                 .all(|task| task.status == SddTaskStatus::Done)
         );
-        let md = std::fs::read_to_string(dir.path().join(".agents/tupi/sdd/auth.md")).unwrap();
-        assert!(md.contains("[x]"), "{md}");
+        let result = std::fs::read_to_string(dir.path().join(".tupi/sdd/auth/result.md")).unwrap();
+        assert!(result.contains("## Conclusão"), "{result}");
     }
 
     #[tokio::test]
@@ -1026,7 +1267,13 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1, "T2 não pode rodar");
         let saved = store.load("repo", "auth").unwrap().unwrap();
         assert_eq!(saved.tasks[0].subtasks[0].status, SddSubtaskStatus::Open);
-        assert_eq!(saved.status, SddPlanStatus::Closed);
+        assert_eq!(saved.status, SddPlanStatus::Failed);
+        assert!(
+            saved
+                .activities
+                .iter()
+                .any(|activity| activity.action == "acceptance_failed")
+        );
     }
 
     #[tokio::test]
@@ -1089,7 +1336,7 @@ mod tests {
         assert!(!outcome.ok);
         assert_eq!(requests.lock().unwrap().len(), 1);
         let saved = store.load("repo", "auth").unwrap().unwrap();
-        assert_eq!(saved.status, SddPlanStatus::Closed);
+        assert_eq!(saved.status, SddPlanStatus::Failed);
     }
 
     #[tokio::test]

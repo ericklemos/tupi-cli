@@ -33,26 +33,26 @@ No startup do binário, garantir `<root>/docs` com 5 arquivos markdown de esquel
 
 ## Tasks
 
-- [ ] **t1** Campo `lang` obrigatório, auto-preenchido do sistema
+- [x] **t1** Campo `lang` obrigatório, auto-preenchido do sistema
   - Adicionar `lang` a ProjectConfig (crates/tupi/src/project_config.rs:21-36). Tipo `Lang` (PtBr, En) serializado como `pt-BR`/`en`; campo `lang: Option<Lang>` na leitura para permitir detectar ausência; `ProjectConfig::lang()` devolve o valor resolvido. parse_project (crates/tupi/src/project_config.rs:192-246): presente e inválido = ProjectConfigError; ausente = None, preenchido pela t1.4. Fontes: crates/tupi/src/project_config.rs:21-246, crates/tupi/src/project_config.rs:485-524.
-  - [ ] **t1.1** Tipo `Lang` e campo `lang` em ProjectConfig — parse_project devolve None para {"name":"x"}, Some(En) para {"name":"x","lang":"en"} e não quebra unknown_fields_are_ignored (crates/tupi/src/project_config.rs:457-461).
-  - [ ] **t1.2** Normalização e recusa de valor inválido — `pt-BR`, `pt_br`, `PT-br` viram PtBr; `en`, `EN`, `en_US` viram En; `fr` produz ProjectConfigError novo com caminho e valor na mensagem e load_or_create cai no fallback com warn.
-  - [ ] **t1.3** Detecção do locale do sistema — Função pura `Lang::from_locale` devolve PtBr para `pt_BR.UTF-8` e `pt-BR`, En para `en_US.UTF-8`, En para `fr_FR.UTF-8` (sem template) e En para env vazia; teste sem tocar em env global.
-  - [ ] **t1.4** Backfill: ausente é gravado de volta preservando os demais campos — load_or_create com arquivo existente sem `lang` grava o detectado preservando name, models, docs_folders e chaves desconhecidas; segunda execução não reescreve, seguindo o padrão de record_model_window (crates/tupi/src/project_config.rs:68-149).
-- [ ] **t2** Módulo docs_scaffold com os 5 templates
+  - [x] **t1.1** Tipo `Lang` e campo `lang` em ProjectConfig — parse_project devolve None para {"name":"x"}, Some(En) para {"name":"x","lang":"en"} e não quebra unknown_fields_are_ignored (crates/tupi/src/project_config.rs:457-461).
+  - [x] **t1.2** Normalização e recusa de valor inválido — `pt-BR`, `pt_br`, `PT-br` viram PtBr; `en`, `EN`, `en_US` viram En; `fr` produz ProjectConfigError novo com caminho e valor na mensagem e load_or_create cai no fallback com warn.
+  - [x] **t1.3** Detecção do locale do sistema — Função pura `Lang::from_locale` devolve PtBr para `pt_BR.UTF-8` e `pt-BR`, En para `en_US.UTF-8`, En para `fr_FR.UTF-8` (sem template) e En para env vazia; teste sem tocar em env global.
+  - [x] **t1.4** Backfill: ausente é gravado de volta preservando os demais campos — load_or_create com arquivo existente sem `lang` grava o detectado preservando name, models, docs_folders e chaves desconhecidas; segunda execução não reescreve, seguindo o padrão de record_model_window (crates/tupi/src/project_config.rs:68-149).
+- [x] **t2** Módulo docs_scaffold com os 5 templates
   - Novo módulo crates/tupi/src/docs_scaffold.rs, no formato de crates/tupi/src/agents_config.rs:5-39: `scaffold(root, lang)` escreve docs/index.md, docs/architecture.md, docs/business.md, docs/conventions.md e docs/decisions/0000-template.md. Cada arquivo: H1 de propósito em uma linha + H2 vazios. Não sobrescreve arquivo que já tenha conteúdo autoral.
-  - [ ] **t2.1** Templates pt-BR e en com os H2 definidos — index.md tem ## Arquitetura / ## Regras de negócio / ## Convenções (ou equivalentes en) linkando os outros três; architecture.md tem ## Camadas / ## Fronteiras / ## Componentes; business.md tem ## Entidades / ## Invariantes / ## Fluxos; conventions.md tem ## Onde cada coisa mora / ## Testes / ## Commits; decisions/0000-template.md tem ## Contexto / ## Decisão / ## Alternativas rejeitadas / ## Consequências. Nenhum H2 com corpo.
-  - [ ] **t2.2** Nunca apaga conteúdo: só escreve se ausente ou se o conteúdo ainda é o esqueleto — Arquivo com conteúdo autoral (linha além dos headings) permanece byte a byte igual após scaffold; arquivo ainda idêntico ao esqueleto não é reescrito (mtime intacto na segunda execução).
-  - [ ] **t2.3** Escopo estrito: nada além dos 5 caminhos — Teste cria docs/notas.md, docs/architecture.md com corpo autoral e docs/business.md ausente: notas.md e architecture.md intactos, business.md criado, nenhum arquivo novo fora dos 5 caminhos.
-  - [ ] **t2.4** Falha de I/O não derruba o startup — Erro de escrita em docs/ gera tracing::warn e o processo segue, como em load_or_create (crates/tupi/src/project_config.rs:257-279).
-- [ ] **t3** Wiring no startup
+  - [x] **t2.1** Templates pt-BR e en com os H2 definidos — index.md tem ## Arquitetura / ## Regras de negócio / ## Convenções (ou equivalentes en) linkando os outros três; architecture.md tem ## Camadas / ## Fronteiras / ## Componentes; business.md tem ## Entidades / ## Invariantes / ## Fluxos; conventions.md tem ## Onde cada coisa mora / ## Testes / ## Commits; decisions/0000-template.md tem ## Contexto / ## Decisão / ## Alternativas rejeitadas / ## Consequências. Nenhum H2 com corpo.
+  - [x] **t2.2** Nunca apaga conteúdo: só escreve se ausente ou se o conteúdo ainda é o esqueleto — Arquivo com conteúdo autoral (linha além dos headings) permanece byte a byte igual após scaffold; arquivo ainda idêntico ao esqueleto não é reescrito (mtime intacto na segunda execução).
+  - [x] **t2.3** Escopo estrito: nada além dos 5 caminhos — Teste cria docs/notas.md, docs/architecture.md com corpo autoral e docs/business.md ausente: notas.md e architecture.md intactos, business.md criado, nenhum arquivo novo fora dos 5 caminhos.
+  - [x] **t2.4** Falha de I/O não derruba o startup — Erro de escrita em docs/ gera tracing::warn e o processo segue, como em load_or_create (crates/tupi/src/project_config.rs:257-279).
+- [x] **t3** Wiring no startup
   - Chamar o scaffold em main logo após `project_config::load_or_create(&root)` e antes de montar tools/indexação (crates/tupi/src/main.rs:17-434), no mesmo root usado pelas tools.
-  - [ ] **t3.1** Chamada após load_or_create, antes da montagem do ToolRegistry — Ordem: load_or_create -> scaffold -> docs_folders/tools; teste de função extraída verifica que docs/index.md existe antes de o índice de docs ser construído.
-  - [ ] **t3.2** Declarar `mod docs_scaffold;` e logar o resultado em tracing::debug — cargo build passa e o tracing::debug mostra o lang resolvido e quantos arquivos foram escritos/preservados.
-- [ ] **t4** `docs` como pasta padrão de documentação
+  - [x] **t3.1** Chamada após load_or_create, antes da montagem do ToolRegistry — Ordem: load_or_create -> scaffold -> docs_folders/tools; teste de função extraída verifica que docs/index.md existe antes de o índice de docs ser construído.
+  - [x] **t3.2** Declarar `mod docs_scaffold;` e logar o resultado em tracing::debug — cargo build passa e o tracing::debug mostra o lang resolvido e quantos arquivos foram escritos/preservados.
+- [x] **t4** `docs` como pasta padrão de documentação
   - Quando `docs_folders` está ausente ou vazio, usar ["docs"]. Alterar fallback (crates/tupi/src/project_config.rs:281-288) e normalize_docs_folders (crates/tupi/src/project_config.rs:193-231); lista explícita continua substituindo o default.
-  - [ ] **t4.1** Default ["docs"] no fallback e no normalize vazio — ai.project.json criado do zero contém docs_folders: ["docs"] e lang preenchido; lista explícita ["wiki"] produz apenas wiki.
-  - [ ] **t4.2** Reconciliar testes existentes — a_missing_file_is_created_with_the_folder_name (crates/tupi/src/project_config.rs:321) passa a esperar ["docs"] e o lang do sistema; nenhum outro teste de project_config quebra.
+  - [x] **t4.1** Default ["docs"] no fallback e no normalize vazio — ai.project.json criado do zero contém docs_folders: ["docs"] e lang preenchido; lista explícita ["wiki"] produz apenas wiki.
+  - [x] **t4.2** Reconciliar testes existentes — a_missing_file_is_created_with_the_folder_name (crates/tupi/src/project_config.rs:321) passa a esperar ["docs"] e o lang do sistema; nenhum outro teste de project_config quebra.
 - [ ] **t5** Verificação de ponta a ponta
   - Fechar o ciclo com tool, não apenas com teste unitário.
   - [ ] **t5.1** cargo test nos crates afetados — cargo test -p tupi e cargo test -p tupi-tools verdes.

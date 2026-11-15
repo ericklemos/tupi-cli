@@ -70,7 +70,9 @@ impl PeekTool {
 }
 
 fn chars_for_budget(budget_tokens: usize) -> usize {
-    (budget_tokens as f64 * CHARS_PER_TOKEN) as usize
+    // Orçamento zero ainda entrega um caractere: uma página vazia que repete o
+    // próprio `Próximo offset` trava a paginação em loop no chamador.
+    ((budget_tokens as f64 * CHARS_PER_TOKEN) as usize).max(1)
 }
 
 /// Byte onde começa o caractere de índice `chars` (ou o fim do texto).
@@ -237,6 +239,20 @@ mod tests {
         let out = tool.peek(&handle, 999, DEFAULT_BUDGET_TOKENS).unwrap();
 
         assert!(out.contains("Fim do corpo."));
+    }
+
+    #[test]
+    fn a_zero_budget_still_advances_the_offset() {
+        let tool = tool();
+        let handle = handle_of(&tool, "abcdef".to_string());
+
+        let page = tool.peek(&handle, 0, 0).unwrap();
+
+        // Uma página vazia com o próprio offset como próximo passo prende o
+        // chamador em loop: o orçamento zero entrega um caractere, não zero.
+        let text = page.split("\n\nRestante:").next().unwrap();
+        assert_eq!(text, "a", "página: {page:?}");
+        assert!(page.contains("Próximo offset: 1."), "página: {page:?}");
     }
 
     #[test]

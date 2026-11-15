@@ -15,6 +15,7 @@ fn write_mirror_writes_the_same_markdown_as_the_tool() {
         created_at: 1,
         updated_at: 1,
         closed_at: None,
+        ..Default::default()
     };
 
     let path = write_mirror(dir.path(), &plan).unwrap();

@@ -50,15 +50,7 @@ pub async fn ensure_generation_model(
     base: &Path,
     fetcher: &dyn Fetcher,
 ) -> Result<PathBuf, InferError> {
-    ensure_model(
-        base,
-        LFM3_REPO,
-        LFM3_FILE,
-        LFM3_SHA256,
-        LFM3_BYTES,
-        fetcher,
-    )
-    .await
+    ensure_model(base, LFM3_REPO, LFM3_FILE, LFM3_SHA256, LFM3_BYTES, fetcher).await
 }
 
 pub async fn ensure_model(

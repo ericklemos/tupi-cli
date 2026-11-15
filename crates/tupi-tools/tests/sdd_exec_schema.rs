@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 use tupi_kernel::{AgentMode, Tool};
-use tupi_tools::sdd::{InMemorySddStore, SddTool};
+use tupi_tools::sdd::SddTool;
 
 #[test]
 fn set_tasks_accepts_parallel_touches_and_acceptance_test() {
     let dir = tempfile::tempdir().unwrap();
     let tool = SddTool::new(
         dir.path().to_path_buf(),
-        Arc::new(InMemorySddStore::default()),
+        Arc::new(tupi_tools::sdd::FsSddStore::new(dir.path())),
         Some(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()))),
         2000,
     );
@@ -31,8 +31,8 @@ fn set_tasks_accepts_parallel_touches_and_acceptance_test() {
     }))
     .unwrap();
 
-    let md = std::fs::read_to_string(dir.path().join(".agents/tupi/sdd/auth.md")).unwrap();
-    assert!(md.contains("paralela"), "{md}");
-    assert!(md.contains("src/store.rs"), "{md}");
-    assert!(md.contains("sdd_run"), "{md}");
+    let tasks = std::fs::read_to_string(dir.path().join(".tupi/sdd/auth/tasks.json")).unwrap();
+    assert!(tasks.contains("\"parallel\": true"), "{tasks}");
+    assert!(tasks.contains("src/store.rs"), "{tasks}");
+    assert!(tasks.contains("sdd_run"), "{tasks}");
 }

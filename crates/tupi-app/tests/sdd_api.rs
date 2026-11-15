@@ -60,6 +60,7 @@ fn plan() -> SddPlan {
         created_at: 1,
         updated_at: 1,
         closed_at: Some(1),
+        ..Default::default()
     }
 }
 
@@ -77,6 +78,7 @@ async fn blocking_execution_runs_inside_spawn_blocking() {
         repo_key: "repo".to_string(),
         tools: ToolRegistry::new(),
         agent_tools: Arc::new(|| ToolRegistry::new()),
+        docs_agent: None,
         provider,
         model: "m".to_string(),
         agent_prefix: "sys".to_string(),

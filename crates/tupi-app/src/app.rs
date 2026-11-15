@@ -373,6 +373,8 @@ pub struct App {
     model: Mutex<String>,
     events: EventBus,
     store: Option<Arc<Store>>,
+    /// Persistência dos planos SDD; separada do redb de settings/modelos.
+    sdd_store: Option<Arc<dyn tupi_tools::sdd::SddStore>>,
     tools: ToolRegistry,
     pending: Arc<Mutex<Vec<ToolCall>>>,
     next_request: AtomicU64,
@@ -429,6 +431,14 @@ impl App {
         self
     }
 
+    pub fn with_sdd_store(
+        mut self: Arc<Self>,
+        store: Arc<dyn tupi_tools::sdd::SddStore>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("App recém-criado").sdd_store = Some(store);
+        self
+    }
+
     pub fn with_mode_cell(
         mut self: Arc<Self>,
         mode: Arc<std::sync::atomic::AtomicU8>,
@@ -439,6 +449,24 @@ impl App {
 
     pub fn mode(&self) -> tupi_kernel::AgentMode {
         tupi_kernel::AgentMode::from_u8(self.mode.load(Ordering::SeqCst))
+    }
+
+    fn apply_mode(&self, mode: tupi_kernel::AgentMode) -> Result<CommandOutcome, CommandError> {
+        if self.active.load(Ordering::SeqCst) != 0 {
+            return Err(CommandError::Busy);
+        }
+        if self.mode() == tupi_kernel::AgentMode::Sdd
+            && mode != tupi_kernel::AgentMode::Sdd
+            && self.sdd_flow_started.load(Ordering::SeqCst)
+        {
+            self.events.publish(Event::Notice {
+                message: SDD_LOCK_NOTICE.to_string(),
+            });
+            return Ok(CommandOutcome::Noop);
+        }
+        self.mode.store(mode.as_u8(), Ordering::SeqCst);
+        self.events.publish(Event::ModeChanged { mode });
+        Ok(CommandOutcome::ModeChanged { mode })
     }
 
     pub fn with_store(
@@ -493,6 +521,7 @@ impl App {
             active: Arc::new(AtomicU64::new(0)),
             current: Arc::new(Mutex::new(None)),
             store,
+            sdd_store: None,
             tools,
             pending: Arc::new(Mutex::new(Vec::new())),
             prefix,
@@ -518,7 +547,7 @@ impl App {
         });
         app.apply_context();
         app
-}
+    }
 
     /// Liga o catálogo de workflows lido do projeto, em `tupi-tools`.
     pub fn with_workflows(mut self: Arc<Self>, workflows: Arc<dyn WorkflowIndex>) -> Arc<Self> {
@@ -559,6 +588,26 @@ impl App {
             }));
         };
 
+        if let Some(agent) = workflow.agent.as_deref() {
+            let mode = match agent {
+                "execution" => Some(tupi_kernel::AgentMode::Execution),
+                "sdd" => Some(tupi_kernel::AgentMode::Sdd),
+                _ => {
+                    self.events.publish(Event::Notice {
+                        message: format!(
+                            "workflow `{}`: agente `{agent}` desconhecido; mantendo o modo atual",
+                            workflow.name
+                        ),
+                    });
+                    None
+                }
+            };
+            if let Some(mode) = mode {
+                if matches!(self.apply_mode(mode)?, CommandOutcome::Noop) {
+                    return Ok(CommandOutcome::Noop);
+                }
+            }
+        }
         self.send_message(workflow.invocation(extra))
     }
 
@@ -715,7 +764,7 @@ impl App {
         let base_prefix = self.prefix.clone();
         let mode_cell = Arc::clone(&self.mode);
         let sdd_flow_started = Arc::clone(&self.sdd_flow_started);
-        let sdd_store = self.store.clone();
+        let sdd_store = self.sdd_store.clone();
         let sdd_repo_key = self.repo_key.clone();
         let show_prompts = self.show_prompts.load(Ordering::SeqCst);
         let max_tool_steps = self.max_tool_steps;
@@ -1229,9 +1278,9 @@ impl App {
                         message: "SDD fechado — modo execução".to_string(),
                     });
                     if let (Some(store_ref), Some(rk)) = (&sdd_store, &sdd_repo_key)
-                        && let Ok(Some(slug)) = store_ref.active_sdd_slug(rk)
-                        && let Ok(Some(plan)) = store_ref.load_sdd_plan(rk, &slug)
-                        && plan.status == tupi_store::SddPlanStatus::Closed
+                        && let Ok(Some(slug)) = store_ref.active_slug(rk)
+                        && let Ok(Some(plan)) = store_ref.load(rk, &slug)
+                        && plan.status == tupi_tools::sdd::SddPlanStatus::Closed
                     {
                         session.replace_messages(vec![Message::user(
                             crate::sdd::format_execution_handoff(&plan),
@@ -1509,42 +1558,13 @@ impl CommandHandler for App {
                 Command::SetModel { model } => self.set_model(model),
                 Command::Memory { action } => Ok(self.memory_command(action)),
                 Command::ToggleMode => {
-                    if self.active.load(Ordering::SeqCst) != 0 {
-                        return Err(CommandError::Busy);
-                    }
-                    if self.mode() == tupi_kernel::AgentMode::Sdd
-                        && self.sdd_flow_started.load(Ordering::SeqCst)
-                    {
-                        self.events.publish(Event::Notice {
-                            message: SDD_LOCK_NOTICE.to_string(),
-                        });
-                        return Ok(CommandOutcome::Noop);
-                    }
                     let next = match self.mode() {
                         tupi_kernel::AgentMode::Execution => tupi_kernel::AgentMode::Sdd,
                         tupi_kernel::AgentMode::Sdd => tupi_kernel::AgentMode::Execution,
                     };
-                    self.mode.store(next.as_u8(), Ordering::SeqCst);
-                    self.events.publish(Event::ModeChanged { mode: next });
-                    Ok(CommandOutcome::ModeChanged { mode: next })
+                    self.apply_mode(next)
                 }
-                Command::SetMode { mode } => {
-                    if self.active.load(Ordering::SeqCst) != 0 {
-                        return Err(CommandError::Busy);
-                    }
-                    if self.mode() == tupi_kernel::AgentMode::Sdd
-                        && mode != tupi_kernel::AgentMode::Sdd
-                        && self.sdd_flow_started.load(Ordering::SeqCst)
-                    {
-                        self.events.publish(Event::Notice {
-                            message: SDD_LOCK_NOTICE.to_string(),
-                        });
-                        return Ok(CommandOutcome::Noop);
-                    }
-                    self.mode.store(mode.as_u8(), Ordering::SeqCst);
-                    self.events.publish(Event::ModeChanged { mode });
-                    Ok(CommandOutcome::ModeChanged { mode })
-                }
+                Command::SetMode { mode } => self.apply_mode(mode),
                 Command::NewSession => {
                     let request_id = self.active.swap(0, Ordering::SeqCst);
                     if request_id != 0 {
@@ -2365,6 +2385,84 @@ mod tests {
     }
 
     /// Catálogo fixo de workflows para os testes de `/workflows/<nome>`.
+    fn workflow_with_agent(name: &str, agent: &str) -> tupi_domain::Workflow {
+        tupi_domain::Workflow {
+            name: name.to_string(),
+            description: String::new(),
+            agent: Some(agent.to_string()),
+            source: tupi_domain::WorkflowSource::LocalTupi,
+            path: None,
+            body: "# x\n".into(),
+            shadowed: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_applies_the_declared_agent_mode() {
+        let app = App::with_tools(
+            registry(Arc::new(FakeProvider { tokens: vec!["ok"] })),
+            "fake",
+            "m".into(),
+            EventBus::new(16),
+            None,
+            ToolRegistry::new(),
+            "BASE".into(),
+        )
+        .with_workflows(Arc::new(crate::workflow::FixedIndex {
+            workflows: vec![workflow_with_agent("plan", "sdd")],
+        }));
+        let outcome = app
+            .handle(Command::RunWorkflow {
+                name: "plan".into(),
+                extra: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CommandOutcome::Started { .. }));
+        assert_eq!(app.mode(), tupi_kernel::AgentMode::Sdd);
+    }
+
+    #[tokio::test]
+    async fn unknown_workflow_agent_keeps_the_mode() {
+        let app = App::with_tools(
+            registry(Arc::new(FakeProvider { tokens: vec!["ok"] })),
+            "fake",
+            "m".into(),
+            EventBus::new(16),
+            None,
+            ToolRegistry::new(),
+            "BASE".into(),
+        )
+        .with_workflows(Arc::new(crate::workflow::FixedIndex {
+            workflows: vec![workflow_with_agent("x", "reviewer")],
+        }));
+        let outcome = app
+            .handle(Command::RunWorkflow {
+                name: "x".into(),
+                extra: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CommandOutcome::Started { .. }));
+        assert_eq!(app.mode(), tupi_kernel::AgentMode::Execution);
+    }
+
+    #[test]
+    fn sdd_lock_blocks_leaving_the_mode() {
+        let app = App::new(
+            registry(Arc::new(FakeProvider { tokens: vec![] })),
+            "fake",
+            "m".into(),
+            EventBus::new(4),
+        );
+        app.mode
+            .store(tupi_kernel::AgentMode::Sdd.as_u8(), Ordering::SeqCst);
+        app.sdd_flow_started.store(true, Ordering::SeqCst);
+        let outcome = app.apply_mode(tupi_kernel::AgentMode::Execution).unwrap();
+        assert!(matches!(outcome, CommandOutcome::Noop));
+        assert_eq!(app.mode(), tupi_kernel::AgentMode::Sdd);
+    }
+
     fn fixed_workflows(names: &[&str]) -> Arc<crate::workflow::FixedIndex> {
         Arc::new(crate::workflow::FixedIndex {
             workflows: names
@@ -2372,6 +2470,7 @@ mod tests {
                 .map(|name| tupi_domain::Workflow {
                     name: (*name).to_string(),
                     description: String::new(),
+                    agent: None,
                     source: tupi_domain::WorkflowSource::LocalTupi,
                     path: None,
                     body: format!("# {name}\n\n1. enquadre\n"),

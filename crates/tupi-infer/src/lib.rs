@@ -2,12 +2,12 @@
 
 use thiserror::Error;
 
+#[cfg(feature = "local-models")]
+mod backend;
 pub mod cache;
 pub mod download;
 #[cfg(feature = "local-models")]
 pub mod llama;
-#[cfg(feature = "local-models")]
-pub mod llama_colbert;
 #[cfg(feature = "local-models")]
 pub mod llama_generate;
 
@@ -17,8 +17,6 @@ pub use download::{
 };
 #[cfg(feature = "local-models")]
 pub use llama::LlamaEmbedder;
-#[cfg(feature = "local-models")]
-pub use llama_colbert::{LlamaColBert, maxsim};
 #[cfg(feature = "local-models")]
 pub use llama_generate::LlamaGenerator;
 
@@ -48,5 +46,3 @@ pub enum InferError {
     #[error("inferência: {0}")]
     Inference(String),
 }
-mod backend;
-

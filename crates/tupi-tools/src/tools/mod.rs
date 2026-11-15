@@ -1,6 +1,8 @@
 pub(crate) mod assert;
+pub(crate) mod clock;
 pub(crate) mod context_graph;
 pub(crate) mod diff;
+pub(crate) mod docs;
 pub(crate) mod edit;
 pub(crate) mod env;
 pub(crate) mod exec;
@@ -26,4 +28,3 @@ pub(crate) mod why;
 pub(crate) mod workflow;
 pub(crate) mod write;
 pub(crate) mod write_many;
-pub(crate) mod docs;

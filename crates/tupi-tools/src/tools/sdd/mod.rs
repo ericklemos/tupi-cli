@@ -18,6 +18,7 @@ pub enum SddPlanStatus {
     Draft,
     Closed,
     Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,8 +87,120 @@ pub struct SddPlan {
     pub updated_at: u64,
     #[serde(default)]
     pub closed_at: Option<u64>,
+    #[serde(default)]
+    pub activities: Vec<SddActivity>,
+    #[serde(default)]
+    pub notes: Vec<SddNote>,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub docs_feedback: Option<DocsFeedback>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SddActivity {
+    pub seq: u64,
+    pub at: u64,
+    pub actor: String,
+    pub action: String,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub subtask: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SddNote {
+    pub at: u64,
+    pub actor: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocsFeedbackStatus {
+    Skipped,
+    Pending,
+    Updated,
+    Created,
+    Noop,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocsFeedback {
+    pub status: DocsFeedbackStatus,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub reindexed: bool,
+}
+
+impl Default for SddPlanStatus {
+    fn default() -> Self {
+        Self::Draft
+    }
+}
+
+impl Default for SddPlan {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            repo_key: String::new(),
+            title: String::new(),
+            status: SddPlanStatus::Draft,
+            goal: String::new(),
+            constraints: Vec::new(),
+            nuances: Vec::new(),
+            tasks: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            closed_at: None,
+            activities: Vec::new(),
+            notes: Vec::new(),
+            conclusion: None,
+            docs_feedback: None,
+        }
+    }
+}
+
+impl SddPlan {
+    pub fn record_activity(&mut self, actor: &str, action: &str, status: &str) -> &mut SddActivity {
+        let seq = self.activities.len() as u64 + 1;
+        self.activities.push(SddActivity {
+            seq,
+            at: now(),
+            actor: actor.to_string(),
+            action: action.to_string(),
+            task: None,
+            subtask: None,
+            status: status.to_string(),
+            duration_ms: None,
+            files: Vec::new(),
+            note: None,
+        });
+        self.activities
+            .last_mut()
+            .expect("atividade recém-inserida")
+    }
+
+    pub fn add_note(&mut self, actor: &str, text: &str) {
+        self.notes.push(SddNote {
+            at: now(),
+            actor: actor.to_string(),
+            text: text.to_string(),
+        });
+    }
+}
 pub trait SddStore: Send + Sync {
     fn save(&self, plan: &SddPlan) -> Result<(), String>;
     fn load(&self, repo_key: &str, slug: &str) -> Result<Option<SddPlan>, String>;
@@ -162,6 +275,7 @@ enum SddAction {
     Close,
     Progress,
     Execute,
+    Note,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +323,8 @@ struct SddParams {
     id: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     budget_tokens: Option<usize>,
 }
@@ -328,10 +444,6 @@ impl SddTool {
             })
     }
 
-    fn write_markdown_mirror(&self, plan: &SddPlan) -> Result<PathBuf, ToolError> {
-        write_mirror(&self.root_dir, plan)
-    }
-
     fn render_budgeted(&self, sections: Vec<Section>, budget_tokens: usize) -> String {
         let selection = budget::select(&sections, budget_tokens);
         let handle = if !selection.omitted.is_empty() {
@@ -379,6 +491,7 @@ fn status_label_plan(status: SddPlanStatus) -> &'static str {
         SddPlanStatus::Draft => "draft",
         SddPlanStatus::Closed => "closed",
         SddPlanStatus::Completed => "completed",
+        SddPlanStatus::Failed => "failed",
     }
 }
 
@@ -539,13 +652,13 @@ impl Tool for SddTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "sdd".to_string(),
-            description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade no banco local + espelho .agents/tupi/sdd/<slug>.md). Antes de upsert_spec, consulte a tool docs e registre as fontes como caminho:inicio-fim em goal, constraints, nuances e details.".to_string(),
+            description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade em .tupi/sdd/<slug>/: meta.json e tasks.json). Antes de upsert_spec, consulte a tool docs e registre as fontes como caminho:inicio-fim em goal, constraints, nuances e details.".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["upsert_spec", "set_tasks", "status", "list", "activate", "close", "progress"],
+                        "enum": ["upsert_spec", "set_tasks", "status", "list", "activate", "close", "progress", "note"],
                         "description": "Ação SDD. No modo SDD: upsert_spec, set_tasks, status, list, activate, close. Na execução: status, list, activate, progress."
                     },
                     "slug": {
@@ -692,15 +805,16 @@ impl Tool for SddTool {
                             created_at: ts,
                             updated_at: ts,
                             closed_at: None,
+                            ..Default::default()
                         }
                     }
                 };
                 plan.updated_at = ts;
+                plan.record_activity("sdd", "spec_upserted", "ok");
                 self.sdd_store.save(&plan).map_err(ToolError::Other)?;
                 self.sdd_store
                     .set_active_slug(&rk, Some(&slug))
                     .map_err(ToolError::Other)?;
-                self.write_markdown_mirror(&plan)?;
                 plan_to_sections(&plan)
             }
             SddAction::SetTasks => {
@@ -750,8 +864,8 @@ impl Tool for SddTool {
                     })
                     .collect();
                 plan.updated_at = now();
+                plan.record_activity("sdd", "tasks_set", "ok");
                 self.sdd_store.save(&plan).map_err(ToolError::Other)?;
-                self.write_markdown_mirror(&plan)?;
                 plan_to_sections(&plan)
             }
             SddAction::Status => {
@@ -837,15 +951,15 @@ impl Tool for SddTool {
                 plan.status = SddPlanStatus::Closed;
                 plan.closed_at = Some(ts);
                 plan.updated_at = ts;
+                plan.record_activity("sdd", "spec_closed", "ok");
                 self.sdd_store.save(&plan).map_err(ToolError::Other)?;
                 self.sdd_store
                     .set_active_slug(&rk, Some(&slug))
                     .map_err(ToolError::Other)?;
-                self.write_markdown_mirror(&plan)?;
                 let mut sections = vec![Section {
                     heading: format!("### sdd — spec '{}' fechada", plan.slug),
                     body: format!(
-                        "- status: closed\n- tasks: {}\n- espelho: .agents/tupi/sdd/{}.md",
+                        "- status: closed\n- tasks: {}\n- pasta: .tupi/sdd/{}/",
                         plan.tasks.len(),
                         plan.slug
                     ),
@@ -863,6 +977,26 @@ impl Tool for SddTool {
                     });
                 }
                 sections
+            }
+            SddAction::Note => {
+                let slug = self.resolve_target_slug(params.slug.as_deref())?;
+                let text = params
+                    .text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| ToolError::InvalidArguments("note exige text".into()))?;
+                let mut plan = self
+                    .sdd_store
+                    .load(&rk, &slug)
+                    .map_err(ToolError::Other)?
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(format!("plano '{slug}' não encontrado"))
+                    })?;
+                plan.add_note("agent", text);
+                plan.updated_at = now();
+                self.sdd_store.save(&plan).map_err(ToolError::Other)?;
+                plan_to_sections(&plan)
             }
             SddAction::Execute => {
                 self.require_execution_mode("execute")?;
@@ -982,8 +1116,8 @@ impl Tool for SddTool {
                     plan.status = SddPlanStatus::Completed;
                 }
                 plan.updated_at = now();
+                plan.record_activity("sdd", "progress_updated", "ok");
                 self.sdd_store.save(&plan).map_err(ToolError::Other)?;
-                self.write_markdown_mirror(&plan)?;
                 plan_to_sections(&plan)
             }
         };
@@ -1015,6 +1149,12 @@ impl Tool for SddTool {
     }
 }
 
+mod meta;
+mod render;
+mod store;
+
+pub use store::FsSddStore;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1023,6 +1163,74 @@ mod tests {
     use tupi_kernel::{AgentMode, Tool};
 
     use super::*;
+
+    #[test]
+    fn upsert_spec_and_set_tasks_append_activities() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemorySddStore::default());
+        let tool = SddTool::new(
+            dir.path().to_path_buf(),
+            store.clone(),
+            Some(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()))),
+            2000,
+        );
+        tool.call(serde_json::json!({"action":"upsert_spec","slug":"a","title":"A","goal":"G"}))
+            .unwrap();
+        tool.call(serde_json::json!({"action":"set_tasks","tasks":[{"id":"T1","title":"T"}]}))
+            .unwrap();
+        let plan = store
+            .load(&crate::paths::repo_key(dir.path()), "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.activities
+                .iter()
+                .map(|activity| activity.action.as_str())
+                .collect::<Vec<_>>(),
+            ["spec_upserted", "tasks_set"]
+        );
+    }
+
+    #[test]
+    fn a_note_goes_to_notes_and_not_activities() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(InMemorySddStore::default());
+        let tool = SddTool::new(dir.path().to_path_buf(), store.clone(), None, 2000);
+        tool.call(serde_json::json!({"action":"upsert_spec","slug":"a","title":"A","goal":"G"}))
+            .unwrap();
+        tool.call(serde_json::json!({"action":"note","slug":"a","text":"decisão"}))
+            .unwrap();
+        let plan = store
+            .load(&crate::paths::repo_key(dir.path()), "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.notes.len(), 1);
+        assert_eq!(plan.notes[0].text, "decisão");
+        assert!(
+            !plan
+                .activities
+                .iter()
+                .any(|activity| activity.action == "note")
+        );
+    }
+
+    #[test]
+    fn a_new_plan_records_monotonic_activities_and_notes() {
+        let mut plan = SddPlan {
+            slug: "auth".into(),
+            title: "Auth".into(),
+            goal: "OAuth".into(),
+            ..Default::default()
+        };
+        plan.record_activity("sdd", "spec_upserted", "ok");
+        plan.record_activity("sdd", "tasks_set", "ok");
+        plan.add_note("agent", "lock mantido");
+        assert_eq!(plan.activities.len(), 2);
+        assert_eq!(plan.activities[0].seq, 1);
+        assert_eq!(plan.activities[1].seq, 2);
+        assert_eq!(plan.notes[0].text, "lock mantido");
+        assert_eq!(status_label_plan(SddPlanStatus::Failed), "failed");
+    }
 
     #[test]
     fn execution_spec_lists_only_progress_actions() {
@@ -1057,7 +1265,7 @@ mod tests {
     #[test]
     fn sdd_upsert_spec_set_tasks_and_writes_markdown_mirror() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(InMemorySddStore::default());
+        let store = Arc::new(FsSddStore::new(dir.path()));
         let mode_cell = Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()));
         let tool = SddTool::new(dir.path().to_path_buf(), store, Some(mode_cell), 2000);
 
@@ -1089,12 +1297,14 @@ mod tests {
         }))
         .unwrap();
 
-        let md_path = dir.path().join(".agents/tupi/sdd/auth-flow.md");
-        let md = std::fs::read_to_string(&md_path).unwrap();
-        assert!(md.contains("somente leitura"), "{md}");
-        assert!(md.contains("Fluxo de Autenticação"), "{md}");
-        assert!(md.contains("Token expira em 55m"), "{md}");
-        assert!(md.contains("- [ ] **T1.1** Lock no store"), "{md}");
+        let spec = std::fs::read_to_string(dir.path().join(".tupi/sdd/auth-flow/spec.md")).unwrap();
+        assert!(spec.contains("Gerado automaticamente"), "{spec}");
+        assert!(spec.contains("Fluxo de Autenticação"), "{spec}");
+        assert!(spec.contains("Token expira em 55m"), "{spec}");
+        let tasks =
+            std::fs::read_to_string(dir.path().join(".tupi/sdd/auth-flow/tasks.json")).unwrap();
+        assert!(tasks.contains("T1.1"), "{tasks}");
+        assert!(tasks.contains("Lock no store"), "{tasks}");
     }
 
     #[test]
@@ -1130,7 +1340,7 @@ mod tests {
     #[test]
     fn sdd_progress_updates_subtask_and_completes_plan() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(InMemorySddStore::default());
+        let store = Arc::new(FsSddStore::new(dir.path()));
         let mode_cell = Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8()));
         let tool = SddTool::new(
             dir.path().to_path_buf(),
@@ -1169,8 +1379,9 @@ mod tests {
         }))
         .unwrap();
 
-        let md = std::fs::read_to_string(dir.path().join(".agents/tupi/sdd/rag.md")).unwrap();
-        assert!(md.contains("- [x] **T1.1** Parser"), "{md}");
+        let tasks = std::fs::read_to_string(dir.path().join(".tupi/sdd/rag/tasks.json")).unwrap();
+        assert!(tasks.contains("\"id\": \"T1.1\""), "{tasks}");
+        assert!(tasks.contains("\"status\": \"done\""), "{tasks}");
         let saved = store
             .load(&crate::paths::repo_key(dir.path()), "rag")
             .unwrap()

@@ -34,6 +34,7 @@ mod tests {
         Workflow {
             name: name.to_string(),
             description: String::new(),
+            agent: None,
             source: WorkflowSource::Native,
             path: None,
             body: String::new(),

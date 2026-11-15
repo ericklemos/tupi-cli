@@ -23,10 +23,13 @@ fn fold(character: char) -> char {
 /// Frequência dos termos normalizados, reusando a lista de stopwords do search.
 pub fn terms(text: &str) -> BTreeMap<String, u16> {
     let normalized = normalize(text);
-    let allowed: HashSet<String> =
-        crate::support::terms::extract_terms(&normalized, &[]).into_iter().collect();
+    let allowed: HashSet<String> = crate::support::terms::extract_terms(&normalized, &[])
+        .into_iter()
+        .collect();
     let mut counts = BTreeMap::new();
-    for token in normalized.split(|character: char| !character.is_alphanumeric() && character != '_') {
+    for token in
+        normalized.split(|character: char| !character.is_alphanumeric() && character != '_')
+    {
         if token.is_empty() || !allowed.contains(token) {
             continue;
         }

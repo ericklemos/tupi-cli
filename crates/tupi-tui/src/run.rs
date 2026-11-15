@@ -735,6 +735,32 @@ fn clamped_transcript_position(
 }
 
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect) {
+    /// Sessão nova não tem histórico, então o transcript era um retângulo
+    /// vazio e a primeira tela não ensinava nada. Estas linhas somem no
+    /// primeiro turno.
+    fn empty_state(width: u16) -> Vec<Line<'static>> {
+        let dim = Style::default().fg(Color::DarkGray);
+        let bold_green = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("  ● ", bold_green),
+            Span::styled("tupi", bold_green),
+        ])];
+        for hint in [
+            "descreva a tarefa ou aponte o caminho de um arquivo",
+            "/ abre os comandos  ·  /workflows lista os procedimentos",
+        ] {
+            for piece in wrap_text(hint, (width as usize).saturating_sub(4).max(1)) {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(piece, dim),
+                ]));
+            }
+        }
+        lines
+    }
+
     let content_area = Rect {
         width: area.width.saturating_sub(1),
         ..area
@@ -760,6 +786,14 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
         width: content_area.width,
         area: content_area,
     }));
+
+    if state.lines.is_empty() && !state.processing() {
+        frame.render_widget(
+            Paragraph::new(empty_state(content_area.width)),
+            content_area,
+        );
+        return;
+    }
 
     let mut rows = rows;
     if let Some(selection) = state.selection {
@@ -851,10 +885,26 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
         return;
     }
 
+    // Fora de Idle o Enter não abre turno: enfileira (e comando `/` é
+    // recusado). Cor e legenda saem do MESMO `status` que `run_with_dashboard`
+    // consulta, então avisam antes da tecla em vez de depois do aviso.
+    let busy = state.status != Status::Idle;
+    let accent = match state.status {
+        Status::Idle => Color::Cyan,
+        Status::Streaming => Color::Yellow,
+        Status::Busy => Color::Red,
+    };
+
     let (inner, prompt_x, prompt_y) = if compact {
         (area, area.x, area.y)
     } else {
-        let block = Block::bordered().border_style(Style::default().fg(Color::DarkGray));
+        let mut block = Block::bordered()
+            .border_style(Style::default().fg(if busy { accent } else { Color::DarkGray }));
+        let title = " enter enfileira ";
+        // Em terminal estreito o título comeria a borda inteira; aí ele some.
+        if busy && title.len() + 2 <= area.width as usize {
+            block = block.title(Line::from(Span::styled(title, Style::default().fg(accent))));
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         (inner, inner.x, inner.y)
@@ -865,9 +915,7 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
 
     let prompt = Span::styled(
         "› ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
     );
 
     // Quebra o texto na largura útil; as continuações recuam 2 colunas para
@@ -879,12 +927,16 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect, 
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible.len());
     if state.input.is_empty() {
+        // Enquanto o turno roda `/models` seria recusado, então o placeholder
+        // troca a dica de comando pelo que o Enter faz agora.
+        let placeholder = if busy {
+            "escreva algo…  (enter enfileira)"
+        } else {
+            "escreva algo…  (/models troca o modelo)"
+        };
         lines.push(Line::from(vec![
             prompt.clone(),
-            Span::styled(
-                "escreva algo…  (/modelos troca o modelo)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
         ]));
     } else {
         for (index, chunk) in visible.iter().enumerate() {
@@ -1161,6 +1213,32 @@ fn draw_suggestions(frame: &mut ratatui::Frame<'_>, state: &ChatState, composer_
 }
 
 fn draw_overlay(frame: &mut ratatui::Frame<'_>, state: &ChatState) {
+    /// Dicas de teclado do modal, no mesmo estilo do rodapé principal: com o
+    /// overlay aberto todos os atalhos de baixo ficam inertes, então estas são
+    /// as únicas teclas que o usuário tem para descobrir.
+    fn hints(overlay: &crate::state::Overlay, visible: usize) -> String {
+        let memory = overlay.title.contains("memória");
+        let pendings = overlay.title.contains("pendências");
+        let mut keys = vec!["↑↓ navegar"];
+        if memory {
+            keys.push("d esquece");
+        }
+        if !memory && !pendings {
+            keys.push("enter aplica");
+        }
+        keys.push("esc fecha");
+        let keys = keys.join(" · ");
+        if overlay.items.len() > visible {
+            format!(
+                " {}/{} · {keys} ",
+                overlay.selected + 1,
+                overlay.items.len()
+            )
+        } else {
+            format!(" {keys} ")
+        }
+    }
+
     let Some(overlay) = &state.overlay else {
         return;
     };
@@ -1168,16 +1246,19 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, state: &ChatState) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
 
-    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let block = Block::bordered().title(overlay.title.clone());
+    let inner = block.inner(area);
+    // A última linha interna fica reservada às dicas de teclado.
+    let list_height = (inner.height as usize).saturating_sub(1).max(1);
     let start = overlay
         .selected
-        .saturating_sub(inner_height.saturating_sub(1));
+        .saturating_sub(list_height.saturating_sub(1));
     let lines: Vec<Line> = overlay
         .items
         .iter()
         .enumerate()
         .skip(start)
-        .take(inner_height)
+        .take(list_height)
         .map(|(index, item)| {
             let style = if index == overlay.selected {
                 Style::default()
@@ -1197,10 +1278,62 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, state: &ChatState) {
         Paragraph::new(lines)
     };
 
+    frame.render_widget(block, area);
+
+    let [list_area, hints_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(body, list_area);
     frame.render_widget(
-        body.block(Block::bordered().title(overlay.title.clone())),
-        area,
+        Paragraph::new(hints(overlay, list_height)).style(Style::default().fg(Color::DarkGray)),
+        hints_area,
     );
+}
+
+#[cfg(test)]
+mod overlay_hint_tests {
+    use super::*;
+
+    fn overlay_text(state: &ChatState, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_overlay(frame, state)).unwrap();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overlay_shows_its_keyboard_hints_and_position() {
+        let mut state = ChatState::default();
+        state.open_overlay(
+            " modelos ",
+            (0..40).map(|n| format!("modelo-{n}")).collect(),
+        );
+        let text = overlay_text(&state, 80, 24);
+        assert!(text.contains("↑↓ navegar"), "{text}");
+        assert!(text.contains("enter aplica"), "{text}");
+        assert!(text.contains("esc fecha"), "{text}");
+        assert!(text.contains("1/40"), "{text}");
+    }
+
+    #[test]
+    fn overlay_hints_follow_what_enter_and_d_actually_do() {
+        let mut state = ChatState::default();
+        state.open_overlay_with_ids(
+            " memória ",
+            vec!["fato um".to_string()],
+            vec!["id-1".to_string()],
+        );
+        let text = overlay_text(&state, 80, 24);
+        assert!(text.contains("d esquece"), "{text}");
+        assert!(!text.contains("enter aplica"), "{text}");
+        assert!(!text.contains("1/1"), "{text}");
+    }
 }
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -2037,6 +2170,37 @@ mod tests {
         }
     }
 
+    fn transcript_text(state: &ChatState) -> String {
+        let backend = ratatui::backend::TestBackend::new(60, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_transcript(frame, state, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..8)
+            .map(|y| {
+                (0..60u16)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn empty_transcript_teaches_how_to_start_and_steps_aside() {
+        let text = transcript_text(&ChatState::default());
+        assert!(text.contains("tupi"), "{text}");
+        assert!(text.contains("/workflows lista os procedimentos"), "{text}");
+
+        let mut state = ChatState::default();
+        state.push_user("oi");
+        let text = transcript_text(&state);
+        assert!(!text.contains("aponte o caminho de um arquivo"), "{text}");
+    }
+
     #[test]
     fn transcript_marks_user_and_assistant_messages() {
         let lines = vec![message(Role::User, "oi"), message(Role::Assistant, "olá")];
@@ -2450,5 +2614,45 @@ mod tests {
         state.finish_assistant();
         state.open_overlay("modelos", vec!["a".into()]);
         assert_eq!(should_toggle_mode(&state, backtab), ToggleAction::Ignore);
+    }
+}
+
+#[cfg(test)]
+mod composer_hint_tests {
+    use super::*;
+
+    fn rows(state: &ChatState, width: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
+        terminal
+            .draw(|frame| draw_composer(frame, state, Rect::new(0, 0, width, 5), false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..5)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+    }
+
+    /// O composer tem que dizer o que o Enter faz ANTES da tecla: fora de Idle
+    /// a mensagem entra na fila e comando `/` é recusado.
+    #[test]
+    fn composer_announces_queueing_while_a_turn_runs() {
+        let idle = rows(&ChatState::default(), 48);
+        assert!(idle.iter().any(|row| row.contains("/models troca o modelo")), "{idle:?}");
+        assert!(!idle.iter().any(|row| row.contains("enfileira")), "{idle:?}");
+
+        // `begin_assistant` é o caminho público que leva o estado a Streaming.
+        let mut streaming = ChatState::default();
+        streaming.begin_assistant();
+        let busy = rows(&streaming, 48);
+        assert!(busy.iter().any(|row| row.contains("enter enfileira")), "{busy:?}");
+        assert!(!busy.iter().any(|row| row.contains("/models")), "{busy:?}");
+
+        // Mesmo com texto já digitado a legenda continua valendo.
+        streaming.input = "segunda pergunta".into();
+        let typed = rows(&streaming, 48);
+        assert!(typed.iter().any(|row| row.contains("enter enfileira")), "{typed:?}");
     }
 }

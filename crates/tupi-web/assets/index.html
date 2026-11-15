@@ -19,15 +19,15 @@
       </div>
     </header>
 
-    <nav class="tabs" id="tabs">
-      <button data-tab="graph" class="active">Grafo</button>
-      <button data-tab="memory">Memória &amp; Fatos</button>
-      <button data-tab="session">Sessão &amp; Telemetria</button>
-      <button data-tab="workspace">Workspace</button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Seções do dashboard">
+      <button role="tab" id="tab-graph" data-tab="graph" aria-controls="panel-graph" aria-selected="true" tabindex="0" class="active">Grafo</button>
+      <button role="tab" id="tab-memory" data-tab="memory" aria-controls="panel-memory" aria-selected="false" tabindex="-1">Memória &amp; Fatos</button>
+      <button role="tab" id="tab-session" data-tab="session" aria-controls="panel-session" aria-selected="false" tabindex="-1">Sessão &amp; Telemetria</button>
+      <button role="tab" id="tab-workspace" data-tab="workspace" aria-controls="panel-workspace" aria-selected="false" tabindex="-1">Workspace</button>
     </nav>
 
     <main>
-      <section id="panel-graph" class="panel active">
+      <section id="panel-graph" class="panel active" role="tabpanel" aria-labelledby="tab-graph">
         <div class="graph-controls">
           <input id="graph-search" type="search" placeholder="símbolo ou arquivo" />
           <button id="graph-search-run">Buscar</button>
@@ -45,7 +45,7 @@
         </div>
       </section>
 
-      <section id="panel-memory" class="panel">
+      <section id="panel-memory" class="panel" role="tabpanel" aria-labelledby="tab-memory">
         <div class="columns">
           <div>
             <h2>Fatos ativos</h2>
@@ -62,13 +62,13 @@
         </div>
       </section>
 
-      <section id="panel-session" class="panel">
+      <section id="panel-session" class="panel" role="tabpanel" aria-labelledby="tab-session">
         <div class="cards" id="session-cards"></div>
         <h2>Linha do tempo</h2>
         <ul id="timeline"></ul>
       </section>
 
-      <section id="panel-workspace" class="panel">
+      <section id="panel-workspace" class="panel" role="tabpanel" aria-labelledby="tab-workspace">
         <div class="columns">
           <div>
             <h2>Notas e tarefas</h2>

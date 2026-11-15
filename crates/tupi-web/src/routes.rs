@@ -248,6 +248,7 @@ async fn history(State(state): State<AppState>) -> Json<HistoryDto> {
 struct WorkflowDto {
     name: String,
     description: String,
+    agent: Option<String>,
     source: String,
     path: Option<String>,
     shadowed: Vec<String>,
@@ -261,6 +262,7 @@ fn workflow_dto(workflow: Workflow) -> WorkflowDto {
     WorkflowDto {
         name: workflow.name,
         description: workflow.description,
+        agent: workflow.agent,
         source: workflow_source_name(&workflow.source),
         path: workflow.path.map(|path| path.display().to_string()),
         shadowed: workflow.shadowed.iter().map(workflow_source_name).collect(),

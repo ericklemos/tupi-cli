@@ -31,6 +31,7 @@ fn core_exposure_can_write_and_patch_non_rust_files() {
     let state = tempfile::tempdir().unwrap();
     let registry = core_registry(dir.path(), state.path());
 
+    assert!(registry.has("clock"), "perfil Core sem clock: a data vira palpite");
     assert!(registry.has("edit"), "perfil Core sem edit");
     assert!(
         registry.has("write"),

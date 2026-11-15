@@ -1,5 +1,6 @@
 (
     name: "artisan",
+    agent: Some("execution"),
     description: "Duvidar de toda afirmação até a ferramenta capaz de contradizê-la dizer que ela vale.",
     body: r#"# Artisan
 **Name:** The Artisan 🎨

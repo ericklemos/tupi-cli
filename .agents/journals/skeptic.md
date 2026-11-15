@@ -1,5 +1,26 @@
 # The Skeptic's Journal — Critical Disaster Scenarios
 
+## 2026-11-11 - Stale-Green `exec` Cache: The Verification Gate Lies About Freshness
+**The Flaw:** `ExecTool::call` (`crates/tupi-tools/src/tools/exec/mod.rs:162-203`) keys the cache on
+`args.join(" ") + fingerprint(root)`, and `fingerprint` (`crates/tupi-tools/src/tools/exec/render.rs:32-75`)
+only admits extensions `rs|toml|lock`, never dotfiles (`hidden(true)`) and never anything ignored by
+`.gitignore` (`standard_filters(true)`), identifying each file as `(path, len, mtime_nanos)` instead of
+hashing content. `.cargo/config.toml` (rustflags, linker, target-dir, `[env]`), `.sqlx/`, `.env*` and
+every fixture outside `rs/toml/lock` (`.json`, `.sql`, `.proto`, `.yaml`) are invisible to the key.
+On a hit the tool prints `status: ok · <original duration>s · em cache`, reconstructing a plausible
+fresh run time from the cloned `Output.duration` (`exec/mod.rs:84-87`, `exec/diagnostics.rs:65-150`).
+**The Catalyst:** A crate reads `tests/fixtures/*.json` (or `.cargo/config.toml` sets a `--cfg`/linker).
+The agent runs `exec kind=test` and gets `ok`. Only the fixture (or the hidden config) changes — via
+`write`/`edit` or by the user. Nothing in `rs|toml|lock` changed, so the next `exec kind=test` is a cache
+hit and returns the previous `ok`. The failure needs the one case nobody tests: a change outside the
+whitelist.
+**The Fallout:** The project's only falsifier (AGENTS.md: "nenhuma afirmação entra no contexto sem um
+falsificador") certifies broken code with a green `ok` and a fabricated duration. The agent reports
+"tests pass", opens the PR, and the pipeline finds the regression after review. Secondary: every `exec`
+pays a full `ignore::WalkBuilder` crawl (gitignore matching + metadata + sort) to save one cargo run that
+cargo already deduplicates with content hashes — the cache costs CPU on every call and buys no tokens.
+Only defense available to the model is `refresh: true` on every call, which nullifies the cache entirely.
+
 ## 2026-11-11 - The Prefix-Blind Target & Shrink-Induced Pruning Spiral
 **The Flaw:** `App::plan_context` (`crates/tupi-app/src/app.rs:105-122`) subtracts `fixed_tokens` (`tool_tokens + prefix_tokens + warning_tokens`) from `context_budget` to compute `message_budget`, yet passes the raw `context_target` into `plan_amortized_with` capped only by `.min(message_budget)` instead of subtracting `fixed_tokens`. Worse, inside `tupi_domain::context::plan_with` (`crates/tupi-domain/src/context.rs:74-118`), `shrink_old_results` runs unconditionally whenever `total(messages) > ceiling`, mutating old tool outputs into `[resultado anterior omitido...]` pointers even when the final turn unit cannot be dropped (`units(&kept) == 1`). `Plan::trimmed()` returns `true` whenever `shrunk_results > 0`, triggering `session.replace_messages(planned.messages)` in `App::send_message` (`app.rs:459`), which permanently overwrites the in-memory `SessionStore` with pointer text.
 **The Catalyst:** With default config (`budget: 32000`, `target: 16000`, `fixed_tokens: ~8000`), `message_budget` is `24000`, while `message_target` remains `16000` (leaving total prompt after pruning at `16000 + 8000 = 24000` instead of `16000`). When `token_scale` rises above `1.33x` (or `fixed_tokens >= 16000`), `message_target == message_budget`, which hits `target >= ceiling` in `plan_amortized_with` and **completely disables amortized pruning**, degrading to step-by-step thrashing that invalidates the provider's KV prefix cache on every single tool step. Simultaneously, if a single multi-step turn exceeds `message_budget`, old tool results are permanently erased from `SessionStore` and replaced with instructions to call the tool again—where `DeliveryLedger` (`crates/tupi-tools/src/ledger.rs`) responds with *"Já entregue nesta sessão — corpo em peek h_xxxx"* because the ledger was never notified that the context pruner destroyed the delivery.

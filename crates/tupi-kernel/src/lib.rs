@@ -74,6 +74,6 @@ mod tests {
         ));
     }
 }
-pub mod pipeline;
 pub mod embed;
 pub mod generate;
+pub mod pipeline;

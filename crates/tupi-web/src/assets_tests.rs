@@ -66,4 +66,20 @@ async fn index_wires_the_module_scripts_and_canvas() {
     assert!(html.contains("panel-memory"));
     assert!(html.contains("panel-session"));
     assert!(html.contains("panel-workspace"));
+    assert!(
+        html.contains("role=\"tablist\""),
+        "as abas precisam de tablist"
+    );
+    assert!(
+        html.contains("aria-selected=\"true\""),
+        "a aba ativa precisa expor aria-selected"
+    );
+    assert!(
+        html.contains("aria-controls=\"panel-graph\""),
+        "cada aba precisa apontar para seu painel"
+    );
+    assert!(
+        html.contains("role=\"tabpanel\""),
+        "os painéis precisam de tabpanel"
+    );
 }

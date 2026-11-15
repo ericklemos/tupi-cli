@@ -492,6 +492,7 @@ mod tests {
                 "ledger",
                 "sdd",
                 "state",
+                "clock",
                 "env",
                 "peek",
                 "setup",

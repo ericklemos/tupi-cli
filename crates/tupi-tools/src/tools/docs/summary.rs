@@ -16,8 +16,9 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// Limpa a saída do modelo para uma linha curta.
 pub fn sanitize(raw: &str, max_chars: usize) -> Option<String> {
     let line = raw.lines().next()?.trim();
-    let cleaned = strip_prefixes(line)
-        .trim_end_matches(|character: char| character.is_whitespace() || matches!(character, '"' | '\'' | '`'));
+    let cleaned = strip_prefixes(line).trim_end_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '"' | '\'' | '`')
+    });
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;

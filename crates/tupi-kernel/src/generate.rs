@@ -39,10 +39,7 @@ impl GeneratorSlot {
     }
 
     pub fn set(&self, generator: Arc<dyn Generator>) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(generator);
+        *self.0.write().unwrap_or_else(|error| error.into_inner()) = Some(generator);
     }
 }
 
@@ -54,7 +51,9 @@ mod tests {
     fn slot_starts_empty_and_accepts_one_generator() {
         struct Fake;
         impl Generator for Fake {
-            fn model_id(&self) -> &str { "fake-gen" }
+            fn model_id(&self) -> &str {
+                "fake-gen"
+            }
             fn generate(&self, _prompt: &str, _max_tokens: usize) -> Result<String, GenerateError> {
                 Ok("uma linha".to_string())
             }

@@ -49,6 +49,7 @@ impl WorkflowSource {
 pub struct Workflow {
     pub name: String,
     pub description: String,
+    pub agent: Option<String>,
     pub source: WorkflowSource,
     /// Relativo ao root do projeto; `None` quando viaja dentro do binário.
     pub path: Option<std::path::PathBuf>,
@@ -82,6 +83,7 @@ mod tests {
         Workflow {
             name: "feature".into(),
             description: "leva a feature do desenho ao teste".into(),
+            agent: None,
             source: WorkflowSource::LocalTupi,
             path: None,
             body: "# Feature\n\n1. enquadre\n".into(),

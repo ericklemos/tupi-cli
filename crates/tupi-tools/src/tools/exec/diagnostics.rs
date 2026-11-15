@@ -62,7 +62,11 @@ pub(super) fn test_lines(stdout: &str) -> Vec<String> {
     lines
 }
 
-pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<Section> {
+pub(crate) fn sections_for(
+    args: &[String],
+    raw: &Output,
+    cached_age: Option<std::time::Duration>,
+) -> Vec<Section> {
     let command = command_line(args);
     let status = if raw.timed_out {
         "timeout"
@@ -74,14 +78,29 @@ pub(crate) fn sections_for(args: &[String], raw: &Output, cached: bool) -> Vec<S
     let diag = diagnostics(&raw.stderr);
     let tests = test_lines(&raw.stdout);
 
+    // Um hit de cache não pode se passar por execução fresca: `raw.duration`
+    // é a duração da execução *original*, então a idade do hit precisa
+    // aparecer junto dela.
+    let timing = match cached_age {
+        Some(age) => {
+            let seconds = age.as_secs();
+            let ago = if seconds >= 60 {
+                format!("{}m{}s", seconds / 60, seconds % 60)
+            } else {
+                format!("{seconds}s")
+            };
+            format!(
+                "em cache há {ago} · execução original: {:.1}s",
+                raw.duration.as_secs_f64()
+            )
+        }
+        None => format!("{:.1}s", raw.duration.as_secs_f64()),
+    };
+
     let mut summary = String::new();
     summary.push('\n');
     summary.push_str(&format!("- comando: {command}\n"));
-    summary.push_str(&format!(
-        "- status: {status} · {:.1}s{}\n",
-        raw.duration.as_secs_f64(),
-        if cached { " · em cache" } else { "" }
-    ));
+    summary.push_str(&format!("- status: {status} · {timing}\n"));
     if !diag.errors.is_empty() || !diag.warnings.is_empty() {
         summary.push_str(&format!(
             "- erros: {} · avisos: {}\n",
