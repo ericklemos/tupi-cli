@@ -455,8 +455,8 @@ impl Tool for WorkflowTool {
         }
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "tupi-transcribe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tupi-infer.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process"] }
+whisper-rs = { version = "0.16", default-features = false }
+sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries"] }
+
+[features]
+# O Whisper (whisper.cpp) usa a mesma GPU do llama.cpp: a feature sobe do
+# binário `tupi` e liga o backend do whisper também.
+cuda = ["whisper-rs/cuda"]
+metal = ["whisper-rs/metal"]
+vulkan = ["whisper-rs/vulkan"]
+
+[dev-dependencies]
+tempfile.workspace = true

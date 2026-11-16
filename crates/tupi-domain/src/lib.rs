@@ -13,7 +13,7 @@ pub use workflow::{WORKFLOWS_PREFIX, Workflow, WorkflowSource, parse_workflow_in
 pub type SessionId = u64;
 pub type RequestId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     System,
     User,
@@ -32,14 +32,14 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -107,6 +107,10 @@ impl Session {
     pub fn push(&mut self, role: Role, content: impl Into<String>) {
         self.messages.push(Message::new(role, content));
     }
+
+    pub fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -114,6 +118,7 @@ pub enum AgentMode {
     #[default]
     Execution,
     Sdd,
+    Docs,
 }
 
 impl AgentMode {
@@ -121,12 +126,14 @@ impl AgentMode {
         match self {
             Self::Execution => 0,
             Self::Sdd => 1,
+            Self::Docs => 2,
         }
     }
 
     pub fn from_u8(raw: u8) -> Self {
         match raw {
             1 => Self::Sdd,
+            2 => Self::Docs,
             _ => Self::Execution,
         }
     }
@@ -245,5 +252,12 @@ mod tests {
 
         assert_eq!(session.messages[0], Message::user("oi"));
         assert_eq!(session.messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn docs_mode_round_trips_through_u8() {
+        assert_eq!(AgentMode::Docs.as_u8(), 2);
+        assert_eq!(AgentMode::from_u8(2), AgentMode::Docs);
+        assert_eq!(AgentMode::from_u8(9), AgentMode::Execution);
     }
 }

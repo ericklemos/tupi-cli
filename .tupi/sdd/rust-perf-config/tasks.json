@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "slug": "rust-perf-config",
-  "updated_at": 1794761770,
+  "updated_at": 1794783903,
   "tasks": [
     {
       "id": "T1",
@@ -9,7 +9,7 @@
       "details": "Declarar [profile.release] (lto, codegen-units=1, strip) e [profile.dev.package.\"*\"] opt-level para deps pesadas no Cargo.toml raiz:1-68, alem de um perfil profiling.",
       "nuances": [],
       "parallel": false,
-      "status": "in_progress",
+      "status": "done",
       "subtasks": [
         {
           "id": "T1.1",
@@ -25,7 +25,7 @@
           "acceptance": "cargo build --release conclui, binario roda --help, tempos comparados ao baseline.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T1.3",
@@ -41,7 +41,7 @@
           "acceptance": "cargo build --profile profiling gera binario com simbolos para perf/samply.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -77,7 +77,7 @@
       "details": "Nao ha #[global_allocator] em crates/tupi/src/main.rs:19. Adicionar mimalloc/jemalloc atras de feature e medir.",
       "nuances": [],
       "parallel": false,
-      "status": "open",
+      "status": "done",
       "subtasks": [
         {
           "id": "T3.1",
@@ -85,7 +85,7 @@
           "acceptance": "Build default sem a dependencia; com feature ligada testes e smoke de TUI/web passam.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T3.2",
@@ -93,7 +93,7 @@
           "acceptance": "Resultado numerico registrado; sem ganho, a feature e descartada.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -103,7 +103,7 @@
       "details": "Criar .cargo/config.toml (nao existe) com linker rapido (lld/mold) e caminho opt-in para target-cpu.",
       "nuances": [],
       "parallel": false,
-      "status": "in_progress",
+      "status": "done",
       "subtasks": [
         {
           "id": "T4.1",
@@ -111,7 +111,7 @@
           "acceptance": "Tempo de link release antes/depois registrado; build funciona em Linux e macOS.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T4.2",
@@ -129,7 +129,7 @@
       "details": "tokio com features=[\"full\"] (Cargo.toml:31) e tupi-infer com local-models fixo no binario (crates/tupi/Cargo.toml:18).",
       "nuances": [],
       "parallel": false,
-      "status": "in_progress",
+      "status": "done",
       "subtasks": [
         {
           "id": "T5.1",
@@ -145,7 +145,7 @@
           "acceptance": "cargo build -p tupi sem as features compila headless; default mantem comportamento atual.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },

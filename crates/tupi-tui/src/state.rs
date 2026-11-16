@@ -4,6 +4,7 @@ use crate::sdd::SDD_COMMAND;
 pub const COMMANDS: &[&str] = &[
     "/dashboard",
     "/models",
+    "/sessions",
     "/connect",
     "/enable-show-prompts-messages",
     SDD_COMMAND,
@@ -18,12 +19,22 @@ pub enum Status {
     Busy,
 }
 
+/// Qual lista o overlay está mostrando; as teclas mudam por tipo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    Generic,
+    Models,
+    Memory,
+    Sessions,
+}
+
 #[derive(Debug)]
 pub struct Overlay {
     pub title: String,
     pub items: Vec<String>,
     pub ids: Vec<String>,
     pub selected: usize,
+    pub kind: OverlayKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +95,8 @@ pub struct ChatState {
     pub workflows: Vec<String>,
     /// Slugs dos planos SDD retomáveis, usados depois de `/sdd `.
     pub sdd_specs: Vec<String>,
+    /// Sessão marcada para apagar com o segundo `d`, se houver.
+    pub pending_delete: Option<String>,
     pending_memory: Vec<String>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
@@ -166,14 +179,39 @@ impl ChatState {
         }
 
         self.streaming_index = None;
-        self.lines.push(ChatEntry::Tool {
+        let entry = ChatEntry::Tool {
             call_id: call_id.to_string(),
             name: name.to_string(),
             summary: compact_summary(summary),
             ok: None,
             started: std::time::Instant::now(),
             duration: None,
-        });
+        };
+
+        // Sub-chamada (id com `#`) entra no grupo do pai, não no fim da lista:
+        // com subagentes paralelos, os eventos chegam intercalados e o grupo
+        // precisa continuar contíguo.
+        let mut at = self.lines.len();
+        if let Some((parent, _)) = call_id.rsplit_once('#')
+            && let Some(index) = self.lines.iter().position(
+                |entry| matches!(entry, ChatEntry::Tool { call_id: id, .. } if id == parent),
+            )
+        {
+            at = index + 1;
+            while at < self.lines.len() {
+                let same_parent = match &self.lines[at] {
+                    ChatEntry::Tool { call_id: id, .. } => {
+                        id.rsplit_once('#').map(|(id_parent, _)| id_parent) == Some(parent)
+                    }
+                    _ => false,
+                };
+                if !same_parent {
+                    break;
+                }
+                at += 1;
+            }
+        }
+        self.lines.insert(at, entry);
     }
 
     pub fn push_memory(&mut self, text: &str, after: bool) {
@@ -377,16 +415,28 @@ impl ChatState {
     }
 
     pub fn open_overlay(&mut self, title: impl Into<String>, items: Vec<String>) {
-        self.overlay = Some(Overlay {
-            title: title.into(),
-            items,
-            ids: Vec::new(),
-            selected: 0,
-        });
+        self.open_overlay_kind(OverlayKind::Generic, title, items, Vec::new());
     }
 
     pub fn open_overlay_with_ids(
         &mut self,
+        title: impl Into<String>,
+        items: Vec<String>,
+        ids: Vec<String>,
+    ) {
+        self.open_overlay_kind(OverlayKind::Generic, title, items, ids);
+    }
+
+    pub fn selected_id(&self) -> Option<&str> {
+        self.overlay
+            .as_ref()
+            .and_then(|overlay| overlay.ids.get(overlay.selected))
+            .map(String::as_str)
+    }
+
+    pub fn open_overlay_kind(
+        &mut self,
+        kind: OverlayKind,
         title: impl Into<String>,
         items: Vec<String>,
         ids: Vec<String>,
@@ -396,14 +446,17 @@ impl ChatState {
             items,
             ids,
             selected: 0,
+            kind,
         });
     }
 
-    pub fn selected_id(&self) -> Option<&str> {
-        self.overlay
-            .as_ref()
-            .and_then(|overlay| overlay.ids.get(overlay.selected))
-            .map(String::as_str)
+    pub fn open_sessions(
+        &mut self,
+        title: impl Into<String>,
+        items: Vec<String>,
+        ids: Vec<String>,
+    ) {
+        self.open_overlay_kind(OverlayKind::Sessions, title, items, ids);
     }
 
     pub fn close_overlay(&mut self) {
@@ -415,6 +468,7 @@ impl ChatState {
     }
 
     pub fn overlay_next(&mut self) {
+        self.cancel_pending_delete();
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -424,6 +478,7 @@ impl ChatState {
     }
 
     pub fn overlay_prev(&mut self) {
+        self.cancel_pending_delete();
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -433,6 +488,51 @@ impl ChatState {
                 .checked_sub(1)
                 .unwrap_or(overlay.items.len() - 1);
         }
+    }
+
+    pub fn sessions_delete_pressed(&mut self) -> Option<String> {
+        let id = self.selected_id()?.to_string();
+        if self.pending_delete.as_deref() == Some(id.as_str()) {
+            self.pending_delete = None;
+            Some(id)
+        } else {
+            self.pending_delete = Some(id);
+            None
+        }
+    }
+
+    pub fn cancel_pending_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    pub fn load_transcript(&mut self, entries: Vec<tupi_kernel::TranscriptEntry>) {
+        self.reset_for_new_session();
+        for entry in entries {
+            match entry {
+                tupi_kernel::TranscriptEntry::User { text } => self.push_user(&text),
+                tupi_kernel::TranscriptEntry::Assistant { text } => {
+                    self.begin_assistant();
+                    self.append_token(&text);
+                    self.finish_assistant();
+                }
+                tupi_kernel::TranscriptEntry::Tool {
+                    call_id,
+                    name,
+                    summary,
+                    ok,
+                    duration_us,
+                } => {
+                    self.push_tool_started(&call_id, &name, &summary);
+                    self.finish_tool(
+                        &call_id,
+                        ok,
+                        Some(std::time::Duration::from_micros(duration_us)),
+                    );
+                }
+                tupi_kernel::TranscriptEntry::Notice { text } => self.push_memory(&text, true),
+            }
+        }
+        self.scroll = 0;
     }
 
     pub fn selected_item(&self) -> Option<&str> {
@@ -698,6 +798,30 @@ mod tests {
         // A sub-chamada de pipeline não infla o placar do turno.
         assert_eq!(state.turn_tool_stats(), (2, 1));
         assert_eq!(state.tools_in_flight(), 0);
+    }
+
+    #[test]
+    fn subagent_tools_are_inserted_under_their_own_agent() {
+        let mut state = ChatState::default();
+        state.push_tool_started("sdd#T1.1", "agent", "T1.1 — A");
+        state.push_tool_started("sdd#T1.2", "agent", "T1.2 — B");
+        state.push_tool_started("sdd#T1.1#1.0", "read", "a.rs");
+        state.push_tool_started("sdd#T1.2#1.0", "read", "b.rs");
+
+        // Agentes paralelos intercalam eventos; a linha de cada tool precisa
+        // ficar no grupo do seu próprio subagente.
+        let ids: Vec<&str> = state
+            .lines
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Tool { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sdd#T1.1", "sdd#T1.1#1.0", "sdd#T1.2", "sdd#T1.2#1.0"]
+        );
     }
 
     #[test]
@@ -1082,5 +1206,113 @@ mod tests {
             state.notice.is_none(),
             "aviso de fechamento ficou preso no modo SDD"
         );
+    }
+
+    #[test]
+    fn sessions_overlay_keeps_the_kind() {
+        let mut state = ChatState::default();
+        state.open_sessions(" sessões ", vec!["a".into()], vec!["1".into()]);
+        assert_eq!(
+            state.overlay.as_ref().map(|overlay| overlay.kind),
+            Some(OverlayKind::Sessions)
+        );
+
+        state.open_overlay(" modelos ", Vec::new());
+        assert_eq!(
+            state.overlay.as_ref().map(|overlay| overlay.kind),
+            Some(OverlayKind::Generic)
+        );
+    }
+
+    #[test]
+    fn delete_needs_two_presses_on_the_same_selection() {
+        let mut state = ChatState::default();
+        state.open_sessions(
+            " sessões ",
+            vec!["a".into(), "b".into()],
+            vec!["1".into(), "2".into()],
+        );
+        state.overlay_next();
+
+        assert_eq!(state.sessions_delete_pressed(), None);
+        assert_eq!(state.sessions_delete_pressed(), Some("2".into()));
+    }
+
+    #[test]
+    fn choosing_another_row_cancels_the_pending_delete() {
+        let mut state = ChatState::default();
+        state.open_sessions(
+            " sessões ",
+            vec!["a".into(), "b".into()],
+            vec!["1".into(), "2".into()],
+        );
+        state.sessions_delete_pressed();
+        state.overlay_next();
+        assert_eq!(state.pending_delete, None);
+        assert_eq!(state.sessions_delete_pressed(), None);
+        assert_eq!(state.pending_delete.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn load_transcript_rebuilds_every_entry() {
+        let mut state = ChatState::default();
+        state.load_transcript(vec![
+            tupi_kernel::TranscriptEntry::User { text: "oi".into() },
+            tupi_kernel::TranscriptEntry::Assistant {
+                text: "olá".into()
+            },
+            tupi_kernel::TranscriptEntry::Tool {
+                call_id: "c1".into(),
+                name: "read".into(),
+                summary: "src/lib.rs".into(),
+                ok: true,
+                duration_us: 42,
+            },
+            tupi_kernel::TranscriptEntry::Notice {
+                text: "memória".into(),
+            },
+        ]);
+
+        assert_eq!(state.lines.len(), 4);
+        assert!(matches!(
+            state.lines[0],
+            ChatEntry::Message {
+                role: tupi_domain::Role::User,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.lines[1],
+            ChatEntry::Message {
+                role: tupi_domain::Role::Assistant,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.lines[2],
+            ChatEntry::Tool {
+                ok: Some(true),
+                duration: Some(duration),
+                ..
+            } if duration == std::time::Duration::from_micros(42)
+        ));
+        assert!(matches!(state.lines[3], ChatEntry::Memory { .. }));
+        assert_eq!(state.status, Status::Idle);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn load_transcript_resets_the_previous_conversation() {
+        let mut state = ChatState::default();
+        state.push_user("antiga");
+        state.load_transcript(vec![tupi_kernel::TranscriptEntry::User {
+            text: "nova".into(),
+        }]);
+
+        assert_eq!(state.lines.len(), 1);
+        assert!(matches!(
+            &state.lines[0],
+            ChatEntry::Message { content, .. } if content == "nova"
+        ));
     }
 }

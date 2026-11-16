@@ -70,7 +70,13 @@ pub(crate) fn describe_call(tools: &ToolRegistry, call: &ToolCall) -> String {
 fn close_unanswered(session: &SessionStore, pending: &Mutex<Vec<ToolCall>>, reason: &str) {
     let calls = std::mem::take(&mut *pending.lock().unwrap());
     for call in calls {
-        session.push_message(Message::tool(call.id, reason));
+        let _ = session.record_tool(
+            Message::tool(call.id.clone(), reason),
+            &call,
+            reason,
+            false,
+            std::time::Duration::ZERO,
+        );
     }
 }
 
@@ -420,6 +426,10 @@ pub struct App {
     /// `sdd(action="close")` ou `/new`.
     sdd_flow_started: Arc<AtomicBool>,
     repo_key: Option<String>,
+    /// Archive das sessões do repositório; `None` nos construtores de teste.
+    session_archive: Mutex<Option<Arc<dyn crate::sessions::SessionArchive>>>,
+    /// Evita repetir o aviso de falha de gravação a cada mensagem do turno.
+    persist_error_reported: Arc<AtomicBool>,
 }
 const SDD_LOCK_NOTICE: &str = "SDD em andamento — conclua o fluxo antes de trocar de modo";
 
@@ -451,6 +461,23 @@ impl App {
         mode: Arc<std::sync::atomic::AtomicU8>,
     ) -> Arc<Self> {
         Arc::get_mut(&mut self).expect("App recém-criado").mode = mode;
+        self
+    }
+
+    /// Compartilha a célula do request id com quem roda trabalho fora do
+    /// pipeline (o executor SDD), para os eventos caírem no turno certo.
+    pub fn with_active_cell(self: Arc<Self>, _cell: Arc<AtomicU64>) -> Arc<Self> {
+        let mut app = self;
+        Arc::get_mut(&mut app).expect("App recém-criado").active = _cell;
+        app
+    }
+
+    pub fn with_session_archive(
+        self: Arc<Self>,
+        archive: Arc<dyn crate::sessions::SessionArchive>,
+    ) -> Arc<Self> {
+        *self.session_archive.lock().unwrap() = Some(archive.clone());
+        self.session.attach_archive(archive);
         self
     }
 
@@ -565,7 +592,7 @@ impl App {
         } else {
             crate::sdd::format_resume_brief(&plan)
         };
-        self.session.push_message(Message::user(brief));
+        let _ = self.session.record_synthetic(Message::user(brief));
 
         // A TUI limpa o notice ao aplicar `ModeChanged`; publicar o aviso
         // depois do evento garante que ele sobreviva à atualização do rodapé.
@@ -666,6 +693,8 @@ impl App {
             )),
             sdd_flow_started: Arc::new(AtomicBool::new(false)),
             repo_key: None,
+            session_archive: Mutex::new(None),
+            persist_error_reported: Arc::new(AtomicBool::new(false)),
         });
         app.apply_context();
         app
@@ -821,6 +850,87 @@ impl App {
         self.session.snapshot()
     }
 
+    fn list_sessions_command(&self) -> Result<CommandOutcome, CommandError> {
+        let Some(archive) = self.session_archive.lock().unwrap().clone() else {
+            return Ok(CommandOutcome::SessionsList {
+                items: Vec::new(),
+                ids: Vec::new(),
+            });
+        };
+        let now = crate::sessions::now_unix();
+        let summaries = archive.list().map_err(CommandError::Internal)?;
+        let mut items = Vec::with_capacity(summaries.len());
+        let mut ids = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            items.push(format!(
+                "{} · {} msgs · {}",
+                summary.title,
+                summary.message_count,
+                crate::sessions::relative_time(now, summary.updated_at)
+            ));
+            ids.push(summary.id);
+        }
+        Ok(CommandOutcome::SessionsList { items, ids })
+    }
+
+    fn resume_session_command(&self, id: &str) -> Result<CommandOutcome, CommandError> {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            return Err(CommandError::Internal("uso: /sessions".to_string()));
+        }
+        if self.active.load(Ordering::SeqCst) != 0 {
+            return Err(CommandError::Busy);
+        }
+        let archive = self
+            .session_archive
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| CommandError::Internal("sessões indisponíveis".to_string()))?;
+        let stored = archive
+            .load(&id)
+            .map_err(CommandError::Internal)?
+            .ok_or_else(|| CommandError::Internal(format!("sessão `{id}` não existe")))?;
+        let lock = archive.lock(&id).map_err(CommandError::Internal)?;
+        let crate::sessions::StoredSession {
+            meta,
+            messages,
+            transcript,
+        } = stored;
+        let title = meta.title.clone();
+        let mode = meta.mode;
+        self.session
+            .resume(&id, messages, meta, lock)
+            .map_err(CommandError::Internal)?;
+        self.mode.store(mode.as_u8(), Ordering::SeqCst);
+        self.sdd_flow_started
+            .store(mode == tupi_kernel::AgentMode::Sdd, Ordering::SeqCst);
+        self.memory.new_session();
+        self.events.publish(Event::ModeChanged { mode });
+        Ok(CommandOutcome::SessionResumed {
+            id,
+            title,
+            mode,
+            entries: transcript,
+        })
+    }
+
+    fn delete_session_command(&self, id: &str) -> Result<CommandOutcome, CommandError> {
+        let id = id.trim().to_string();
+        let archive = self
+            .session_archive
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| CommandError::Internal("sessões indisponíveis".to_string()))?;
+        if self.session.current_id().as_deref() == Some(id.as_str()) {
+            return Err(CommandError::Internal(
+                "não é possível apagar a sessão aberta".to_string(),
+            ));
+        }
+        let found = archive.delete(&id).map_err(CommandError::Internal)?;
+        Ok(CommandOutcome::SessionDeleted { id, found })
+    }
     pub fn provider(&self) -> Result<std::sync::Arc<dyn tupi_kernel::Provider>, CommandError> {
         let id = self.provider_id.lock().unwrap().clone();
         if self.registry.get(&id).is_none() {
@@ -883,6 +993,7 @@ impl App {
             }
         };
 
+        self.persist_error_reported.store(false, Ordering::SeqCst);
         let request_id = self.next_request.fetch_add(1, Ordering::SeqCst);
         self.active.store(request_id, Ordering::SeqCst);
         if self.mode() == tupi_kernel::AgentMode::Sdd {
@@ -890,6 +1001,7 @@ impl App {
         }
 
         let model = self.model.lock().unwrap().clone();
+        let provider_id = self.provider_id.lock().unwrap().clone();
         let tools = self.tools.clone();
         let base_prefix = self.prefix.clone();
         let mode_cell = Arc::clone(&self.mode);
@@ -927,7 +1039,17 @@ impl App {
 
         let last_user_message = text.clone();
         let debug_dir = self.debug_dir.clone();
-        self.session.push(Role::User, text);
+        if let Err(error) =
+            self.session
+                .record_user(text.clone(), self.mode(), &provider_id, &model)
+        {
+            tracing::warn!(%error, "falha ao gravar a sessão");
+            if !self.persist_error_reported.swap(true, Ordering::SeqCst) {
+                self.events.publish(Event::Notice {
+                    message: format!("sessão não gravada: {error}"),
+                });
+            }
+        }
 
         let partial = Arc::new(Mutex::new(String::new()));
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1000,6 +1122,8 @@ impl App {
                     ))
                 };
                 let mut closed_sdd = false;
+                let mut sdd_execute_terminal = false;
+                let mut sdd_execute_failure: Option<String> = None;
 
                 let warning_message = if step >= warn_at.max(1) {
                     let warning = if final_step {
@@ -1266,7 +1390,7 @@ impl App {
                 );
                 if truncated && !stream_failed && failure.is_none() {
                     if !streamed_text.is_empty() {
-                        session.push_message(
+                        let _ = session.record_message(
                             Message::assistant(streamed_text).with_reasoning(streamed_reasoning),
                         );
                     }
@@ -1278,7 +1402,7 @@ impl App {
                         ),
                     });
                     if truncation_retries <= MAX_TRUNCATION_RETRIES && !final_step {
-                        session.push_message(Message::new(
+                        let _ = session.record_message(Message::new(
                             Role::System,
                             format!(
                                 "A resposta anterior foi cortada pelo limite de {max_tokens} tokens antes de terminar. Nada dela foi executado. Não repita a mesma resposta: reemita-a cabendo no teto — um arquivo por chamada e, se o conteúdo for grande, crie um esqueleto pequeno e complete com edições em passos menores."
@@ -1303,12 +1427,12 @@ impl App {
 
                 if final_step {
                     if !streamed_text.is_empty() {
-                        session.push_message(
+                        let _ = session.record_message(
                             Message::assistant(streamed_text).with_reasoning(streamed_reasoning),
                         );
                     }
                 } else if !streamed_text.is_empty() || !calls.is_empty() {
-                    session.push_message(
+                    let _ = session.record_message(
                         Message::assistant_with_calls(streamed_text, calls.clone())
                             .with_reasoning(streamed_reasoning),
                     );
@@ -1364,10 +1488,11 @@ impl App {
                     }
 
                     let tool_started = std::time::Instant::now();
-                    let (mut content, ok) = if current_mode == tupi_kernel::AgentMode::Sdd
-                        && tools.get(&call.name).is_some_and(|t| !t.sdd_allowed())
-                    {
-                        (format!("tool '{}' bloqueada no modo SDD", call.name), false)
+                    let blocked = tools
+                        .get(&call.name)
+                        .is_some_and(|t| !t.mode_mask().contains(current_mode));
+                    let (mut content, ok) = if blocked {
+                        (format!("tool '{}' bloqueada neste modo", call.name), false)
                     } else {
                         match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
                             crate::pipeline::execute(
@@ -1395,17 +1520,50 @@ impl App {
                             Err(error) => (error, false),
                         }
                     };
-                    if ok
-                        && call.name == "sdd"
-                        && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    let sdd_action = if ok && call.name == "sdd" {
+                        serde_json::from_str::<serde_json::Value>(&call.arguments)
                             .ok()
-                            .and_then(|v| {
-                                v.get("action")
-                                    .and_then(|a| a.as_str().map(|s| s == "close"))
+                            .and_then(|value| {
+                                value
+                                    .get("action")
+                                    .and_then(|action| action.as_str())
+                                    .map(str::to_string)
                             })
-                            .unwrap_or(false)
-                    {
+                    } else {
+                        None
+                    };
+                    if sdd_action.as_deref() == Some("close") {
                         closed_sdd = true;
+                    }
+                    if sdd_action.as_deref() == Some("execute")
+                        && let (Some(store_ref), Some(rk)) = (&sdd_store, &sdd_repo_key)
+                        && let Some(slug) =
+                            serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("slug")
+                                        .and_then(|slug| slug.as_str())
+                                        .map(str::to_string)
+                                })
+                                .or_else(|| store_ref.active_slug(rk).ok().flatten())
+                        && let Ok(Some(plan)) = store_ref.load(rk, &slug)
+                        && matches!(
+                            plan.status,
+                            tupi_tools::sdd::SddPlanStatus::Completed
+                                | tupi_tools::sdd::SddPlanStatus::Failed
+                        )
+                    {
+                        sdd_execute_terminal = true;
+                        if plan.status == tupi_tools::sdd::SddPlanStatus::Failed {
+                            sdd_execute_failure = Some(
+                                content
+                                    .lines()
+                                    .find(|line| line.starts_with("execução SDD falhou:"))
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| "execução SDD falhou".to_string()),
+                            );
+                        }
                     }
                     let tool_summary = summarize(&content);
                     if ok
@@ -1456,7 +1614,7 @@ impl App {
                                 result_chars: clipped.chars,
                                 result_bytes: clipped.bytes,
                                 truncated: clipped.truncated,
-                                summary,
+                                summary: summary.clone(),
                                 error,
                             },
                         ));
@@ -1465,8 +1623,24 @@ impl App {
                     // O resultado e a baixa no pending são atômicos sob o mesmo
                     // lock que o cancel usa: nenhuma call recebe dois resultados.
                     let mut pending_calls = pending.lock().unwrap();
-                    session.push_message(Message::tool(call.id.clone(), content));
+                    let tool_content_summary = crate::app::summarize(&content);
+                    let _ = session.record_tool(
+                        Message::tool(call.id.clone(), content),
+                        &call,
+                        &tool_content_summary,
+                        ok,
+                        duration,
+                    );
                     pending_calls.retain(|pending| pending.id != call.id);
+                    drop(pending_calls);
+                    if sdd_execute_terminal {
+                        close_unanswered(
+                            &session,
+                            &pending,
+                            "turno encerrado: execução SDD terminou",
+                        );
+                        break;
+                    }
                 }
                 pending.lock().unwrap().clear();
                 if closed_sdd {
@@ -1481,12 +1655,31 @@ impl App {
                     if let (Some(store_ref), Some(rk)) = (&sdd_store, &sdd_repo_key)
                         && let Ok(Some(slug)) = store_ref.active_slug(rk)
                         && let Ok(Some(plan)) = store_ref.load(rk, &slug)
-                        && plan.status == tupi_tools::sdd::SddPlanStatus::Closed
+                        && matches!(
+                            plan.status,
+                            tupi_tools::sdd::SddPlanStatus::Closed
+                                | tupi_tools::sdd::SddPlanStatus::Completed
+                                | tupi_tools::sdd::SddPlanStatus::Failed
+                        )
                     {
-                        session.replace_messages(vec![Message::user(
-                            crate::sdd::format_execution_handoff(&plan),
-                        )]);
+                        let handoff =
+                            vec![Message::user(crate::sdd::format_execution_handoff(&plan))];
+                        let _ = session.record_checkpoint(handoff.clone());
+                        session.replace_messages(handoff);
                     }
+                }
+                if sdd_execute_terminal {
+                    let message = match &sdd_execute_failure {
+                        Some(failure_line) => {
+                            failure = Some(failure_line.clone());
+                            "execução SDD falhou — turno encerrado"
+                        }
+                        None => "SDD executado — turno encerrado",
+                    };
+                    events.publish(Event::Notice {
+                        message: message.to_string(),
+                    });
+                    break;
                 }
             }
 
@@ -1521,6 +1714,10 @@ impl App {
                 *slot = None;
             }
             drop(slot);
+
+            let _ = session.touch(tupi_kernel::AgentMode::from_u8(
+                mode_cell.load(Ordering::SeqCst),
+            ));
 
             let cancelled = active.load(Ordering::SeqCst) != request_id;
 
@@ -1626,7 +1823,7 @@ impl App {
                 .map(|partial| partial.lock().unwrap().clone())
                 .unwrap_or_default();
             if !partial_text.is_empty() {
-                self.session.push_assistant_once(&partial_text);
+                let _ = self.session.record_assistant_once(&partial_text);
             }
         }
 
@@ -1752,7 +1949,16 @@ impl CommandHandler for App {
 
         let started = std::time::Instant::now();
         let result = async {
+            match &command {
+                Command::ListSessions => return self.list_sessions_command(),
+                Command::ResumeSession { id } => return self.resume_session_command(id),
+                Command::DeleteSession { id } => return self.delete_session_command(id),
+                _ => {}
+            }
             match command {
+                Command::ListSessions => Ok(CommandOutcome::Noop),
+                Command::ResumeSession { .. } => Ok(CommandOutcome::Noop),
+                Command::DeleteSession { .. } => Ok(CommandOutcome::Noop),
                 Command::SendMessage { text } => self.send_message(text),
                 Command::RunWorkflow { name, extra } => self.run_workflow(&name, &extra),
                 Command::CancelStream { request_id } => Ok(self.cancel(request_id).await),
@@ -1762,7 +1968,8 @@ impl CommandHandler for App {
                 Command::ToggleMode => {
                     let next = match self.mode() {
                         tupi_kernel::AgentMode::Execution => tupi_kernel::AgentMode::Sdd,
-                        tupi_kernel::AgentMode::Sdd => tupi_kernel::AgentMode::Execution,
+                        tupi_kernel::AgentMode::Sdd => tupi_kernel::AgentMode::Docs,
+                        tupi_kernel::AgentMode::Docs => tupi_kernel::AgentMode::Execution,
                     };
                     self.apply_mode(next)
                 }
@@ -1774,6 +1981,7 @@ impl CommandHandler for App {
                     }
 
                     close_unanswered(&self.session, &self.pending, "nova sessão iniciada");
+                    self.session.finish_session(self.mode());
                     self.session.replace_messages(Vec::new());
                     self.memory.new_session();
                     self.sdd_flow_started.store(false, Ordering::SeqCst);
@@ -3170,6 +3378,30 @@ mod tests {
                 .iter()
                 .any(|message| message.role == Role::Tool)
         );
+    }
+
+    #[tokio::test]
+    async fn the_active_cell_tracks_the_turn_request_id() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![text_event("oi")]]));
+        let cell = Arc::new(AtomicU64::new(0));
+        let app =
+            app_with_tools(provider, bus, Arc::new(EchoTool::new())).with_active_cell(cell.clone());
+
+        let CommandOutcome::Started { request_id } = app
+            .handle(Command::SendMessage { text: "oi".into() })
+            .await
+            .unwrap()
+        else {
+            panic!("esperava Started");
+        };
+
+        // O executor SDD lê esta célula para publicar no turno correto.
+        assert_eq!(cell.load(Ordering::SeqCst), request_id);
+
+        wait_for_end(&mut rx).await;
+        assert_eq!(cell.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

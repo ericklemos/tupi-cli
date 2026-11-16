@@ -1,4 +1,5 @@
 pub(crate) mod assert;
+pub(crate) mod archive;
 pub(crate) mod clock;
 pub(crate) mod context_graph;
 pub(crate) mod diff;
@@ -9,6 +10,7 @@ pub(crate) mod exec;
 pub(crate) mod facts;
 pub(crate) mod fetch;
 pub(crate) mod impact;
+pub(crate) mod investigate;
 pub(crate) mod map;
 pub(crate) mod patch;
 pub(crate) mod peek;

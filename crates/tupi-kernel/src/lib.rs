@@ -1,10 +1,12 @@
 mod command;
+pub use command::TranscriptEntry;
 mod error;
 mod event;
 mod provider;
 mod query;
 mod registry;
 mod tool;
+pub use tool::ModeMask;
 
 mod workflow;
 
@@ -15,7 +17,8 @@ pub use provider::{ChatRequest, Provider, ProviderEvent, ProviderStream};
 pub use query::{Query, QueryBus, QueryHandler, QueryResult};
 pub use registry::ProviderRegistry;
 pub use tool::{
-    Tool, ToolError, ToolRegistry, ToolSpec, is_tool_cancelled, tools_payload, with_tool_cancel,
+    Tool, ToolError, ToolRegistry, ToolSpec, current_tool_cancel, is_tool_cancelled,
+    tools_payload, with_tool_cancel,
 };
 pub use workflow::WorkflowIndex;
 

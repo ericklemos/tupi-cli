@@ -18,6 +18,7 @@ tupi-web.workspace = true
 tupi-store.workspace = true
 tupi-tools.workspace = true
 tupi-infer = { workspace = true, default-features = false }
+tupi-transcribe.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 dotenvy.workspace = true
@@ -35,11 +36,14 @@ serde_json.workspace = true
 # escolhe o backend. A diferença é que agora dá para desligar:
 # `cargo build -p tupi --no-default-features` compila sem `llama-cpp-2`, que é o
 # maior custo de build nativo do binário (ver docs/perf/baseline.md).
+#
+# Transcrição NÃO é feature: `tupi transcribe` faz parte do binário final em
+# todas as variantes (CPU, CUDA, Vulkan, Metal).
 default = ["local-models", "cuda"]
 local-models = ["tupi-infer/local-models"]
-cuda = ["tupi-infer/cuda"]
-metal = ["tupi-infer/metal"]
-vulkan = ["tupi-infer/vulkan"]
+cuda = ["tupi-infer/cuda", "tupi-transcribe/cuda"]
+metal = ["tupi-infer/metal", "tupi-transcribe/metal"]
+vulkan = ["tupi-infer/vulkan", "tupi-transcribe/vulkan"]
 
 [dev-dependencies]
 tempfile.workspace = true

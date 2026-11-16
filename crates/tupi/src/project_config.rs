@@ -8,6 +8,9 @@ const FALLBACK_NAME: &str = "project";
 
 use std::collections::BTreeMap;
 
+#[path = "archive_config.rs"]
+pub mod archive_config;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Configuração do índice vetorial local ("space").
 pub struct SpaceConfig {
@@ -48,6 +51,9 @@ pub struct ProjectConfig {
     /// Índice vetorial local do repositório. Ausente liga por padrão.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<SpaceConfig>,
+    /// Acervo persistente do modo docs. Ausente desliga o modo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<archive_config::ArchiveConfig>,
 }
 
 pub use crate::lang::Lang;
@@ -338,6 +344,7 @@ fn fallback(root: &Path) -> ProjectConfig {
         models: Default::default(),
         dashboard_web_port: None,
         space: None,
+        archive: None,
     }
 }
 

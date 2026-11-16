@@ -24,6 +24,7 @@ grep-regex.workspace = true
 ignore.workspace = true
 libc.workspace = true
 tracing.workspace = true
+redb.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]

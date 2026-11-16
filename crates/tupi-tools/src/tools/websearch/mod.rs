@@ -150,8 +150,8 @@ impl Tool for WebSearchTool {
         format!("websearch: {query}")
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }
 }
 
@@ -186,30 +186,5 @@ mod tests {
             4000,
         );
         assert!(Tool::call(&tool, serde_json::json!({"query": "  "})).is_err());
-    }
-
-    // TEMP: sonda manual de rede. Remover apos o teste.
-    #[test]
-    fn temp_live_network_probe() {
-        let cwd = std::path::Path::new(".");
-        let google = super::super::super::support::web::curl("https://www.google.com", cwd)
-            .map(|html| {
-                format!(
-                    "OK {} bytes · title={:?}",
-                    html.len(),
-                    super::super::super::support::web::title(&html)
-                )
-            })
-            .map_err(|error| format!("ERRO {error:?}"));
-        let ddg = search_hits("rust programming language", None, cwd)
-            .map(|hits| {
-                let first = hits
-                    .first()
-                    .map(|hit| format!("{} -> {}", hit.title, hit.url))
-                    .unwrap_or_else(|| "sem hits".to_string());
-                format!("OK {} hits · primeiro={first}", hits.len())
-            })
-            .map_err(|error| format!("ERRO {error:?}"));
-        panic!("GOOGLE={google:?} || DDG={ddg:?}");
     }
 }

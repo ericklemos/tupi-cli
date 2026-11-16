@@ -125,6 +125,88 @@ pub async fn run_with_dashboard(
                         }
 
                         if state.overlay_open() {
+                            if state
+                                .overlay
+                                .as_ref()
+                                .is_some_and(|overlay| overlay.kind == crate::state::OverlayKind::Sessions)
+                            {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        state.cancel_pending_delete();
+                                        state.close_overlay();
+                                    }
+                                    KeyCode::Up => state.overlay_prev(),
+                                    KeyCode::Down => state.overlay_next(),
+                                    KeyCode::Char('d') => {
+                                        if let Some(id) = state.sessions_delete_pressed() {
+                                            match buses
+                                                .commands
+                                                .dispatch(Command::DeleteSession { id: id.clone() })
+                                                .await
+                                            {
+                                                Ok(CommandOutcome::SessionDeleted { found, .. }) => {
+                                                    state.notice = Some(if found {
+                                                        format!("sessão apagada: {id}")
+                                                    } else {
+                                                        format!("sessão {id} não encontrada")
+                                                    });
+                                                }
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    state.notice = Some(error.to_string())
+                                                }
+                                            }
+                                            match buses.commands.dispatch(Command::ListSessions).await {
+                                                Ok(CommandOutcome::SessionsList { items, ids })
+                                                    if !items.is_empty() =>
+                                                {
+                                                    state.open_sessions(" sessões ", items, ids);
+                                                }
+                                                Ok(_) => state.close_overlay(),
+                                                Err(error) => {
+                                                    state.notice = Some(error.to_string())
+                                                }
+                                            }
+                                        } else {
+                                            state.notice =
+                                                Some("pressione d de novo para apagar".to_string());
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        if let Some(id) = state.selected_id().map(str::to_string) {
+                                            match buses
+                                                .commands
+                                                .dispatch(Command::ResumeSession { id })
+                                                .await
+                                            {
+                                                Ok(CommandOutcome::SessionResumed {
+                                                    title,
+                                                    mode,
+                                                    entries,
+                                                    ..
+                                                }) => {
+                                                    state.close_overlay();
+                                                    state.load_transcript(entries);
+                                                    state.apply_mode_changed(mode);
+                                                    state.sdd_specs =
+                                                        sdd_spec_names(&buses.queries).await;
+                                                    state.notice =
+                                                        Some(format!("sessão retomada: {title}"));
+                                                }
+                                                Ok(_) => state.close_overlay(),
+                                                Err(error) => {
+                                                    state.notice = Some(error.to_string())
+                                                }
+                                            }
+                                        } else {
+                                            state.close_overlay();
+                                        }
+                                    }
+                                    _ => state.cancel_pending_delete(),
+                                }
+                                continue;
+                            }
+
                             match key.code {
                                 KeyCode::Esc => state.close_overlay(),
                                 KeyCode::Up => state.overlay_prev(),
@@ -276,6 +358,23 @@ pub async fn run_with_dashboard(
                                             Ok(_) => {}
                                             Err(error) => state.fail(&error.to_string()),
                                         }
+                                    } else if input == "/sessions" {
+                                        state.input.clear();
+                                        state.refresh_suggestions();
+                                        match buses.commands.dispatch(Command::ListSessions).await {
+                                            Ok(CommandOutcome::SessionsList { items, ids })
+                                                if !items.is_empty() =>
+                                            {
+                                                state.open_sessions(" sessões ", items, ids);
+                                            }
+                                            Ok(_) => {
+                                                state.notice =
+                                                    Some("nenhuma sessão neste repositório".to_string())
+                                            }
+                                            Err(error) => {
+                                                state.notice = Some(error.to_string())
+                                            }
+                                        }
                                     } else if input == "/enable-show-prompts-messages" {
                                         state.input.clear();
                                         state.refresh_suggestions();
@@ -386,6 +485,11 @@ pub async fn run_with_dashboard(
                                     continue;
                                 }
                                 if let Some(request_id) = request {
+                                    // O cancelamento espera as tools em voo
+                                    // pararem: avisa e desenha antes para o
+                                    // ESC não parecer ignorado.
+                                    state.notice = Some("cancelando…".to_string());
+                                    terminal.draw(|frame| draw(frame, &state, &model, &provider))?;
                                     let cancelled = matches!(
                                         buses
                                             .commands
@@ -393,6 +497,7 @@ pub async fn run_with_dashboard(
                                             .await,
                                         Ok(CommandOutcome::Cancelled)
                                     );
+                                    state.notice = None;
                                     if cancelled {
                                         state.finish_assistant();
                                         request = drain_queue(&buses.commands, &mut state).await;
@@ -1139,6 +1244,7 @@ fn draw_details(
     let (mode_badge, mode_color) = match state.mode {
         tupi_kernel::AgentMode::Sdd => ("[SDD]", Color::Cyan),
         tupi_kernel::AgentMode::Execution => ("[EXEC]", Color::DarkGray),
+        tupi_kernel::AgentMode::Docs => ("[DOCS]", Color::Magenta),
     };
 
     let left = Line::from(vec![
@@ -1478,6 +1584,7 @@ fn transcript_layout_at(
             | "research" | "env" => ("◆", Color::Cyan),
             "edit" | "write" | "write_many" | "patch" | "relocate" => ("▪", Color::Yellow),
             "exec" | "shell" | "test_many" | "setup" => ("▸", Color::Magenta),
+            "agent" => ("◇", Color::Cyan),
             _ => ("⚙", Color::DarkGray),
         }
     }
@@ -1595,13 +1702,14 @@ fn transcript_layout_at(
                     }
                 }
 
-                let child = call_id.contains('#');
-                let extra = if group_open {
-                    2 + if child { 2 } else { 0 }
-                } else {
-                    0
-                };
-                let lead = format!("  {}{}", " ".repeat(extra), if child { "└ " } else { "" });
+                let depth = call_id.matches('#').count();
+                let extra = if group_open { 2 } else { 0 };
+                let lead = format!(
+                    "  {}{}{}",
+                    " ".repeat(extra),
+                    " ".repeat(2 * depth),
+                    if depth > 0 { "└ " } else { "" }
+                );
                 let (glyph, glyph_color) = tool_glyph(name);
                 let (mark, mark_color) = match ok {
                     Some(true) => ("✓", Color::Green),
@@ -2391,6 +2499,50 @@ mod tests {
     }
 
     #[test]
+    fn subagent_tools_render_indented_under_the_agent_line() {
+        let now = std::time::Instant::now();
+        let lines = vec![
+            ChatEntry::Tool {
+                call_id: "sdd#T1.1".into(),
+                name: "agent".into(),
+                summary: "T1.1 — Parser".into(),
+                ok: None,
+                started: now,
+                duration: None,
+            },
+            ChatEntry::Tool {
+                call_id: "sdd#T1.1#1.0".into(),
+                name: "read".into(),
+                summary: "src/a.rs".into(),
+                ok: Some(true),
+                started: now,
+                duration: Some(std::time::Duration::from_millis(300)),
+            },
+        ];
+        let rows = transcript_layout_at(
+            &lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            now,
+        );
+        let texts: Vec<String> = rows.rows.iter().map(row_text).collect();
+        let agent = texts
+            .iter()
+            .find(|row| row.contains("agent · T1.1"))
+            .unwrap();
+        let tool = texts
+            .iter()
+            .find(|row| row.contains("read · src/a.rs"))
+            .unwrap();
+        let indent = |row: &str| row.chars().take_while(|ch| *ch == ' ').count();
+
+        // O subagente tem glifo próprio e a tool dele desce um nível.
+        assert!(agent.contains('◇'), "{agent}");
+        assert!(indent(tool) > indent(agent), "{agent:?} vs {tool:?}");
+    }
+
+    #[test]
     fn tool_run_of_three_gains_a_header_with_live_placar() {
         let now = std::time::Instant::now();
         let mut lines = vec![message(Role::User, "vai")];
@@ -2889,6 +3041,15 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect();
         assert!(sdd_row.contains("[SDD]"), "{sdd_row:?}");
+
+        state.apply_mode_changed(tupi_kernel::AgentMode::Docs);
+        terminal
+            .draw(|frame| draw_details(frame, &state, "modelo", "prov", frame.area()))
+            .unwrap();
+        let docs_row: String = (0..100)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(docs_row.contains("[DOCS]"), "{docs_row:?}");
     }
 
     #[test]

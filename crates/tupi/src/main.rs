@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
         agent_timeout: std::time::Duration,
         agent_prefix: String,
         repo_key: String,
+        active: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl AgentExecutor {
@@ -52,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens: self.max_tokens,
                 agent_timeout: self.agent_timeout,
                 events: self.events.clone(),
-                request_id: 0,
+                request_id: self.active.load(std::sync::atomic::Ordering::SeqCst),
+                // Dentro de um turno, `execute` herda a flag da tool em
+                // curso (o ESC); esta só vale fora dele, onde ninguém a aciona.
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 in_flight: std::sync::Arc::new(tokio::sync::Notify::new()),
                 in_flight_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -70,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
     // `tupi install` responde antes de qualquer inicialização pesada: não
     // exige chave de API, não abre o redb, não baixa modelo e não sobe a TUI.
     let argv: Vec<String> = std::env::args().collect();
+    // `tupi transcribe` também responde antes de abrir o redb e a TUI.
+    if let Some(args) = tupi_transcribe::subcommand(&argv) {
+        std::process::exit(transcribe::run(args).await?);
+    }
     if let Some(args) = install_args(&argv) {
         install::run(args)?;
         return Ok(());
@@ -263,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         );
         registry
     });
+    let active_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let auto_execute = store
         .setting("sdd.auto_execute")
         .ok()
@@ -377,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
                 ) as u64),
                 agent_prefix: tupi_app::sdd::compose_agent_prefix(&prefix),
                 repo_key: repo_key.clone(),
+                active: active_cell.clone(),
             });
             tool_options.sdd_executor = Some(std::sync::Arc::new(
                 move |plan: &tupi_tools::sdd::SddPlan| executor.run(plan),
@@ -455,7 +464,11 @@ async fn main() -> anyhow::Result<()> {
     let app = app
         .with_repo_key(repo_key)
         .with_mode_cell(mode_cell)
+        .with_active_cell(active_cell)
         .with_sdd_store(sdd_store_for_tools.clone());
+    let app = app.with_session_archive(std::sync::Arc::new(
+        tupi_app::sessions::FsSessionArchive::new(root.clone()),
+    ));
     let app = app.with_workflows(workflows);
     let app = app.with_memory(root.clone());
 
@@ -933,3 +946,6 @@ mod web_port_tests {
         assert_eq!(resolve_web_port(0, None), 0);
     }
 }
+
+// Subcomando `tupi transcribe` (feature `transcribe`).
+mod transcribe;

@@ -563,6 +563,7 @@ fn mode_label(mode: tupi_kernel::AgentMode) -> &'static str {
     match mode {
         tupi_kernel::AgentMode::Execution => "execution",
         tupi_kernel::AgentMode::Sdd => "sdd",
+        tupi_kernel::AgentMode::Docs => "docs",
     }
 }
 
@@ -667,6 +668,30 @@ impl CommandInfo {
                 extra: Some(slug.clone()),
                 model: None,
             },
+            Command::ListSessions => Self {
+                command: "list_sessions".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: None,
+                model: None,
+            },
+            Command::ResumeSession { id } => Self {
+                command: "resume_session".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: Some(id.clone()),
+                model: None,
+            },
+            Command::DeleteSession { id } => Self {
+                command: "delete_session".to_string(),
+                request: None,
+                text: None,
+                workflow: None,
+                extra: Some(id.clone()),
+                model: None,
+            },
         }
     }
 
@@ -715,6 +740,9 @@ impl CommandInfo {
                         CommandOutcome::MemoryToggled { .. } => "memory_toggled",
                         CommandOutcome::MemoryForgotten { .. } => "memory_forgotten",
                         CommandOutcome::SddResumed { .. } => "sdd_resumed",
+                        CommandOutcome::SessionsList { .. } => "sessions_list",
+                        CommandOutcome::SessionResumed { .. } => "session_resumed",
+                        CommandOutcome::SessionDeleted { .. } => "session_deleted",
                         CommandOutcome::Noop => "noop",
                     }
                     .to_string(),
@@ -738,10 +766,15 @@ impl CommandInfo {
                     CommandOutcome::SddResumed { mode, .. } => {
                         finished.mode = Some(mode_label(*mode).to_string());
                     }
+                    CommandOutcome::SessionResumed { mode, .. } => {
+                        finished.mode = Some(mode_label(*mode).to_string());
+                    }
                     CommandOutcome::Cancelled
                     | CommandOutcome::Memory { .. }
                     | CommandOutcome::MemoryForgotten { .. }
                     | CommandOutcome::SessionReset
+                    | CommandOutcome::SessionsList { .. }
+                    | CommandOutcome::SessionDeleted { .. }
                     | CommandOutcome::Noop => {}
                 }
             }

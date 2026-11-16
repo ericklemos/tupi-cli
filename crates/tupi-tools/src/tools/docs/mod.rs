@@ -393,11 +393,8 @@ impl Tool for DocsTool {
         self.writable
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
-    }
-    fn execution_allowed(&self) -> bool {
-        false
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::SDD
     }
 }
 

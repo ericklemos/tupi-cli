@@ -733,6 +733,7 @@ impl Tool for SddTool {
         match mode {
             AgentMode::Execution => self.execution_spec(),
             AgentMode::Sdd => self.spec(),
+            AgentMode::Docs => self.spec(),
         }
     }
 
@@ -1164,8 +1165,8 @@ impl Tool for SddTool {
         true
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }
 }
 

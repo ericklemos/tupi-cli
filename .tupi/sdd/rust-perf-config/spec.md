@@ -2,7 +2,7 @@
 
 # Ajuste de perfis e configuração Rust para performance (`rust-perf-config`)
 
-**Status:** failed
+**Status:** completed
 
 ## Objetivo
 

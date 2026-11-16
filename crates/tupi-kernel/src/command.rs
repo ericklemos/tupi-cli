@@ -16,6 +16,27 @@ pub enum MemoryAction {
     On,
 }
 
+/// Uma linha visível da conversa, pronta para a TUI desenhar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        summary: String,
+        ok: bool,
+        duration_us: u64,
+    },
+    Notice {
+        text: String,
+    },
+}
+
 pub enum Command {
     SendMessage {
         text: String,
@@ -54,6 +75,16 @@ pub enum Command {
     ResumeSdd {
         slug: String,
     },
+    /// `/sessions`: lista as sessões gravadas no repositório.
+    ListSessions,
+    /// `/sessions` + Enter: retoma a sessão escolhida.
+    ResumeSession {
+        id: String,
+    },
+    /// `/sessions` + `d` duas vezes: apaga a sessão escolhida.
+    DeleteSession {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +122,22 @@ pub enum CommandOutcome {
         title: String,
         mode: tupi_domain::AgentMode,
         open_tasks: usize,
+    },
+    /// `/sessions` aceito: as linhas e os ids estão na ordem da lista.
+    SessionsList {
+        items: Vec<String>,
+        ids: Vec<String>,
+    },
+    /// A sessão foi retomada: o app já trocou o histórico e o modo.
+    SessionResumed {
+        id: String,
+        title: String,
+        mode: tupi_domain::AgentMode,
+        entries: Vec<TranscriptEntry>,
+    },
+    SessionDeleted {
+        id: String,
+        found: bool,
     },
     Noop,
 }
@@ -132,5 +179,56 @@ impl CommandBus {
         command: Command,
     ) -> Result<CommandOutcome, CommandError> {
         self.handler.handle_in(Some(session), command).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_commands_carry_what_the_tui_needs() {
+        let entries = vec![
+            TranscriptEntry::User { text: "oi".into() },
+            TranscriptEntry::Tool {
+                call_id: "c1".into(),
+                name: "read".into(),
+                summary: "src/lib.rs".into(),
+                ok: true,
+                duration_us: 42,
+            },
+        ];
+        let outcome = CommandOutcome::SessionResumed {
+            id: "100-1".into(),
+            title: "Primeira".into(),
+            mode: tupi_domain::AgentMode::Sdd,
+            entries: entries.clone(),
+        };
+
+        match outcome {
+            CommandOutcome::SessionResumed {
+                id,
+                mode,
+                entries: got,
+                ..
+            } => {
+                assert_eq!(id, "100-1");
+                assert_eq!(mode, tupi_domain::AgentMode::Sdd);
+                assert_eq!(got, entries);
+            }
+            _ => panic!("outcome errado"),
+        }
+
+        let _ = Command::ListSessions;
+        let _ = Command::ResumeSession { id: "x".into() };
+        let _ = Command::DeleteSession { id: "x".into() };
+        let _ = CommandOutcome::SessionsList {
+            items: vec![],
+            ids: vec![],
+        };
+        let _ = CommandOutcome::SessionDeleted {
+            id: "x".into(),
+            found: false,
+        };
     }
 }

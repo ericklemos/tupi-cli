@@ -3,8 +3,15 @@
 ## Arquitetura
 
 - [Arquitetura](architecture.md) — camadas, fronteiras e componentes do workspace.
-- [Baseline de performance](perf/baseline.md) — números de build e do grafo, com as
-  lacunas de medição.
+
+## Performance
+
+- [Baseline de performance](perf/baseline.md) — números de build e do grafo,
+  ajustes aplicados e lacunas de medição.
+- [Baseline de build (T1.1)](perf/build-baseline.md) — tempos e tamanhos a frio
+  antes de qualquer `[profile.*]`, com o script de reprodução.
+- [Alocador e linker: medidos e descartados](perf/allocator-and-linker.md) —
+  `mimalloc` e `mold` não trouxeram ganho; o que ficou como harness.
 
 ## Comandos
 

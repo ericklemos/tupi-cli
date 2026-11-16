@@ -69,8 +69,8 @@ impl Tool for ReadOnlyStub {
         Ok("conteudo".into())
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }
 }
 
@@ -125,8 +125,8 @@ impl Tool for CloseSddStub {
         true
     }
 
-    fn sdd_allowed(&self) -> bool {
-        true
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }
 }
 
@@ -164,13 +164,16 @@ async fn shift_tab_is_blocked_after_first_message_in_sdd() {
     )
     .with_mode_cell(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8())));
 
+    // O ciclo agora tem três modos: Sdd → Docs → Execution → Sdd.
     assert!(matches!(
         app.handle(Command::ToggleMode).await.unwrap(),
         CommandOutcome::ModeChanged {
-            mode: AgentMode::Execution
+            mode: AgentMode::Docs
         }
     ));
     app.handle(Command::ToggleMode).await.unwrap();
+    app.handle(Command::ToggleMode).await.unwrap();
+    assert_eq!(app.mode(), AgentMode::Sdd);
 
     app.handle(Command::SendMessage {
         text: "quero auth".into(),
@@ -206,7 +209,7 @@ async fn shift_tab_is_blocked_after_first_message_in_sdd() {
     assert!(matches!(
         app.handle(Command::ToggleMode).await.unwrap(),
         CommandOutcome::ModeChanged {
-            mode: AgentMode::Execution
+            mode: AgentMode::Docs
         }
     ));
 }
@@ -497,6 +500,8 @@ async fn toggling_mode_twice_keeps_the_sdd_plan_open_and_does_not_announce_close
     .with_mode_cell(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8())))
     .with_sdd_store(sdd.clone());
 
+    // Sdd → Docs → Execution → Sdd: sair e voltar não pode fechar o plano.
+    app.handle(Command::ToggleMode).await.unwrap();
     app.handle(Command::ToggleMode).await.unwrap();
     app.handle(Command::ToggleMode).await.unwrap();
 
@@ -519,5 +524,260 @@ async fn toggling_mode_twice_keeps_the_sdd_plan_open_and_does_not_announce_close
     assert!(
         !noticed_close,
         "o fechamento só pode ser anunciado pela tool sdd(action=\"close\") no planejamento"
+    );
+}
+struct ExecutingSddStub {
+    store: Arc<InMemorySddStore>,
+    repo_key: String,
+    slug: String,
+    executes: Arc<AtomicU8>,
+}
+
+impl Tool for ExecutingSddStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sdd".into(),
+            description: String::new(),
+            schema: serde_json::json!({}),
+        }
+    }
+
+    fn call(&self, arguments: Value) -> Result<String, ToolError> {
+        if arguments.get("action").and_then(Value::as_str) == Some("execute") {
+            self.executes.fetch_add(1, Ordering::SeqCst);
+            let mut plan = self
+                .store
+                .load(&self.repo_key, &self.slug)
+                .map_err(ToolError::Other)?
+                .ok_or_else(|| ToolError::NotFound(self.slug.clone()))?;
+            plan.status = SddPlanStatus::Failed;
+            self.store.save(&plan).map_err(ToolError::Other)?;
+            return Ok("### sdd — execução\nexecução SDD falhou: t1 falhou".into());
+        }
+        Ok("ok".into())
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
+    }
+}
+
+#[tokio::test]
+async fn failed_sdd_execute_ends_the_turn_instead_of_reexecuting() {
+    let sdd = Arc::new(InMemorySddStore::default());
+    let repo_key = "repo-exec".to_string();
+    let plan = SddPlan {
+        slug: "auth".into(),
+        repo_key: repo_key.clone(),
+        title: "Autenticação".into(),
+        status: SddPlanStatus::Closed,
+        goal: "Adicionar OAuth".into(),
+        created_at: 100,
+        updated_at: 100,
+        closed_at: Some(100),
+        ..Default::default()
+    };
+    sdd.save(&plan).unwrap();
+    sdd.set_active_slug(&repo_key, Some("auth")).unwrap();
+
+    let executes = Arc::new(AtomicU8::new(0));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+            id: "c_exec_1".into(),
+            name: "sdd".into(),
+            arguments: r#"{"action":"execute"}"#.into(),
+        }]))],
+        vec![Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+            id: "c_exec_2".into(),
+            name: "sdd".into(),
+            arguments: r#"{"action":"execute"}"#.into(),
+        }]))],
+        vec![Ok(ProviderEvent::Text("não deveria chegar aqui".into()))],
+    ]));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ExecutingSddStub {
+        store: sdd.clone(),
+        repo_key: repo_key.clone(),
+        slug: "auth".into(),
+        executes: executes.clone(),
+    }));
+
+    let bus = EventBus::new(64);
+    let mut rx = bus.subscribe();
+    let app = App::with_tools(
+        registry(provider.clone()),
+        "scripted",
+        "m".into(),
+        bus,
+        None,
+        tools,
+        "BASE".into(),
+    )
+    .with_repo_key(repo_key)
+    .with_mode_cell(Arc::new(AtomicU8::new(AgentMode::Execution.as_u8())))
+    .with_sdd_store(sdd);
+
+    app.handle(Command::SendMessage {
+        text: "continue".into(),
+    })
+    .await
+    .unwrap();
+
+    let mut failed = None;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("tempo esgotado esperando evento")
+            .expect("canal de eventos fechado");
+        match event {
+            Event::StreamFailed { message, .. } => {
+                failed = Some(message);
+                break;
+            }
+            Event::StreamFinished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        executes.load(Ordering::SeqCst),
+        1,
+        "a execução SDD só pode rodar uma vez por turno"
+    );
+    assert!(
+        failed
+            .as_deref()
+            .is_some_and(|message| message.contains("execução SDD falhou")),
+        "o turno precisa terminar com a falha da execução: {failed:?}"
+    );
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        1,
+        "o modelo não pode ser chamado de novo depois da execução falhar"
+    );
+}
+struct FailedCloseSddStub {
+    store: Arc<InMemorySddStore>,
+    repo_key: String,
+    slug: String,
+}
+
+impl Tool for FailedCloseSddStub {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sdd".into(),
+            description: String::new(),
+            schema: serde_json::json!({}),
+        }
+    }
+
+    fn call(&self, arguments: Value) -> Result<String, ToolError> {
+        if arguments.get("action").and_then(Value::as_str) == Some("close") {
+            let mut plan = self
+                .store
+                .load(&self.repo_key, &self.slug)
+                .map_err(ToolError::Other)?
+                .ok_or_else(|| ToolError::NotFound(self.slug.clone()))?;
+            plan.status = SddPlanStatus::Failed;
+            self.store.save(&plan).map_err(ToolError::Other)?;
+            return Ok("### sdd — execução\nexecução SDD falhou: t1 falhou".into());
+        }
+        Ok("ok".into())
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn mode_mask(&self) -> tupi_kernel::ModeMask {
+        tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
+    }
+}
+
+#[tokio::test]
+async fn closing_sdd_after_failed_auto_execution_trims_the_session_to_the_handoff() {
+    let sdd = Arc::new(InMemorySddStore::default());
+    let repo_key = "repo-close-exec".to_string();
+    let plan = SddPlan {
+        slug: "auth".into(),
+        repo_key: repo_key.clone(),
+        title: "Autenticação".into(),
+        status: SddPlanStatus::Draft,
+        goal: "Adicionar OAuth".into(),
+        created_at: 100,
+        updated_at: 100,
+        closed_at: None,
+        ..Default::default()
+    };
+    sdd.save(&plan).unwrap();
+    sdd.set_active_slug(&repo_key, Some("auth")).unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![Ok(ProviderEvent::ToolCalls(vec![ToolCall {
+            id: "c_close".into(),
+            name: "sdd".into(),
+            arguments: r#"{"action":"close"}"#.into(),
+        }]))],
+        vec![Ok(ProviderEvent::Text("fim".into()))],
+    ]));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(FailedCloseSddStub {
+        store: sdd.clone(),
+        repo_key: repo_key.clone(),
+        slug: "auth".into(),
+    }));
+
+    let bus = EventBus::new(64);
+    let mut rx = bus.subscribe();
+    let app = App::with_tools(
+        registry(provider.clone()),
+        "scripted",
+        "m".into(),
+        bus,
+        None,
+        tools,
+        "BASE".into(),
+    )
+    .with_repo_key(repo_key)
+    .with_mode_cell(Arc::new(AtomicU8::new(AgentMode::Sdd.as_u8())))
+    .with_sdd_store(sdd);
+
+    app.handle(Command::SendMessage {
+        text: "fecha e executa".into(),
+    })
+    .await
+    .unwrap();
+    let events = wait_finished(&mut rx).await;
+
+    assert_eq!(app.mode(), AgentMode::Execution);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::Notice { message } if message.contains("SDD fechado"))
+        ),
+        "o fechamento precisa ser anunciado"
+    );
+
+    let reqs = provider.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    let second = &reqs[1];
+    assert!(
+        !second
+            .messages
+            .iter()
+            .any(|message| message.content.contains("fecha e executa")),
+        "o histórico de planejamento não pode voltar depois da execução automática"
+    );
+    assert!(
+        second
+            .messages
+            .iter()
+            .any(|message| message.role == Role::User && message.content.contains("Autenticação")),
+        "o handoff do plano precisa entrar no lugar do histórico"
     );
 }

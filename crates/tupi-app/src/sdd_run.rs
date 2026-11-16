@@ -28,6 +28,8 @@ pub(crate) struct AgentTurn<'a> {
     pub cancel: Arc<AtomicBool>,
     pub in_flight: Arc<tokio::sync::Notify>,
     pub in_flight_count: Arc<AtomicUsize>,
+    /// Publica o progresso das tools quando a subtarefa roda sob um turno.
+    pub progress: Option<AgentProgress<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,12 @@ impl AgentOutcome {
             error: Some(message.into()),
         }
     }
+}
+
+pub(crate) struct AgentProgress<'a> {
+    pub events: &'a EventBus,
+    pub request_id: u64,
+    pub label: &'a str,
 }
 
 pub(crate) async fn run_agent(turn: AgentTurn<'_>, brief: &str) -> AgentOutcome {
@@ -105,6 +113,11 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
         let mut calls = Vec::new();
         let mut finish_reason: Option<String> = None;
         while let Some(item) = stream.next().await {
+            // ESC chega com o stream em voo: sem esta checagem o turno só
+            // pararia no próximo passo, depois da resposta inteira.
+            if turn.cancel.load(Ordering::SeqCst) {
+                return AgentOutcome::failure("cancelado");
+            }
             match item {
                 Ok(ProviderEvent::Text(chunk)) => text.push_str(&chunk),
                 Ok(ProviderEvent::Reasoning(chunk)) => reasoning.push_str(&chunk),
@@ -173,19 +186,50 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
             };
         }
         messages.push(Message::assistant_with_calls(text, calls.clone()).with_reasoning(reasoning));
-        for call in calls {
-            let content = match run_tool(
+        for (index, call) in calls.into_iter().enumerate() {
+            if turn.cancel.load(Ordering::SeqCst) {
+                return AgentOutcome::failure("cancelado");
+            }
+            // Cada tool do subagente vira uma linha própria na TUI, aninhada
+            // sob a subtarefa: `sdd#T1.1#<passo>.<índice>`.
+            let call_id = turn
+                .progress
+                .as_ref()
+                .map(|progress| format!("sdd#{}#{step}.{index}", progress.label));
+            if let (Some(progress), Some(call_id)) = (turn.progress.as_ref(), call_id.as_ref()) {
+                progress.events.publish(Event::ToolStarted {
+                    request_id: progress.request_id,
+                    call_id: call_id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    summary: crate::app::describe_call(turn.tools, &call),
+                });
+            }
+            let started = Instant::now();
+            let result = run_tool(
                 turn.tools,
                 &call,
                 &turn.cancel,
                 &turn.in_flight,
                 &turn.in_flight_count,
             )
-            .await
-            {
+            .await;
+            let elapsed = started.elapsed();
+            let ok = result.is_ok();
+            let content = match result {
                 Ok(content) => content,
                 Err(error) => format!("erro: {error}"),
             };
+            if let (Some(progress), Some(call_id)) = (turn.progress.as_ref(), call_id.as_ref()) {
+                progress.events.publish(Event::ToolFinished {
+                    request_id: progress.request_id,
+                    call_id: call_id.clone(),
+                    name: call.name.clone(),
+                    ok,
+                    summary: crate::app::summarize(&content),
+                    duration_us: crate::telemetry::micros(elapsed).max(1),
+                });
+            }
             tracing::debug!(
                 step,
                 tool = %call.name,
@@ -384,6 +428,16 @@ pub(crate) async fn run_plan(ctx: &RunContext, slug: &str) -> SddRunOutcome {
             plan.conclusion = Some(format_run_report(&plan, &lines));
         }
         save(ctx, &plan);
+    } else if !ok && ctx.cancel.load(Ordering::SeqCst) {
+        // Cancelar não é falhar: o plano fica no mesmo estado em que estava
+        // quando o usuário interrompeu, pronto para ser retomado.
+        plan.record_activity("runner", "plan_cancelled", "info");
+        plan.conclusion = Some("cancelado pelo usuário".to_string());
+        save(ctx, &plan);
+        return SddRunOutcome {
+            ok: false,
+            report: "Execução SDD cancelada pelo usuário".to_string(),
+        };
     } else if !ok {
         plan.status = SddPlanStatus::Failed;
         plan.record_activity("runner", "plan_failed", "failed");
@@ -434,6 +488,15 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
     plan.conclusion = None;
     let (tools, docs) = factory();
     let brief = format_docs_brief(plan);
+    let call_id = "sdd#docs".to_string();
+    ctx.events.publish(Event::ToolStarted {
+        request_id: ctx.request_id,
+        call_id: call_id.clone(),
+        name: "agent".to_string(),
+        arguments: "{}".to_string(),
+        summary: "docs — realimentação".to_string(),
+    });
+    let started = Instant::now();
     let outcome = run_agent(
         AgentTurn {
             provider: &ctx.provider,
@@ -446,10 +509,23 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
             cancel: ctx.cancel.clone(),
             in_flight: ctx.in_flight.clone(),
             in_flight_count: ctx.in_flight_count.clone(),
+            progress: Some(AgentProgress {
+                events: &ctx.events,
+                request_id: ctx.request_id,
+                label: "docs",
+            }),
         },
         &brief,
     )
     .await;
+    ctx.events.publish(Event::ToolFinished {
+        request_id: ctx.request_id,
+        call_id,
+        name: "agent".to_string(),
+        ok: outcome.ok,
+        summary: summarize_outcome(&outcome),
+        duration_us: crate::telemetry::micros(started.elapsed()).max(1),
+    });
 
     let refresh = docs.refresh();
     let records = docs.written_records();
@@ -544,6 +620,11 @@ async fn run_one(ctx: &RunContext, plan: &SddPlan, sub_id: &str) -> (AgentOutcom
             cancel: ctx.cancel.clone(),
             in_flight: ctx.in_flight.clone(),
             in_flight_count: ctx.in_flight_count.clone(),
+            progress: Some(AgentProgress {
+                events: &ctx.events,
+                request_id: ctx.request_id,
+                label: sub_id,
+            }),
         },
         &brief,
     )
@@ -581,7 +662,7 @@ async fn record_result(
 
     if ok {
         if let Some(test) = &acceptance {
-            if let Err(error) = run_acceptance(ctx, test).await {
+            if let Err(error) = run_acceptance(ctx, test, sub_id).await {
                 ok = false;
                 acceptance_error = Some(error);
             }
@@ -639,7 +720,11 @@ async fn record_result(
     ok
 }
 
-async fn run_acceptance(ctx: &RunContext, test: &AcceptanceTest) -> Result<(), String> {
+async fn run_acceptance(
+    ctx: &RunContext,
+    test: &AcceptanceTest,
+    sub_id: &str,
+) -> Result<(), String> {
     if !ctx.tools.has("exec") {
         return Err("tool exec não registrada para o aceite".to_string());
     }
@@ -647,19 +732,44 @@ async fn run_acceptance(ctx: &RunContext, test: &AcceptanceTest) -> Result<(), S
     if let Some(package) = &test.package {
         arguments["package"] = serde_json::json!(package);
     }
+    let call_id = format!("sdd-aceite-{sub_id}");
+    ctx.events.publish(Event::ToolStarted {
+        request_id: ctx.request_id,
+        call_id: call_id.clone(),
+        name: "exec".to_string(),
+        arguments: arguments.to_string(),
+        summary: format!("aceite {sub_id} · {}", test.filter),
+    });
     let call = ToolCall {
         id: format!("sdd-aceite-{}", test.filter),
         name: "exec".to_string(),
         arguments: arguments.to_string(),
     };
-    let output = run_tool(
+    let started = Instant::now();
+    let result = run_tool(
         &ctx.tools,
         &call,
         &ctx.cancel,
         &ctx.in_flight,
         &ctx.in_flight_count,
     )
-    .await?;
+    .await;
+    let (ok, detail) = match &result {
+        Ok(output) if output.contains(" 0 passed") => {
+            (false, "nenhum teste casou o filtro".to_string())
+        }
+        Ok(output) => (true, crate::app::summarize(output)),
+        Err(error) => (false, error.clone()),
+    };
+    ctx.events.publish(Event::ToolFinished {
+        request_id: ctx.request_id,
+        call_id,
+        name: "exec".to_string(),
+        ok,
+        summary: detail,
+        duration_us: crate::telemetry::micros(started.elapsed()).max(1),
+    });
+    let output = result?;
     if output.contains(" 0 passed") {
         return Err("nenhum teste casou o filtro do aceite".to_string());
     }
@@ -1053,6 +1163,7 @@ mod tests {
             cancel,
             in_flight: Arc::new(tokio::sync::Notify::new()),
             in_flight_count: Arc::new(AtomicUsize::new(0)),
+            progress: None,
         }
     }
 
@@ -1069,6 +1180,163 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.error);
         assert_eq!(outcome.text, "feito");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_calls_publish_progress_events_with_the_turn_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tupi_tools::sdd::FsSddStore::new(dir.path()));
+        store
+            .save(&closed_plan(vec![task("T1", vec![subtask("T1.1")])]))
+            .unwrap();
+        let (provider, _requests) =
+            Scripted::new_tracked(vec![vec![call_event("c1")], vec![text_event("feito T1.1")]]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let agent_hits = hits.clone();
+        let mut ctx = run_context(
+            store,
+            provider,
+            ToolRegistry::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // O subagente roda com o registry da fábrica, não com `ctx.tools`.
+        ctx.agent_tools = Arc::new(move || {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(EchoTool {
+                hits: agent_hits.clone(),
+            }));
+            registry
+        });
+        let mut rx = ctx.events.subscribe();
+
+        let outcome = run_plan(&ctx, "auth").await;
+
+        assert!(outcome.ok, "{}", outcome.report);
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::ToolStarted {
+                    request_id,
+                    call_id,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(request_id, 1, "evento fora do turno");
+                    started.push((call_id, name));
+                }
+                Event::ToolFinished {
+                    request_id,
+                    call_id,
+                    ok,
+                    ..
+                } => {
+                    assert_eq!(request_id, 1, "evento fora do turno");
+                    finished.push((call_id, ok));
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            started.contains(&("sdd#T1.1".to_string(), "agent".to_string())),
+            "{started:?}"
+        );
+        assert!(
+            started.contains(&("sdd#T1.1#1.0".to_string(), "echo".to_string())),
+            "{started:?}"
+        );
+        assert!(
+            finished.iter().any(|(id, ok)| id == "sdd#T1.1#1.0" && *ok),
+            "{finished:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_publishes_an_exec_line() {
+        let store = Arc::new(InMemorySddStore::default());
+        let mut sub = subtask("T1.1");
+        sub.acceptance_test = Some(AcceptanceTest {
+            package: None,
+            filter: "space_search".to_string(),
+        });
+        store
+            .save(&closed_plan(vec![task("T1", vec![sub])]))
+            .unwrap();
+        let (provider, _requests) = Scripted::new_tracked(vec![vec![text_event("feito T1.1")]]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ExecTool {
+            output: "running 2 tests\ntest result: ok. 2 passed".to_string(),
+            fail: false,
+        }));
+        let ctx = run_context(store, provider, tools, Arc::new(AtomicBool::new(false)));
+        let mut rx = ctx.events.subscribe();
+
+        let outcome = run_plan(&ctx, "auth").await;
+
+        assert!(outcome.ok, "{}", outcome.report);
+        let mut lines = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::ToolStarted {
+                call_id,
+                name,
+                summary,
+                ..
+            } = event
+            {
+                lines.push((call_id, name, summary));
+            }
+        }
+        assert!(
+            lines.iter().any(|(call_id, name, summary)| {
+                call_id == "sdd-aceite-T1.1" && name == "exec" && summary.contains("space_search")
+            }),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_feedback_publishes_an_agent_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        let store = Arc::new(tupi_tools::sdd::FsSddStore::new(dir.path()));
+        store
+            .save(&closed_plan(vec![task("T1", vec![subtask("T1.1")])]))
+            .unwrap();
+        let (provider, _requests) = Scripted::new_tracked(vec![
+            vec![text_event("feito T1.1")],
+            vec![docs_write_event("docs/guia.md", "# Guia\n")],
+            vec![text_event("documentei")],
+        ]);
+        let mut ctx = run_context(
+            store,
+            provider,
+            ToolRegistry::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        ctx.docs_agent = Some(docs_factory(dir.path()));
+        let mut rx = ctx.events.subscribe();
+
+        let outcome = run_plan(&ctx, "auth").await;
+
+        assert!(outcome.ok, "{}", outcome.report);
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::ToolStarted { call_id, name, .. } => started.push((call_id, name)),
+                Event::ToolFinished { call_id, ok, .. } => finished.push((call_id, ok)),
+                _ => {}
+            }
+        }
+        assert!(
+            started.contains(&("sdd#docs".to_string(), "agent".to_string())),
+            "{started:?}"
+        );
+        assert!(
+            finished.iter().any(|(id, ok)| id == "sdd#docs" && *ok),
+            "{finished:?}"
+        );
     }
 
     #[tokio::test]

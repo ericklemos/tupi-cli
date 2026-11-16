@@ -54,6 +54,10 @@ pub struct SddExecOutcome {
 
 /// Executa o plano fechado. Devolve o relatório mesmo em falha.
 pub async fn execute(request: SddExecRequest, slug: &str) -> SddExecOutcome {
+    // A execução roda em `spawn_blocking` — o abort da task do stream não a
+    // alcança —, então o cancelamento tem de vir da tool em curso: é a mesma
+    // flag que o ESC do turno aciona.
+    let cancel = tupi_kernel::current_tool_cancel().unwrap_or(request.cancel);
     let ctx = RunContext {
         store: request.store,
         repo_key: request.repo_key,
@@ -69,7 +73,7 @@ pub async fn execute(request: SddExecRequest, slug: &str) -> SddExecOutcome {
         agent_timeout: request.agent_timeout,
         events: request.events,
         request_id: request.request_id,
-        cancel: request.cancel,
+        cancel,
         in_flight: request.in_flight,
         in_flight_count: request.in_flight_count,
     };

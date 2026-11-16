@@ -52,6 +52,16 @@ where
     f()
 }
 
+/// Cancelamento da tool em curso, quando a chamada corre dentro de um turno.
+///
+/// `with_tool_cancel` guarda a flag do turno numa thread-local. Ferramentas
+/// que delegam para outro executor — a tool sdd, que roda o plano inteiro
+/// numa thread bloqueante — precisam da mesma flag para parar quando o
+/// usuário aperta ESC no meio da execução.
+pub fn current_tool_cancel() -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    TOOL_CANCEL.with(|cell| cell.borrow().clone())
+}
+
 pub fn is_tool_cancelled() -> bool {
     TOOL_CANCEL.with(|cell| {
         cell.borrow()
@@ -82,6 +92,29 @@ pub enum ToolError {
     Other(String),
 }
 
+/// Em quais modos de agente uma tool existe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeMask(u8);
+
+impl ModeMask {
+    pub const EXECUTION: Self = Self(0b001);
+    pub const SDD: Self = Self(0b010);
+    pub const DOCS: Self = Self(0b100);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, mode: crate::AgentMode) -> bool {
+        let bit = match mode {
+            crate::AgentMode::Execution => Self::EXECUTION.0,
+            crate::AgentMode::Sdd => Self::SDD.0,
+            crate::AgentMode::Docs => Self::DOCS.0,
+        };
+        self.0 & bit != 0
+    }
+}
+
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
@@ -104,13 +137,9 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Fail-closed: apenas tools seguras para investigação/SDD retornam true.
-    fn sdd_allowed(&self) -> bool {
-        false
-    }
-    /// Fail-open: tools que só fazem sentido no planejamento retornam false.
-    fn execution_allowed(&self) -> bool {
-        true
+    /// Em quais modos a tool existe. Fail-closed: o padrão é só execução.
+    fn mode_mask(&self) -> ModeMask {
+        ModeMask::EXECUTION
     }
 
     fn spec_for_mode(&self, _mode: crate::AgentMode) -> ToolSpec {
@@ -137,20 +166,11 @@ impl ToolRegistry {
     }
 
     pub fn specs_for_mode(&self, mode: crate::AgentMode) -> Vec<ToolSpec> {
-        match mode {
-            crate::AgentMode::Execution => self
-                .tools
-                .iter()
-                .filter(|tool| tool.execution_allowed())
-                .map(|tool| tool.spec_for_mode(mode))
-                .collect(),
-            crate::AgentMode::Sdd => self
-                .tools
-                .iter()
-                .filter(|tool| tool.sdd_allowed())
-                .map(|tool| tool.spec_for_mode(mode))
-                .collect(),
-        }
+        self.tools
+            .iter()
+            .filter(|tool| tool.mode_mask().contains(mode))
+            .map(|tool| tool.spec_for_mode(mode))
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -283,8 +303,8 @@ mod tests {
             fn call(&self, _: Value) -> Result<String, ToolError> {
                 Ok("ok".into())
             }
-            fn sdd_allowed(&self) -> bool {
-                true
+            fn mode_mask(&self) -> ModeMask {
+                ModeMask::EXECUTION.union(ModeMask::SDD)
             }
         }
 
@@ -327,6 +347,7 @@ mod tests {
                         schema: serde_json::json!({}),
                     },
                     crate::AgentMode::Sdd => self.spec(),
+                    crate::AgentMode::Docs => self.spec(),
                 }
             }
 
@@ -334,8 +355,8 @@ mod tests {
                 Ok(String::new())
             }
 
-            fn sdd_allowed(&self) -> bool {
-                true
+            fn mode_mask(&self) -> ModeMask {
+                ModeMask::EXECUTION.union(ModeMask::SDD)
             }
         }
 

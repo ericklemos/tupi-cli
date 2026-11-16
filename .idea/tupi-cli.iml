@@ -18,6 +18,10 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-infer/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-kernel/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tmp-sha/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tmp-sha/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-transcribe/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-transcribe/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

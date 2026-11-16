@@ -1,0 +1,10 @@
+# Opt-in: linker rápido (mold) para builds desta máquina. NÃO entra no
+# `.cargo/config.toml` versionado, porque nem todo Linux tem `mold` instalado e
+# macOS não tem. Use explícito:
+#
+#   cargo --config scripts/perf/mold.toml build --release -p tupi
+#   cargo --config scripts/perf/mold.toml build --profile profiling -p tupi
+#
+# Medição antes/depois em docs/perf/baseline.md (T4.1).
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

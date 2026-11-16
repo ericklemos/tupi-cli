@@ -255,6 +255,7 @@ pub fn compose_prefix(base: &str, mode: AgentMode) -> String {
                 format!("{base}\n\n{SDD_POSTURE_PROMPT}")
             }
         }
+        AgentMode::Docs => crate::docs::compose_docs_prefix(base),
     }
 }
 

@@ -10,6 +10,7 @@ members = [
     "crates/tupi-store",
     "crates/tupi-tools",
     "crates/tupi-infer",
+    "crates/tupi-transcribe",
     "crates/tupi",
 ]
 
@@ -28,6 +29,7 @@ tupi-web = { path = "crates/tupi-web" }
 tupi-store = { path = "crates/tupi-store" }
 tupi-tools = { path = "crates/tupi-tools" }
 tupi-infer = { path = "crates/tupi-infer" }
+tupi-transcribe = { path = "crates/tupi-transcribe" }
 
 tokio = { version = "1.40", default-features = false }
 async-trait = "0.1"

@@ -2,7 +2,7 @@
   "schema": 1,
   "slug": "rust-perf-config",
   "title": "Ajuste de perfis e configuração Rust para performance",
-  "status": "failed",
+  "status": "completed",
   "goal": "Reduzir o tempo de build e a latência das operações quentes das tools (grafo de código, `search`, `map`) no workspace tupi por meio de configuração de build/runtime Rust, com ganho comprovado por medição antes/depois. Estado atual verificado: o workspace não declara nenhum perfil de build (`Cargo.toml:1-68`, sem `[profile.*]`), não existe `.cargo/config.toml` (leitura em `.cargo/config.toml` retornou arquivo não encontrado) e o único binário é `tupi` (`crates/tupi/Cargo.toml:1-35`). Nenhum `#[global_allocator]` é definido no binário (`crates/tupi/src/main.rs:19`).",
   "constraints": [
     "Somente config/estrutura: nada de reescrita algorítmica ampla; hotspots de runtime entram como tasks separadas e opcionais.",
@@ -31,14 +31,17 @@
     "DECISÃO PENDENTE (Q6 — features do binário): build default permanece com `local-models`+TUI+web; T5.2 adiciona apenas a possibilidade de desligá-las, sem alterar o default."
   ],
   "created_at": 1794705202,
-  "updated_at": 1794761770,
+  "updated_at": 1794783903,
   "closed_at": 1794705350,
-  "conclusion": "Execução SDD: 0/16 subtasks ok\n- T1.1 falhou: limite de 24 passos\n",
+  "conclusion": "Docs atualizados e reindexados (13 arquivos, 63 chunks, 0 pendentes).\n\n**Conclusão para result.md**\n\nConhecimento durável revisado em `docs/perf/`: `baseline.md` foi corrigido onde estava obsoleto — as \"Lacunas\" ainda diziam que alocador (T3), tempo de link (T4.1), tamanho do binário release e pico de RSS não tinham medição, quando `allocator-and-linker.md` já os medira e descartara; a linha de T5.2 afirmava `transcribe` gateável, mas o `crates/tupi/Cargo.toml` atual mantém `tupi-transcribe` sempre compilado, com apenas `cuda`/`metal`/`vulkan` escolhendo backend. Também registrei que `.cargo/config.toml` agora existe com só `[env] CUDACXX` (nenhum `rustflags`/linker — portabilidade preservada) e que o bloqueio do caminho headless desapareceu (`install::run` existe em `crates/tupi/src/install.rs:1232`). `docs/index.md` ganhou a seção \"Performance\" com os três arquivos.\n\nAtenção: a conclusão auto-gerada no topo deste arquivo (\"0/16 subtasks ok, T1.1 falhou\") está defasada — `tasks.json` marca 6/6 tasks e 16/16 subtasks como `done` e `meta.json` registra `plan_completed`.",
   "docs_feedback": {
-    "status": "skipped",
-    "files": [],
-    "reason": "plano falhou; docs não realimentados",
-    "reindexed": false
+    "status": "updated",
+    "files": [
+      "docs/perf/baseline.md",
+      "docs/index.md"
+    ],
+    "reason": "Docs atualizados e reindexados (13 arquivos, 63 chunks, 0 pendentes).\n\n**Conclusão para result.md**\n\nConhecimento durável revisado em `docs/perf/`: `baseline.md` foi corrigido onde estava obsoleto — as \"Lacunas\" ainda diziam que alocador (T3), tempo de link (T4.1), tamanho do binário release e pico de RSS não tinham medição, quando `allocator-and-linker.md` já os medira e descartara; a linha de T5.2 afirmava `transcribe` gateável, mas o `crates/tupi/Cargo.toml` atual mantém `tupi-transcribe` sempre compilado, com apenas `cuda`/`metal`/`vulkan` escolhendo backend. Também registrei que `.cargo/config.toml` agora existe com só `[env] CUDACXX` (nenhum `rustflags`/linker — portabilidade preservada) e que o bloqueio do caminho headless desapareceu (`install::run` existe em `crates/tupi/src/install.rs:1232`). `docs/index.md` ganhou a seção \"Performance\" com os três arquivos.\n\nAtenção: a conclusão auto-gerada no topo deste arquivo (\"0/16 subtasks ok, T1.1 falhou\") está defasada — `tasks.json` marca 6/6 tasks e 16/16 subtasks como `done` e `meta.json` registra `plan_completed`.",
+    "reindexed": true
   },
   "activities": [
     {
@@ -322,6 +325,129 @@
       "at": 1794761770,
       "actor": "sdd",
       "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 25,
+      "at": 1794769294,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 26,
+      "at": 1794769298,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 27,
+      "at": 1794769308,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 28,
+      "at": 1794783895,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 29,
+      "at": 1794783898,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 30,
+      "at": 1794783903,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 31,
+      "at": 1794783903,
+      "actor": "runner",
+      "action": "plan_completed",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 32,
+      "at": 1794783903,
+      "actor": "docs-agent",
+      "action": "docs_feedback_started",
+      "task": null,
+      "subtask": null,
+      "status": "info",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 33,
+      "at": 1794783976,
+      "actor": "docs-agent",
+      "action": "docs_written",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [
+        "docs/perf/baseline.md",
+        "docs/index.md"
+      ],
+      "note": "Docs atualizados e reindexados (13 arquivos, 63 chunks, 0 pendentes).\n\n**Conclusão para result.md**\n\nConhecimento durável revisado em `docs/perf/`: `baseline.md` foi corrigido onde estava obsoleto — as \"Lacunas\" ainda diziam que alocador (T3), tempo de link (T4.1), tamanho do binário release e pico de RSS não tinham medição, quando `allocator-and-linker.md` já os medira e descartara; a linha de T5.2 afirmava `transcribe` gateável, mas o `crates/tupi/Cargo.toml` atual mantém `tupi-transcribe` sempre compilado, com apenas `cuda`/`metal`/`vulkan` escolhendo backend. Também registrei que `.cargo/config.toml` agora existe com só `[env] CUDACXX` (nenhum `rustflags`/linker — portabilidade preservada) e que o bloqueio do caminho headless desapareceu (`install::run` existe em `crates/tupi/src/install.rs:1232`). `docs/index.md` ganhou a seção \"Performance\" com os três arquivos.\n\nAtenção: a conclusão auto-gerada no topo deste arquivo (\"0/16 subtasks ok, T1.1 falhou\") está defasada — `tasks.json` marca 6/6 tasks e 16/16 subtasks como `done` e `meta.json` registra `plan_completed`."
+    },
+    {
+      "seq": 34,
+      "at": 1794783976,
+      "actor": "runner",
+      "action": "docs_reindexed",
       "task": null,
       "subtask": null,
       "status": "ok",

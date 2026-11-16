@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod space;
 mod support;
 mod tools;
@@ -75,6 +76,8 @@ pub struct ToolsOptions {
 
     /// Slot do gerador local de resumos; None desliga os resumos.
     pub generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
+    /// Acervo do modo docs; None desliga o modo.
+    pub archive: Option<crate::tools::archive::ArchiveOptions>,
 }
 
 impl Default for ToolsOptions {
@@ -92,6 +95,7 @@ impl Default for ToolsOptions {
             embedder: None,
             space: None,
             generator: None,
+            archive: None,
         }
     }
 }
@@ -101,8 +105,6 @@ impl ToolsOptions {
     pub fn hermetic(state_dir: std::path::PathBuf) -> Self {
         Self {
             state_dir: Some(state_dir),
-            space: None,
-            space_worker: false,
             watcher: false,
             exec_cache: false,
             web_cache: false,
@@ -111,7 +113,10 @@ impl ToolsOptions {
             sdd_executor: None,
             docs_folders: Vec::new(),
             embedder: None,
+            space_worker: false,
+            space: None,
             generator: None,
+            archive: None,
         }
     }
 }
@@ -169,6 +174,26 @@ pub fn register_with(
     options: ToolsOptions,
 ) {
     let state_dir = options.state_dir.clone();
+    if let Some(archive) = options.archive.clone() {
+        let session = crate::tools::archive::ArchiveSession::new(archive);
+        registry.register(Arc::new(crate::tools::archive::ArchiveTool::new(Arc::clone(
+            &session,
+        ))));
+        let reports_dir = state_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".tupi"))
+            .join("archive")
+            .join("reports");
+        registry.register(Arc::new(crate::tools::investigate::InvestigateTool::new(
+            session,
+            options.generator.clone(),
+            crate::tools::investigate::InvestigateOptions {
+                reports_dir,
+                model: "local".to_string(),
+                batch: 32,
+            },
+        )));
+    }
     let watcher = options.watcher;
     let sdd_store = options
         .sdd_store
