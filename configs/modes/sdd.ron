@@ -29,6 +29,7 @@
             "docs",
             "env",
             "facts",
+            "feedback",
             "fetch",
             "impact",
             "map",

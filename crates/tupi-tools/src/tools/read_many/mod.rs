@@ -490,6 +490,7 @@ mod tests {
                 "websearch",
                 "research",
                 "ledger",
+                "feedback",
                 "sdd",
                 "state",
                 "clock",

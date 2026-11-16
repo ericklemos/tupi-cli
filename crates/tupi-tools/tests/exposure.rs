@@ -80,3 +80,25 @@ fn core_write_creates_a_markdown_file() {
     let saved = std::fs::read_to_string(dir.path().join("nota.md")).unwrap();
     assert_eq!(saved, "# nota\n");
 }
+
+#[test]
+fn core_exposure_exposes_feedback_in_every_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let registry = core_registry(dir.path(), state.path());
+
+    // SDD e docs sofrem o mesmo atrito da execução: o perfil mínimo precisa
+    // carregar o feedback em todos os modos.
+    assert!(registry.has("feedback"), "perfil Core sem feedback");
+    assert!(
+        registry.get("feedback").is_some(),
+        "feedback registrado mas não exposto pelo perfil Core"
+    );
+    for mode in [AgentMode::Execution, AgentMode::Sdd] {
+        let list = names(&registry, mode);
+        assert!(
+            list.iter().any(|name| name == "feedback"),
+            "modo {mode:?} sem feedback: {list:?}"
+        );
+    }
+}

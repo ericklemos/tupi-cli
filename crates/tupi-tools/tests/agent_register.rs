@@ -33,6 +33,9 @@ fn agent_registry_has_code_tools_and_no_orchestration_tools() {
     ] {
         assert!(!registry.has(name), "não deveria ter {name}");
     }
+    // O atrito é registrado pelo agente principal: o subagente não ganha uma
+    // segunda saída de escrita para .agents/tupi/debug/feedback.jsonl.
+    assert!(!registry.has("feedback"), "subagente não registra atrito");
 }
 
 #[test]

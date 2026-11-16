@@ -95,6 +95,14 @@ pub struct Memory {
     enabled: AtomicBool,
     session: Mutex<String>,
     first_turn: AtomicBool,
+    /// O `begin_turn` já anexou o bloco de memória ao prefixo deste turno.
+    /// Enquanto for verdade, o recall por tool não vai ao provedor de novo: o
+    /// turno já recebeu a memória, fora do bloco de resultado.
+    turn_attached: AtomicBool,
+    /// O turno já pagou um julgamento de memória, com ou sem bloco. Sem isso,
+    /// um turno em que a leitura do prompt não achou nada pagaria uma
+    /// requisição extra por tool call para reencontrar o mesmo conjunto.
+    turn_judged: AtomicBool,
     cache: Mutex<HashMap<String, Option<MemoryBlock>>>,
 }
 
@@ -105,6 +113,8 @@ impl Memory {
             enabled: AtomicBool::new(false),
             session: Mutex::new(String::new()),
             first_turn: AtomicBool::new(true),
+            turn_attached: AtomicBool::new(false),
+            turn_judged: AtomicBool::new(false),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -160,6 +170,9 @@ impl Memory {
         let session = self.next_session();
         *self.session.lock().unwrap() = session.clone();
         self.first_turn.store(true, Ordering::SeqCst);
+        // Sessão nova, prefixo novo: o bloco anexado era do turno anterior.
+        self.turn_attached.store(false, Ordering::SeqCst);
+        self.turn_judged.store(false, Ordering::SeqCst);
         self.cache.lock().unwrap().clear();
         if let Some(root) = self.active_root() {
             // Fecha só a dívida desta aba: o log é do repositório, mas o id
@@ -187,6 +200,10 @@ impl Memory {
         user: &str,
         cancel: &AtomicBool,
     ) -> Option<MemoryBlock> {
+        // Cada turno recomeça sem bloco no prefixo: só o `begin_turn` que
+        // injeta de verdade marca a supressão do recall por tool.
+        self.turn_attached.store(false, Ordering::SeqCst);
+        self.turn_judged.store(false, Ordering::SeqCst);
         let root = self.active_root()?;
         let session = self.session();
         if session.is_empty() {
@@ -230,6 +247,7 @@ impl Memory {
 
         // Sem candidato, a leitura continua devida: o próximo texto ou tool
         // que tocar num fato resolve a dívida.
+        self.turn_judged.store(true, Ordering::SeqCst);
         let block = self.recall(&root, user, provider, model, cancel).await?;
 
         let mut queue = memory::pendings(&root);
@@ -239,6 +257,9 @@ impl Memory {
         if changed {
             let _ = memory::save_pendings(&root, &touched(&queue));
         }
+        // O bloco já está no prefixo do turno: a próxima tool call não precisa
+        // (nem deve) pagar outra requisição para reencontrar a mesma memória.
+        self.turn_attached.store(true, Ordering::SeqCst);
         Some(block)
     }
 
@@ -257,6 +278,12 @@ impl Memory {
         // prefixo do turno, fora do bloco de resultado; aqui ela é suprimida.
         const SHELL_TOOL: &str = "shell";
         if tool == SHELL_TOOL {
+            return None;
+        }
+        // O `begin_turn` já pagou o julgamento e o bloco está no prefixo de
+        // todo passo deste turno: julgar de novo por tool só compraria uma ida
+        // extra ao provedor para reencontrar o que o modelo já recebeu.
+        if self.turn_attached.load(Ordering::SeqCst) || self.turn_judged.load(Ordering::SeqCst) {
             return None;
         }
         let root = self.active_root()?;

@@ -24,6 +24,8 @@ fn docs_agent_registry_has_only_allowed_tools() {
     assert!(!registry.has("write"));
     assert!(!registry.has("edit"));
     assert!(!registry.has("exec"));
+    // O sink de atrito é local do agente principal (.agents/tupi/debug).
+    assert!(!registry.has("feedback"));
     assert!(docs.written_files().is_empty());
 }
 

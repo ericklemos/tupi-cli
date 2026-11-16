@@ -1,0 +1,6 @@
+# O llama.cpp vendorizado é um submódulo nosso, pinado por tag imutável
+# (v0.8.0 = build b11960, ver LLAMA_CPP_TAG e README.md). O pin real é o
+# commit do gitlink; a URL abaixo é o espelho interno do projeto.
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/tupi-ai/llama.cpp.git

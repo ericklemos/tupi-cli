@@ -1,13 +1,19 @@
 {
-  "name": "tupi-cli",
-  "lang": "pt-br",
   "dashboard_web_port": 7788,
   "docs_folders": [
     "./docs"
   ],
+  "lang": "pt-br",
   "models": {
+    "antigravity/gemini-4-hydrogen-high": {
+      "context_window": 64000
+    },
     "deepseek/deepseek-flash": {
       "context_window": 200000
+    },
+    "deepseek/deepseek-v4-pro": {
+      "context_window": 64000
     }
-  }
+  },
+  "name": "tupi-cli"
 }

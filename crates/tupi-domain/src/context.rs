@@ -221,6 +221,90 @@ fn format_call_target(name: &str, arguments: &str) -> String {
     name.to_string()
 }
 
+
+/// Cabeçalho do manifesto do turno. Entra no prefixo do turno (como a memória),
+/// nunca no bloco de resultado da tool: metadado de lista não é saída de
+/// comando (razão registrada na supressão do `shell` em `memory.rs`).
+pub const MANIFEST_PREFIX: &str = "## Já entregue neste turno (sem corpos: não releia; `peek` para o trecho omitido, `read` com repeat=\"allow\" para o corpo)";
+
+/// Teto de entradas: o manifesto é lembrete compacto, não um segundo histórico.
+const MANIFEST_MAX_ENTRIES: usize = 24;
+
+/// Só o começo do resultado é inspecionado: hash e handle ficam no cabeçalho,
+/// então o corpo nunca é varrido.
+const MANIFEST_HEAD_CHARS: usize = 400;
+
+/// Valor entre crases logo depois do marcador (`blake3 \`…\``, `handle: \`…\``).
+fn marked_value(head: &str, marker: &str) -> Option<String> {
+    let start = head.find(marker)? + marker.len();
+    let value = head[start..].split('`').next()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn header_meta(head: &str) -> (Option<String>, Option<String>) {
+    (
+        marked_value(head, "blake3 `"),
+        marked_value(head, "handle: `"),
+    )
+}
+
+/// Manifesto do turno: uma linha por resultado já entregue, com o alvo do call
+/// (path/símbolo), o hash do arquivo e o handle de `peek` quando existem.
+/// Nenhum corpo: a lista é curta, o prefixo fica estável entre os passos e o
+/// modelo deixa de gastar um passo relendo só para descobrir que já tinha o
+/// resultado.
+pub fn turn_manifest(messages: &[Message]) -> String {
+    let mut targets: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for message in messages {
+        for call in &message.tool_calls {
+            targets.insert(
+                call.id.as_str(),
+                format_call_target(&call.name, &call.arguments),
+            );
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages.iter().rev() {
+        if message.role != Role::Tool {
+            continue;
+        }
+        let Some(id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(target) = targets.get(id) else {
+            continue;
+        };
+        let head: String = message.content.chars().take(MANIFEST_HEAD_CHARS).collect();
+        let (hash, handle) = header_meta(&head);
+        let mut line = format!("- {target}");
+        if let Some(hash) = hash {
+            line.push_str(&format!(" · blake3 {hash}"));
+        }
+        if let Some(handle) = handle {
+            line.push_str(&format!(" · peek {handle}"));
+        }
+        if lines.contains(&line) {
+            continue;
+        }
+        lines.push(line);
+        if lines.len() >= MANIFEST_MAX_ENTRIES {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.reverse();
+    let mut out = String::from(MANIFEST_PREFIX);
+    for line in &lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
 fn summarize_unit(unit: &[Message], summary_lines: &mut Vec<String>) {
     let Some(first) = unit.first() else {
         return;

@@ -1088,6 +1088,15 @@ impl App {
                 .as_ref()
                 .map(|block| tupi_domain::tokens::estimate_tokens(&block.text))
                 .unwrap_or(0);
+            // Manifesto do que já veio antes deste turno: lista compacta no
+            // prefixo, montada uma vez para o prefixo não mudar a cada passo
+            // (o cache do provedor depende de prefixo estável).
+            let manifest = tupi_domain::context::turn_manifest(&session.messages());
+            let manifest_tokens = if manifest.is_empty() {
+                0
+            } else {
+                tupi_domain::tokens::estimate_message(&Message::new(Role::System, manifest.clone()))
+            };
             let mut tool_log: Vec<String> = Vec::new();
             let mut stated: Vec<String> = memory_block
                 .as_ref()
@@ -1150,6 +1159,7 @@ impl App {
                 let request_tool_tokens = if final_step { 0 } else { tool_tokens };
                 let fixed_tokens = request_tool_tokens
                     .saturating_add(memory_tokens)
+                    .saturating_add(manifest_tokens)
                     .saturating_add(prefix_tokens)
                     .saturating_add(warning_tokens);
                 let scale = token_scale.load(Ordering::SeqCst);
@@ -1173,6 +1183,9 @@ impl App {
                 }
                 if let Some(block) = &memory_block {
                     messages.push(Message::new(Role::System, block.text.clone()));
+                }
+                if !manifest.is_empty() {
+                    messages.push(Message::new(Role::System, manifest.clone()));
                 }
                 messages.extend(planned.messages);
                 if let Some(warning) = warning_message {
@@ -1452,6 +1465,73 @@ impl App {
                     break;
                 }
 
+                // Calls read-only vizinhas rodam juntas: a regra é a do
+                // `pipeline` (mutante serializa, leitura paraleliza). O lote é
+                // executado antes do laço, mas os resultados são consumidos na
+                // ordem declarada, que é contrato histórico.
+                let mut prefetched: std::collections::HashMap<
+                    String,
+                    (String, bool, std::time::Duration),
+                > = std::collections::HashMap::new();
+                {
+                    use futures_util::StreamExt as _;
+                    let mut index = 0;
+                    while index < calls.len() {
+                        let start = index;
+                        if crate::tool_batch::call_is_parallel(&tools, &calls[index], current_mode)
+                        {
+                            while index < calls.len()
+                                && crate::tool_batch::call_is_parallel(
+                                    &tools,
+                                    &calls[index],
+                                    current_mode,
+                                )
+                            {
+                                index += 1;
+                            }
+                        } else {
+                            index += 1;
+                        }
+                        // Lote de um só não ganha nada: segue o caminho serial.
+                        if index - start < 2 {
+                            continue;
+                        }
+                        let batch: Vec<ToolCall> = calls[start..index].to_vec();
+                        let results: Vec<(usize, String, bool, std::time::Duration)> =
+                            futures_util::stream::iter(batch.iter().cloned().enumerate().map(
+                                |(offset, call)| {
+                                    let cancel = Arc::clone(&task_cancel);
+                                    let in_flight = Arc::clone(&task_in_flight);
+                                    let count = Arc::clone(&task_in_flight_count);
+                                    let tools = &tools;
+                                    async move {
+                                        let started = std::time::Instant::now();
+                                        let result =
+                                            run_tool(tools, &call, &cancel, &in_flight, &count)
+                                                .await;
+                                        let duration = started.elapsed();
+                                        match result {
+                                            Ok(content) => (offset, content, true, duration),
+                                            Err(error) => (offset, error, false, duration),
+                                        }
+                                    }
+                                },
+                            ))
+                            .buffer_unordered(crate::pipeline::MAX_PARALLEL)
+                            .collect()
+                            .await;
+                        let mut slots: Vec<Option<(String, bool, std::time::Duration)>> =
+                            vec![None; batch.len()];
+                        for (offset, content, ok, duration) in results {
+                            slots[offset] = Some((content, ok, duration));
+                        }
+                        for (call, slot) in batch.iter().zip(slots) {
+                            if let Some(result) = slot {
+                                prefetched.insert(call.id.clone(), result);
+                            }
+                        }
+                    }
+                }
                 for call in calls {
                     if active.load(Ordering::SeqCst) != request_id {
                         break;
@@ -1492,7 +1572,10 @@ impl App {
                     let blocked = tools
                         .get(&call.name)
                         .is_some_and(|t| !t.mode_mask().contains(current_mode));
-                    let (mut content, ok) = if blocked {
+                    let prefetched_call = prefetched.remove(&call.id);
+                    let (mut content, ok) = if let Some((content, ok, _)) = prefetched_call.clone() {
+                        (content, ok)
+                    } else if blocked {
                         (format!("tool '{}' bloqueada neste modo", call.name), false)
                     } else {
                         match if call.name == tupi_kernel::pipeline::PIPELINE_TOOL {
@@ -1585,7 +1668,9 @@ impl App {
                         content = format!("{}\n\n{content}", block.text);
                         stated.extend(block.fact_texts);
                     }
-                    let duration = tool_started.elapsed();
+                    let duration = prefetched_call
+                        .map(|(_, _, duration)| duration)
+                        .unwrap_or_else(|| tool_started.elapsed());
                     let summary = tool_summary;
 
                     events.publish(Event::ToolFinished {

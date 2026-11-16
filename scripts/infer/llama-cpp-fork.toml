@@ -1,0 +1,46 @@
+# Opt-in: troca o `llama-cpp-sys-2` do crates.io (llama.cpp **v0.6.0**) pelo
+# NOSSO fork (llama.cpp **v0.8.0** = build b11960), que é o que o d1 exige.
+# Fork e pin: `vendor/llama-cpp-sys-2/README.md` e `LLAMA_CPP_TAG`.
+#
+# Por que não mora no `Cargo.toml` do workspace: `[patch.crates-io]` é resolvido
+# pelo cargo **antes** de olhar as features. Medido neste repositório — com
+# `llama-cpp-sys-2 = { git = ..., rev = ... }` no manifesto, até
+# `cargo check -p tupi-infer` (sem feature nenhuma) tenta clonar o fork:
+#
+#   error: failed to load source for dependency `llama-cpp-sys-2`
+#   warning: spurious network error: unexpected http status code: 404
+#
+# Ou seja: patch no manifesto deixaria de ser "atrás de feature" — o build leve
+# (CPU, sem IA local) passaria a depender de rede e de um clone do fork. Aqui o
+# patch só entra quando você pede `--config`, junto com `local-models`/`cuda`:
+#
+#   cargo --config scripts/infer/llama-cpp-fork.toml check -p tupi-infer --features local-models
+#   cargo --config scripts/infer/llama-cpp-fork.toml build -p tupi --features cuda
+#
+# Sem `--config`, nada muda: o `llama-cpp-sys-2` continua sendo o 0.1.161 do
+# crates.io e os dois carregamentos existentes (`crates/tupi-infer/src/llama.rs`,
+# `llama_generate.rs`) seguem compilando contra ele.
+#
+# ESTADO (fork ainda não materializado): este arquivo é a receita pronta, não uma
+# configuração já utilizável. O fork em `vendor/llama-cpp-sys-2` é só o esqueleto
+# — falta o submódulo `llama.cpp` (v0.8.0/b11960) e o remoto publicado. Enquanto
+# isso, o patch não resolve: medido também com `path = "vendor/llama-cpp-sys-2"`
+# (cargo recusa a seleção mesmo com `version = "0.1.161"` casando `^0.1.161`), e,
+# materializado, o `build.rs` do fork para com "submódulo llama.cpp ausente".
+# Fechar T3 = materializar o fork, publicá-lo e trocar a tag abaixo pelo `rev`
+# do commit dela.
+#
+# Pin: tag anotada e imutável (`tupi-<versão do crate>-llama-<tag do llama.cpp>`),
+# nunca `branch`.  O `version = "0.1.161"` do fork NÃO muda ao subir o llama.cpp:
+# é o que casa este patch com `llama-cpp-sys-2 = "^0.1.161"` pedido por
+# `llama-cpp-2` 0.1.161 (duas entradas: macOS-aarch64 com `metal` e a genérica).
+# Backend de GPU no fork é feature (`cuda`/`metal`/`vulkan`), default CPU puro:
+# o patch nunca força CUDA no build padrão.
+[patch.crates-io]
+llama-cpp-sys-2 = { git = "https://github.com/tupi-ai/llama-cpp-rs", tag = "tupi-0.1.161-llama-v0.8.0" }
+
+# Assim que o fork existir de verdade, aperte para o commit que a tag aponta —
+# rev sobre commit é imune a tag movida:
+#
+#   git -C <fork> rev-parse tupi-0.1.161-llama-v0.8.0
+#   llama-cpp-sys-2 = { git = "https://github.com/tupi-ai/llama-cpp-rs", rev = "<sha>" }

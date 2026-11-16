@@ -8,6 +8,7 @@ pub(crate) mod edit;
 pub(crate) mod env;
 pub(crate) mod exec;
 pub(crate) mod facts;
+pub(crate) mod feedback;
 pub(crate) mod fetch;
 pub(crate) mod impact;
 pub(crate) mod investigate;

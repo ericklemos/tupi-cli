@@ -71,6 +71,42 @@ pub fn normalize(text: &str) -> String {
 }
 
 /// FNV-1a de 64 bits: estável, barato e suficiente para um fato por linha.
+/// Arquivo JSONL onde o modelo registra o proprio atrito (log local de debug).
+pub const FEEDBACK_FILE: &str = "feedback.jsonl";
+
+/// Subdiretorio de debug sob `memory::dir(root)`, o mesmo da telemetria do shell.
+pub const DEBUG_DIR: &str = "debug";
+
+pub fn debug_dir(root: &Path) -> PathBuf {
+    dir(root).join(DEBUG_DIR)
+}
+
+pub fn feedback_path(root: &Path) -> PathBuf {
+    debug_dir(root).join(FEEDBACK_FILE)
+}
+
+/// Uma linha de `feedback.jsonl`: atrito que o modelo encontrou em campo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Feedback {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub ts_ms: u64,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub tool: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workaround: Option<String>,
+}
+
 pub fn fact_id(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in normalize(text).as_bytes() {
@@ -78,6 +114,84 @@ pub fn fact_id(text: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// Teto do log de feedback. É log de debug local: o que interessa é o fim do
+/// arquivo, então o corte joga fora o começo quando passa daqui.
+pub const FEEDBACK_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Grava uma linha em `.agents/tupi/debug/feedback.jsonl`, criando o diretório
+/// quando falta e cortando o começo do arquivo quando ele passou do teto.
+///
+/// Append síncrono, no mesmo molde do `trim` da telemetria: sem thread de
+/// escrita, sem compactação por relógio e sem sair da máquina.
+pub fn append_feedback(root: &Path, feedback: &Feedback) -> std::io::Result<()> {
+    let path = feedback_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // o corte vem antes do append: o registro novo nunca cai no recorte e o
+    // arquivo volta ao teto sem reescrever a cada linha gravada
+    trim_feedback(&path, FEEDBACK_MAX_BYTES)?;
+
+    let mut record = feedback.clone();
+    // o id é derivado do texto normalizado: o mesmo atrito escrito com outra
+    // caixa ou outro espaçamento é o mesmo registro
+    record.id = fact_id(&record.text);
+
+    if record.ts_ms == 0 {
+        record.ts_ms = now();
+    }
+    let mut line = serde_json::to_string(&record).unwrap_or_default();
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(line.as_bytes())
+}
+
+/// Corta o começo de `path` até sobrar a metade de `max_bytes`, preservando as
+/// linhas mais recentes inteiras.
+fn trim_feedback(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
+    let len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if len <= max_bytes {
+        return Ok(len);
+    }
+
+    let bytes = std::fs::read(path)?;
+    let keep = (max_bytes / 2) as usize;
+    let tail = &bytes[bytes.len() - keep..];
+    // o recorte pode cair no meio de uma linha: descarta até o primeiro `\n`
+    let tail = match tail.iter().position(|byte| *byte == b'\n') {
+        Some(at) => &tail[at + 1..],
+        None => tail,
+    };
+    write_atomic(path, tail)?;
+    Ok(tail.len() as u64)
+}
+
+fn parse_feedback(line: &str) -> Option<Feedback> {
+    let mut feedback = serde_json::from_str::<Feedback>(line).ok()?;
+    if feedback.text.trim().is_empty() {
+        return None;
+    }
+    if feedback.id.is_empty() {
+        feedback.id = fact_id(&feedback.text);
+    }
+    Some(feedback)
+}
+
+pub fn feedback_records(root: &Path) -> Vec<Feedback> {
+    let Ok(body) = std::fs::read_to_string(feedback_path(root)) else {
+        return Vec::new();
+    };
+    body.lines().filter_map(parse_feedback).collect()
 }
 
 fn parse_fact(line: &str) -> Option<Fact> {
@@ -452,5 +566,187 @@ mod tests {
         assert_eq!(auth[0].fact.tags, vec!["auth".to_string()]);
 
         assert!(score(root.path(), "bom dia", 5).is_empty());
+    }
+
+    #[test]
+    fn feedback_path_is_the_local_debug_sink() {
+        let root = tempfile::tempdir().unwrap();
+        let path = feedback_path(root.path());
+        assert!(path.ends_with(".agents/tupi/debug/feedback.jsonl"));
+        assert_eq!(path, debug_dir(root.path()).join(FEEDBACK_FILE));
+    }
+
+    #[test]
+    fn feedback_round_trips_with_absent_optional_fields() {
+        let bare: Feedback = serde_json::from_str(r#"{"text":"sem grep"}"#).unwrap();
+        assert!(bare.id.is_empty());
+        assert_eq!(bare.ts_ms, 0);
+        assert!(bare.workaround.is_none());
+        assert_eq!(bare.text, "sem grep");
+
+        let full = Feedback {
+            id: fact_id("sem grep"),
+            text: "sem grep".into(),
+            workaround: Some("use search".into()),
+            ..Feedback::default()
+        };
+        let line = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<Feedback>(&line).unwrap(), full);
+        assert!(!serde_json::to_string(&bare).unwrap().contains("workaround"));
+    }
+
+    #[test]
+    fn appending_feedback_creates_the_debug_dir_and_stamps_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = feedback_path(root.path());
+        assert!(!path.exists(), "o diretório ainda não existe");
+
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "sem grep".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            debug_dir(root.path()),
+            root.path().join(".agents").join("tupi").join("debug")
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        let record: Feedback = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(record.text, "sem grep");
+        assert_eq!(record.id, fact_id("sem grep"));
+        assert!(record.ts_ms > 0);
+    }
+
+    #[test]
+    fn appending_past_the_ceiling_keeps_the_newest_lines() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(debug_dir(root.path())).unwrap();
+        let path = feedback_path(root.path());
+        let mut body = String::new();
+        let mut n = 0usize;
+        while body.len() <= FEEDBACK_MAX_BYTES as usize + 4096 {
+            let record = Feedback {
+                id: format!("{n:016x}"),
+                text: format!("atrito {}", n),
+                ..Feedback::default()
+            };
+            body.push_str(&serde_json::to_string(&record).unwrap());
+            body.push('\n');
+            n += 1;
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "ultimo atrito".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            (kept.len() as u64) <= FEEDBACK_MAX_BYTES / 2 + 512,
+            "cortou até a metade do teto: {} bytes",
+            kept.len()
+        );
+        for line in kept.lines() {
+            serde_json::from_str::<Feedback>(line).expect("linhas sobrevivem inteiras");
+        }
+        let last = kept.lines().last().unwrap();
+        let last: Feedback = serde_json::from_str(last).unwrap();
+        assert_eq!(last.text, "ultimo atrito");
+        // o fim do corpo antigo sobrevive, sem linha partida no começo
+        let oldest = kept.lines().next().unwrap();
+        assert!(body.contains(oldest), "o começo é que foi descartado");
+        assert!(body.len() > kept.len());
+        assert!(!root.path().join(".agents/tupi/debug/feedback.tmp").exists());
+    }
+
+    #[test]
+    fn feedback_ids_are_stable_and_records_keep_the_writing_order() {
+        let root = tempfile::tempdir().unwrap();
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "sem grep".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "prompt grande".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+
+        let records = feedback_records(root.path());
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text, "sem grep");
+        assert_eq!(records[1].text, "prompt grande");
+        // o id vem do texto normalizado: caixa e espacos nao geram registro novo
+        assert_eq!(records[0].id, fact_id("  SEM    grep "));
+        assert_eq!(records[0].id, fact_id("sem grep"));
+        assert_ne!(records[0].id, records[1].id);
+        assert!(feedback_records(&root.path().join("sem")).is_empty());
+    }
+
+    #[test]
+    fn a_supplied_id_is_replaced_by_the_normalized_one() {
+        let root = tempfile::tempdir().unwrap();
+        append_feedback(
+            root.path(),
+            &Feedback {
+                id: "id-escolhido-pelo-chamador".into(),
+                text: "  Sem    GREP ".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+
+        let records = feedback_records(root.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, fact_id("sem grep"));
+    }
+
+    #[test]
+    fn the_same_atrito_written_twice_shares_one_id() {
+        let root = tempfile::tempdir().unwrap();
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "sem grep".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+        append_feedback(
+            root.path(),
+            &Feedback {
+                text: "  SEM   grep ".into(),
+                session: "s1".into(),
+                ..Feedback::default()
+            },
+        )
+        .unwrap();
+
+        let records = feedback_records(root.path());
+        // o log guarda as duas linhas (e historico), mas o id se repete: quem le
+        // agrupa por id e nao conta o mesmo atrito duas vezes
+        assert_eq!(records.len(), 2);
+        let ids: std::collections::BTreeSet<&str> =
+            records.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "caixa e espaco nao geram id novo");
+        assert_eq!(records[0].id, fact_id("sem grep"));
+        assert_eq!(records[1].session, "s1");
+        assert!(records[0].ts_ms > 0 && records[1].ts_ms > 0);
     }
 }

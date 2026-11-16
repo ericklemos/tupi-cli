@@ -1454,6 +1454,50 @@ mod tests {
         assert!(outcome.error.unwrap_or_default().contains("passos"));
     }
 
+    /// Dois tetos, dois números: o turno principal lê `max_tool_steps` de
+    /// `configs/tools.ron` (`App::with_max_tool_steps`) e o subagente lê
+    /// `agent_max_steps` do request (`SddExecRequest::agent_max_steps`), então
+    /// o valor de um não move o do outro.
+    #[tokio::test]
+    async fn the_agent_ceiling_is_per_request_not_the_turn_constant() {
+        for configured in [2usize, 5] {
+            let calls: Vec<_> = (0..configured)
+                .map(|index| vec![call_event(&format!("c{index}"))])
+                .collect();
+            let (provider, requests) = Scripted::new_tracked(calls);
+            let mut tools = ToolRegistry::new();
+            tools.register(Arc::new(EchoTool {
+                hits: Arc::new(AtomicUsize::new(0)),
+            }));
+            let cancel = Arc::new(AtomicBool::new(false));
+
+            let outcome = run_agent(
+                fixture(&provider, &tools, configured, cancel),
+                "brief",
+            )
+            .await;
+
+            assert!(!outcome.ok);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                configured,
+                "o subagente deve gastar exatamente o teto do request ({configured})"
+            );
+            assert!(
+                outcome
+                    .error
+                    .unwrap_or_default()
+                    .contains(&format!("limite de {configured} passos")),
+                "a falha deve nomear o teto do request, não outro"
+            );
+            assert_ne!(
+                configured,
+                crate::app::MAX_TOOL_STEPS,
+                "o teto do subagente não é a constante do turno"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn agent_passes_back_reasoning_content_of_previous_steps() {
         let (provider, requests) = Scripted::new_tracked(vec![

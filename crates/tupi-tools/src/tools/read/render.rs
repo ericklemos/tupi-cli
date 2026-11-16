@@ -272,20 +272,26 @@ impl ReadTool {
             .flat_map(|rendered| expand_over_budget(rendered, budget))
             .collect();
 
-        let sections: Vec<Section> = rendered
+        let items: Vec<crate::support::dense::Item> = rendered
             .iter()
-            .map(|rendered| rendered.section.clone())
+            .map(|rendered| crate::support::dense::Item {
+                section: rendered.section.clone(),
+                track: None,
+            })
             .collect();
-        let selection = budget::select(&sections, budget);
-        let handle = if selection.omitted.is_empty() {
-            None
-        } else {
-            Some(self.store.insert(selection.omitted_body()))
-        };
 
+        // O helper ordena por prioridade antes de cortar; refazer a seleção aqui
+        // só serve para o livro-caixa saber o que entrou de fato.
+        let mut order: Vec<usize> = (0..rendered.len()).collect();
+        order.sort_by(|&a, &b| rendered[b].section.priority.cmp(&rendered[a].section.priority));
+        let ordered: Vec<Section> = order
+            .iter()
+            .map(|&idx| rendered[idx].section.clone())
+            .collect();
+        let selection = budget::select(&ordered, budget);
         self.settle(&rendered, &selection);
 
-        budget::render(&selection, handle.as_deref())
+        crate::support::dense::dense(items, budget, &self.ledger, &self.store)
     }
 
     pub(super) fn settle(&self, rendered: &[Rendered], selection: &budget::Selection) {

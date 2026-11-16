@@ -1,0 +1,42 @@
+# Manifesto do fork próprio de `llama-cpp-sys-2` (ver README.md).
+#
+# `version` fica congelada em 0.1.161: é o que casa o `[patch.crates-io]` com
+# `llama-cpp-sys-2 = "^0.1.161"` exigido por `llama-cpp-2` 0.1.161. Subir a tag
+# do llama.cpp não muda este número.
+[package]
+name = "llama-cpp-sys-2"
+version = "0.1.161"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# O build lê `LLAMA_CPP_TAG` e confere o submódulo antes de compilar.
+links = "llama"
+build = "build.rs"
+include = ["src/**", "build.rs", "wrapper.h", "LLAMA_CPP_TAG", "README.md"]
+
+[package.metadata.tupi.fork]
+# O fork é o dono da subida; o pin imutável é a tag do submódulo.
+base = "utilityai/llama-cpp-rs"
+base_version = "0.1.161"
+base_llama_cpp = "v0.6.0"
+llama_cpp_tag = "v0.8.0"
+llama_cpp_build = "b11960"
+llama_cpp_submodule = "llama.cpp"
+
+# Default leve: CPU. GPU só sob feature explícita, para o patch não forçar
+# CUDA no build padrão do workspace.
+[features]
+default = []
+cuda = []
+vulkan = []
+metal = []
+openmp = []
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"
+
+# Isolamento: este diretório é o fork (workspace próprio), não um membro do
+# workspace do tupi.
+[workspace]

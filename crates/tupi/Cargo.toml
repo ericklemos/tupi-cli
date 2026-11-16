@@ -30,6 +30,9 @@ tracing-subscriber.workspace = true
 ron.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Alocador global opcional para medir A/B (`crates/tupi/tests/alloc_ab.rs`).
+# Fora da feature `mimalloc` o binário usa o alocador do sistema.
+mimalloc = { version = "0.1", optional = true }
 
 [features]
 # Uma feature por família de IA local; fora delas o binário não tem IA nenhuma.
@@ -54,6 +57,9 @@ transcribe = ["dep:tupi-transcribe"]
 cuda = ["local-models", "transcribe", "tupi-infer/cuda", "tupi-transcribe/cuda"]
 metal = ["local-models", "transcribe", "tupi-infer/metal", "tupi-transcribe/metal"]
 vulkan = ["local-models", "transcribe", "tupi-infer/vulkan", "tupi-transcribe/vulkan"]
+# Troca o alocador global por `mimalloc` (opt-in, nunca no default): existe só
+# para o A/B medido em docs/perf/allocator-and-linker.md.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile.workspace = true

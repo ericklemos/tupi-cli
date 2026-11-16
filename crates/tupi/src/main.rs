@@ -15,7 +15,14 @@ mod local_models;
 mod project_config;
 mod prompt_config;
 mod startup;
+mod telemetry_report;
 mod tool_config;
+
+/// Alocador global opcional (feature `mimalloc`). Medido por
+/// `crates/tupi/tests/alloc_ab.rs`; sem a feature vale o alocador do sistema.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,6 +88,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(args) = install_args(&argv) {
         install::run(args)?;
         return Ok(());
+    }
+    // `tupi telemetry` lê o JSONL e responde antes de abrir o redb, pedir chave
+    // de API ou subir a TUI: é leitura de relatório, não um turno.
+    if let Some(args) = telemetry_report::subcommand(&argv) {
+        let default_path = telemetry_default_path(&tool_root()?);
+        std::process::exit(telemetry_report::run(args, &default_path)?);
     }
 
     let cli = parse_cli_options(&argv)?;

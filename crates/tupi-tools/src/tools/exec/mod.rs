@@ -8,7 +8,7 @@ mod render;
 mod tests;
 
 pub(crate) use args::{build_args, command_line, execute, timeout_for};
-pub(crate) use render::{CacheNote, CacheOff, clip, fingerprint, finish, sections_for};
+pub(crate) use render::{CacheNote, clip, fingerprint, finish, sections_for};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -264,3 +264,5 @@ fn cache_lookup(
         .filter(|entry| entry.key == key)
         .map(|entry| (entry.output.clone(), entry.at.elapsed()))
 }
+#[cfg(test)]
+mod cache_tests;

@@ -10,9 +10,9 @@ pub(crate) use support::{
 
 pub use tools::sdd;
 pub(crate) use tools::{
-    assert, clock, context_graph, diff, edit, env, exec, facts, fetch, impact, map, patch, peek,
-    read, read_many, relocate, research, search, setup, shell, state, test_many, trace, websearch,
-    why, workflow, write, write_many,
+    assert, clock, context_graph, diff, edit, env, exec, facts, feedback, fetch, impact, map, patch,
+    peek, read, read_many, relocate, research, search, setup, shell, state, test_many, trace,
+    websearch, why, workflow, write, write_many,
 };
 
 pub use ast::{AstChunker, AstSnippet};
@@ -362,6 +362,12 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
+    // O feedback é um sink local de atrito (.agents/tupi/debug), separado do ledger.
+    registry.register(Arc::new(feedback::FeedbackTool::new(
+        root_dir.clone(),
+        store.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
     let mut sdd_tool = crate::sdd::SddTool::new(
         root_dir.clone(),
         sdd_store,
@@ -441,6 +447,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "clock",
     "edit",
     "exec",
+    "feedback",
     "map",
     "patch",
     "read",

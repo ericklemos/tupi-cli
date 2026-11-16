@@ -14,3 +14,4 @@ pub mod telemetry;
 pub mod workflow;
 
 mod pipeline;
+mod tool_batch;

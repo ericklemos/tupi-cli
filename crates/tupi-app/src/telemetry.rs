@@ -72,6 +72,14 @@ struct Stats {
     prompt_tokens: AtomicU64,
     cached_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+    /// Tempo gasto dentro do provedor (soma de `ProviderResponse.duration_us`).
+    provider_us: AtomicU64,
+    /// Tempo até o primeiro chunk de cada requisição que produziu algum.
+    first_token_us: AtomicU64,
+    /// Tempo gasto dentro das tools (soma de `ToolFinished.duration_us`).
+    tool_us: AtomicU64,
+    /// Passos de turno encerrados; divide `provider_us` para dar o custo por passo.
+    steps: AtomicU64,
     errors: AtomicU64,
     dropped: AtomicU64,
 }
@@ -87,6 +95,14 @@ pub struct StatsSnapshot {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
+    /// Tempo total dentro do provedor, somando todas as requisições.
+    pub provider_us: u64,
+    /// Tempo total até o primeiro chunk (só requisições que produziram algum).
+    pub first_token_us: u64,
+    /// Tempo total dentro das tools.
+    pub tool_us: u64,
+    /// Passos somados dos turnos encerrados; `provider_us / steps` é o custo médio por passo.
+    pub steps: u64,
     pub errors: u64,
     pub dropped: u64,
 }
@@ -182,6 +198,10 @@ impl Telemetry {
             prompt_tokens: self.inner.stats.prompt_tokens.load(Ordering::Relaxed),
             cached_tokens: self.inner.stats.cached_tokens.load(Ordering::Relaxed),
             completion_tokens: self.inner.stats.completion_tokens.load(Ordering::Relaxed),
+            provider_us: self.inner.stats.provider_us.load(Ordering::Relaxed),
+            first_token_us: self.inner.stats.first_token_us.load(Ordering::Relaxed),
+            tool_us: self.inner.stats.tool_us.load(Ordering::Relaxed),
+            steps: self.inner.stats.steps.load(Ordering::Relaxed),
             errors: self.inner.stats.errors.load(Ordering::Relaxed),
             dropped: self.inner.stats.dropped.load(Ordering::Relaxed),
         }
@@ -279,8 +299,16 @@ impl TelemetryEvent {
             TelemetryEvent::TurnStarted(_) => {
                 stats.turns.fetch_add(1, Ordering::Relaxed);
             }
+            TelemetryEvent::TurnFinished(event) => {
+                stats.steps.fetch_add(event.steps as u64, Ordering::Relaxed);
+            }
             TelemetryEvent::ProviderResponse(event) => {
                 stats.provider_requests.fetch_add(1, Ordering::Relaxed);
+                // O split provider×tool sai daqui: tempo do modelo separado do tempo de tool.
+                stats
+                    .provider_us
+                    .fetch_add(event.duration_us, Ordering::Relaxed);
+                add(&stats.first_token_us, event.first_token_us);
                 add(&stats.prompt_tokens, event.prompt_tokens);
                 add(&stats.cached_tokens, event.cached_tokens);
                 add(&stats.completion_tokens, event.completion_tokens);
@@ -291,8 +319,13 @@ impl TelemetryEvent {
             TelemetryEvent::ToolStarted(_) => {
                 stats.tool_calls.fetch_add(1, Ordering::Relaxed);
             }
-            TelemetryEvent::ToolFinished(event) if !event.ok => {
-                stats.tool_failures.fetch_add(1, Ordering::Relaxed);
+            TelemetryEvent::ToolFinished(event) => {
+                if !event.ok {
+                    stats.tool_failures.fetch_add(1, Ordering::Relaxed);
+                }
+                stats
+                    .tool_us
+                    .fetch_add(event.duration_us, Ordering::Relaxed);
             }
             TelemetryEvent::ModelsRefreshed(event) if !event.ok => {
                 stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -1414,6 +1447,79 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 10);
         assert_eq!(stats.cached_tokens, 2);
         assert_eq!(stats.completion_tokens, 3);
+    }
+
+    #[test]
+    fn stats_sum_provider_and_tool_time_across_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = Telemetry::open(dir.path().join("telemetry.jsonl"));
+
+        let response = |duration_us: u64, first_token_us: Option<u64>| {
+            TelemetryEvent::ProviderResponse(ProviderResponse {
+                request: 1,
+                step: 1,
+                estimate_tokens: 10,
+                estimate_scaled: 10,
+                scale_ppm: 1_000_000,
+                duration_us,
+                first_token_us,
+                delta_count: 0,
+                delta_chars: 0,
+                tool_calls: 0,
+                tool_call_names: Vec::new(),
+                prompt_tokens: None,
+                cached_tokens: None,
+                completion_tokens: None,
+                finish_reason: Some("stop".to_string()),
+                ok: true,
+                error: None,
+                error_kind: None,
+                http_status: None,
+            })
+        };
+        let tool = |duration_us: u64, ok: bool| {
+            TelemetryEvent::ToolFinished(ToolFinished {
+                request: 1,
+                call: "c1".to_string(),
+                name: "read".to_string(),
+                duration_us,
+                ok,
+                result: None,
+                result_chars: 0,
+                result_bytes: 0,
+                truncated: false,
+                summary: String::new(),
+                error: (!ok).then(|| "falhou".to_string()),
+            })
+        };
+
+        telemetry.record(response(1_000, Some(200)));
+        telemetry.record(response(3_000, Some(400)));
+        // Requisição que falhou antes do primeiro chunk não soma `first_token_us`.
+        telemetry.record(response(500, None));
+        telemetry.record(tool(150, true));
+        telemetry.record(tool(50, false));
+        telemetry.record(TelemetryEvent::TurnFinished(TurnFinished {
+            request: 1,
+            duration_us: 5_000,
+            ok: true,
+            cancelled: false,
+            steps: 4,
+            tool_calls: 2,
+            total_prompt_tokens: None,
+            total_cached_tokens: None,
+            total_completion_tokens: None,
+            error: None,
+            error_kind: None,
+        }));
+
+        let stats = telemetry.stats();
+        assert_eq!(stats.provider_requests, 3);
+        assert_eq!(stats.provider_us, 4_500);
+        assert_eq!(stats.first_token_us, 600);
+        assert_eq!(stats.tool_us, 200);
+        assert_eq!(stats.tool_failures, 1);
+        assert_eq!(stats.steps, 4);
     }
 
     #[test]

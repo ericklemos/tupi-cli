@@ -1,7 +1,17 @@
 // Limite de passos de tool call por turno.
 // Cada passo é uma resposta do modelo que pode conter uma ou mais chamadas;
 // ao atingir o limite, as chamadas ainda não executadas são encerradas.
+//
+// Número medido, não palpite: o split provider×tool da telemetria real
+// (`tupi telemetry`, crates/tupi/src/telemetry_report.rs; probe em
+// crates/tupi/tests/turn_baseline.rs) mostra turno interativo de 12 passos a
+// ~5,4 s por passo, 48% do tempo no provedor e 46% nas tools — o teto é
+// multiplicador do pior caso, e o pior caso não é o uso observado.
+// 30 é o default de código (DEFAULT_MAX_TOOL_STEPS, crates/tupi/src/tool_config.rs)
+// e dá 2,5× de folga sobre os 12 passos medidos: o freio avisa a partir de 18
+// (60%) e a última chamada, sem tools, sai no passo 30. Subir de novo exige
+// pior caso medido, não margem imaginada.
 (
-    max_tool_steps: 200,
+    max_tool_steps: 30,
     expose_all: true
 )
