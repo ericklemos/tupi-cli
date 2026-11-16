@@ -46,3 +46,25 @@ pub enum InferError {
     #[error("inferência: {0}")]
     Inference(String),
 }
+
+// Decisor d1: responde em um único forward pass (`noul`/`choice`/`score`),
+// então não passa por `Generator` nem por `Embedder`. Q4_K_M é a quantização
+// canônica, verificada por tamanho e sha256.
+pub const D1_REPO: &str = "LiquidAI/d1-2B-GGUF";
+pub const D1_FILE: &str = "d1-2B-Q4_K_M.gguf";
+pub const D1_SHA256: &str = "adca5789ad30ae6027e8e936749bb9f19673097492ab26fa1c5b69643ca50b4b";
+pub const D1_BYTES: u64 = 1_099_629_888;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn d1_metadata_matches_the_verified_gguf() {
+        assert!(D1_FILE.ends_with(".gguf"), "{} não é um GGUF", D1_FILE);
+        assert_eq!(D1_BYTES, 1_099_629_888);
+        assert_eq!(D1_SHA256.len(), 64);
+        assert!(D1_SHA256.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(D1_REPO, "LiquidAI/d1-2B-GGUF");
+    }
+}

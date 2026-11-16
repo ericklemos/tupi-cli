@@ -85,7 +85,7 @@ fn a_successful_output_has_no_detail_section() {
         duration: Duration::from_millis(10),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, None);
+    let sections = sections_for(&args, &raw, CacheNote::default());
     assert_eq!(sections.len(), 1);
     assert!(sections[0].body.contains("ok"));
 }
@@ -100,7 +100,7 @@ fn a_failure_carries_the_detail() {
         duration: Duration::from_millis(10),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, None);
+    let sections = sections_for(&args, &raw, CacheNote::default());
     assert_eq!(sections.len(), 1);
     assert!(sections[0].body.contains("mismatched types"));
 }
@@ -124,8 +124,11 @@ fn fingerprint_refuses_to_cache_when_file_count_exceeds_limit() {
     for index in 0..5 {
         std::fs::write(dir.path().join(format!("f{index}.rs")), "fn a() {}").unwrap();
     }
-    assert!(fingerprint(dir.path(), 10).is_some());
-    assert!(fingerprint(dir.path(), 3).is_none());
+    assert!(fingerprint(dir.path(), 10).is_ok());
+    assert_eq!(
+        fingerprint(dir.path(), 3).unwrap_err(),
+        super::render::CacheOff::Files(3)
+    );
 }
 
 #[test]
@@ -183,11 +186,17 @@ fn a_cache_hit_reports_its_age_instead_of_the_original_runtime() {
         duration: Duration::from_millis(3_400),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, Some(Duration::from_secs(125)));
+    let note = CacheNote {
+        age: Some(Duration::from_secs(125)),
+        key_cost: Some(Duration::from_millis(5)),
+        off: None,
+    };
+    let sections = sections_for(&args, &raw, note);
 
     let body = &sections[0].body;
     assert!(body.contains("em cache há 2m5s"), "{body}");
     assert!(body.contains("execução original: 3.4s"), "{body}");
+    assert!(body.contains("cache: hit · chave 5.0ms"), "{body}");
 }
 
 #[test]
@@ -206,7 +215,7 @@ fn every_compiler_error_reaches_the_model() {
         duration: Duration::from_millis(1),
     };
     let args = build_args(&params(ExecKind::Check)).unwrap();
-    let sections = sections_for(&args, &raw, None);
+    let sections = sections_for(&args, &raw, CacheNote::default());
     let important: String = sections
         .iter()
         .filter(|section| section.priority >= 200)
@@ -269,10 +278,27 @@ fn fingerprint_changes_when_the_build_environment_changes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
 
-    let plain = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=\n").unwrap();
-    let flagged = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=--cfg a\n").unwrap();
-    let again = super::render::fingerprint_with(dir.path(), 10, "RUSTFLAGS=\n").unwrap();
+    let plain = super::render::environment_block_from(
+        std::env::vars().filter(|(name, _)| name != "CARGO_NET_OFFLINE"),
+        "rustc 1.90.0",
+        &[],
+    );
+    let offline = super::render::environment_block_from(
+        std::iter::once(("CARGO_NET_OFFLINE".to_string(), "1".to_string())),
+        "rustc 1.90.0",
+        &[],
+    );
+    let noisy = super::render::environment_block_from(
+        std::iter::once(("RUST_LOG".to_string(), "debug".to_string())),
+        "rustc 1.90.0",
+        &[],
+    );
 
-    assert_ne!(flagged, plain);
-    assert_eq!(again, plain);
+    // `CARGO_NET_OFFLINE` muda o que o cargo faz; `RUST_LOG` muda só o log.
+    assert_ne!(offline, plain);
+    assert_eq!(noisy, super::render::environment_block_from(
+        std::iter::empty(),
+        "rustc 1.90.0",
+        &[],
+    ));
 }

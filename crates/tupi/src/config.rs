@@ -115,6 +115,7 @@ mod tests {
         assert!(!super::docs_embedding_enabled(&folders, Some("off")));
         assert!(!super::docs_embedding_enabled(&[], None));
     }
+    #[cfg(feature = "local-models")]
     #[test]
     fn real_embedding_model_loads_with_1024_dims() {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
@@ -132,14 +133,14 @@ mod tests {
         assert_eq!(vectors[0].len(), 1024);
     }
     #[test]
-    fn summaries_are_enabled_only_with_folders_and_without_off() {
-        let folders = vec![std::path::PathBuf::from("docs")];
-        assert!(super::summaries_enabled(&folders, None));
-        assert!(super::summaries_enabled(&folders, Some("auto")));
-        assert!(!super::summaries_enabled(&folders, Some("off")));
-        assert!(!super::summaries_enabled(&[], None));
+    fn summaries_are_enabled_unless_explicitly_off() {
+        assert!(super::summaries_enabled(None));
+        assert!(super::summaries_enabled(Some("auto")));
+        assert!(!super::summaries_enabled(Some("off")));
+        assert!(!super::summaries_enabled(Some("0")));
     }
 
+    #[cfg(feature = "local-models")]
     #[test]
     #[ignore = "requer o GGUF LFM3 verificado"]
     fn real_generation_model_produces_a_line() {
@@ -290,23 +291,20 @@ fn local_embedding_is_needed_for_space_even_without_docs() {
 }
 
 #[test]
-fn docs_download_keeps_the_legacy_behavior() {
-    assert!(should_download(true, false, None));
-}
-
-#[test]
-fn space_alone_does_not_download_without_the_flag() {
-    assert!(!should_download(false, true, None));
-}
-
-#[test]
-fn space_alone_downloads_with_the_flag() {
-    assert!(should_download(false, true, Some("download")));
+fn download_follows_the_enabled_consumers() {
+    assert!(should_download(true, false));
+    assert!(should_download(false, true));
+    assert!(!should_download(false, false));
 }
 
 /// Autoriza baixar o GGUF: docs mantêm o legado; space exige a flag.
-pub fn should_download(docs: bool, space: bool, value: Option<&str>) -> bool {
-    docs || (space && matches!(value.map(str::trim), Some("download")))
+/// A IA local so existe quando a feature `local-models` entrou no build.
+pub const LOCAL_MODELS: bool = cfg!(feature = "local-models");
+
+pub fn should_download(docs: bool, space: bool) -> bool {
+    // O consentimento é a feature de build (`local-models`), não uma variável
+    // de ambiente: se o consumidor está ligado, o modelo pode ser baixado.
+    docs || space
 }
 
 /// O embedder local é necessário quando há docs declarados ou `space` ligado.
@@ -316,13 +314,18 @@ pub fn local_embedding_enabled(
     value: Option<&str>,
 ) -> bool {
     let disabled = matches!(value.map(str::trim), Some("off" | "0" | "false"));
-    !disabled && (space || !folders.is_empty())
+    // Sem `local-models` não há embedder no binário: nada de download nem de
+    // worker vetorial, mesmo com `space` ligado no projeto.
+    LOCAL_MODELS && !disabled && (space || !folders.is_empty())
 }
 
 pub fn docs_embedding_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
     !folders.is_empty() && !matches!(value.map(str::trim), Some("off" | "0" | "false"))
 }
 
-pub fn summaries_enabled(folders: &[std::path::PathBuf], value: Option<&str>) -> bool {
-    docs_embedding_enabled(folders, value)
+pub fn summaries_enabled(value: Option<&str>) -> bool {
+    // A pasta de documentação deixou de ser condição: quem liga o gerador é a
+    // feature `local-models`, e o download só acontece quando existe consumidor
+    // (a tool `docs`, que por sua vez precisa de pasta declarada).
+    LOCAL_MODELS && !matches!(value.map(str::trim), Some("off" | "0" | "false"))
 }

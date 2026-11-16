@@ -65,7 +65,7 @@ pub(super) fn test_lines(stdout: &str) -> Vec<String> {
 pub(crate) fn sections_for(
     args: &[String],
     raw: &Output,
-    cached_age: Option<std::time::Duration>,
+    cache: CacheNote,
 ) -> Vec<Section> {
     let command = command_line(args);
     let status = if raw.timed_out {
@@ -81,7 +81,7 @@ pub(crate) fn sections_for(
     // Um hit de cache não pode se passar por execução fresca: `raw.duration`
     // é a duração da execução *original*, então a idade do hit precisa
     // aparecer junto dela.
-    let timing = match cached_age {
+    let timing = match cache.age {
         Some(age) => {
             let seconds = age.as_secs();
             let ago = if seconds >= 60 {
@@ -97,10 +97,28 @@ pub(crate) fn sections_for(
         None => format!("{:.1}s", raw.duration.as_secs_f64()),
     };
 
+    // Uma linha só: veredito do cache e custo da chave (walk + blake3, feito
+    // antes do cargo). No miss, o total da chamada. Tokens são requisito de
+    // projeto: no máximo uma linha a mais por chamada.
+    let cache_line = match (&cache.off, cache.age, cache.key_cost) {
+        (Some(off), _, _) => format!("cache desligado: {}", off.reason()),
+        (None, Some(_), Some(cost)) => {
+            format!("cache: hit · chave {:.1}ms", cost.as_secs_f64() * 1000.0)
+        }
+        (None, Some(_), None) => "cache: hit".to_string(),
+        (None, None, Some(cost)) => format!(
+            "cache: miss · chave {:.1}ms · total {:.1}s",
+            cost.as_secs_f64() * 1000.0,
+            (cost + raw.duration).as_secs_f64()
+        ),
+        (None, None, None) => "cache: desligado".to_string(),
+    };
+
     let mut summary = String::new();
     summary.push('\n');
     summary.push_str(&format!("- comando: {command}\n"));
     summary.push_str(&format!("- status: {status} · {timing}\n"));
+    summary.push_str(&format!("- {cache_line}\n"));
     if !diag.errors.is_empty() || !diag.warnings.is_empty() {
         summary.push_str(&format!(
             "- erros: {} · avisos: {}\n",

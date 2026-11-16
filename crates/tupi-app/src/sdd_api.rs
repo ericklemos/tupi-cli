@@ -13,16 +13,6 @@ use tupi_tools::sdd::SddStore;
 
 use crate::sdd_run::{RunContext, run_plan};
 
-/// Prefixo mínimo do agente de implementação.
-pub const AGENT_PREFIX: &str = r#"Você é um agente de implementação do tupi.
-
-Implemente exatamente a subtarefa descrita. Não edite o plano nem chame sdd.
-Outros agentes podem estar trabalhando em paralelo em outras partes do
-repositório: trate o que já existe como verdade e não toque no que pertence a
-outra subtarefa. Use read/edit/exec como de costume.
-
-Ao terminar, responda em até 3 linhas: o que mudou, arquivos e como verificou."#;
-
 /// Pedido de execução de um plano fechado.
 pub struct SddExecRequest {
     pub root: PathBuf,

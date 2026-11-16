@@ -6,6 +6,7 @@ pub mod memory;
 pub mod prompt;
 pub mod sdd;
 pub mod sdd_api;
+pub mod sdd_render;
 pub mod sdd_run;
 pub mod sessions;
 pub mod store;

@@ -7,6 +7,8 @@ mod query;
 mod registry;
 mod tool;
 pub use tool::ModeMask;
+mod sdd_config;
+pub use sdd_config::{SddConfig, SddExecution, SddPlanning, SddRunner, SddToolConfig, sdd_config};
 
 mod workflow;
 
@@ -77,6 +79,7 @@ mod tests {
         ));
     }
 }
+pub mod decide;
 pub mod embed;
 pub mod generate;
 pub mod pipeline;

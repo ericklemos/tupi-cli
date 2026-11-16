@@ -166,9 +166,16 @@ impl ToolRegistry {
     }
 
     pub fn specs_for_mode(&self, mode: crate::AgentMode) -> Vec<ToolSpec> {
+        let allowed = match mode {
+            crate::AgentMode::Sdd => crate::sdd_config().planning.tools,
+            _ => &[],
+        };
         self.tools
             .iter()
             .filter(|tool| tool.mode_mask().contains(mode))
+            .filter(|tool| {
+                allowed.is_empty() || allowed.contains(&tool.spec().name.as_str())
+            })
             .map(|tool| tool.spec_for_mode(mode))
             .collect()
     }

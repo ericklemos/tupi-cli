@@ -27,6 +27,9 @@ crates:
 - Subcomando de manutenção não sobe a pilha da TUI: `tupi install` responde no
   `main` antes de env, redb e provider (ver
   [`features/tupi-install.md`](features/tupi-install.md)).
+- Poder de execução só encolhe: o `shell` recusa antes de rodar o que está fora
+  da allowlist e nenhuma correção dele amplia o que pode ser executado (ver
+  [`features/shell-tool.md`](features/shell-tool.md)).
 
 ## Componentes
 
@@ -34,7 +37,10 @@ crates:
   single-flight, busca lexical sobre os símbolos; números em
   [`perf/baseline.md`](perf/baseline.md).
 - **Tools** (`tupi-tools`): `read`/`search`/`map`/`peek`, edição com hash,
-  `exec`/`test_many`, grafo e web. `AGENTS.md` é gerado por `setup`.
+  `exec`/`test_many`, grafo e web. `AGENTS.md` é gerado por `setup`. O `shell` é
+  inspeção crua: allowlist restrita, recusa que ensina a alternativa e nenhuma
+  memória de projeto no resultado (ver
+  [`features/shell-tool.md`](features/shell-tool.md)).
 - **Transcript da TUI**: `ChatState` guarda o relógio e a duração de cada tool;
   `transcript_layout_at` desenha linha viva, glifo por categoria e indentação de
   sub-chamadas (ver [`features/tui-tool-usage.md`](features/tui-tool-usage.md)).

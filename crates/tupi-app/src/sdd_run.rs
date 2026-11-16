@@ -501,7 +501,7 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
         AgentTurn {
             provider: &ctx.provider,
             model: &ctx.model,
-            prefix: crate::sdd::DOCS_AGENT_PREFIX,
+            prefix: tupi_kernel::sdd_config().execution.docs_agent_prefix,
             tools: &tools,
             max_steps: ctx.agent_max_steps,
             max_tokens: ctx.max_tokens,
@@ -576,15 +576,9 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
 }
 
 fn format_docs_brief(plan: &SddPlan) -> String {
-    format!(
-        "Você é o agente de documentação do plano SDD {slug}.\n\
-         Leia .tupi/sdd/{slug}/result.md, spec.md, tasks.json e meta.json.\n\
-         Use docs map/query/read para ver a documentação atual.\n\
-         Se o trabalho mudou conhecimento durável, atualize/crie arquivos sob docs_folders com docs write.\n\
-         Se nada mudou, não escreva nada.\n\
-         No final, responda uma conclusão curta (até 10 linhas) para result.md.\n\
-         Não altere código, testes ou arquivos fora de docs_folders.",
-        slug = plan.slug
+    crate::sdd_render::render(
+        tupi_kernel::sdd_config().execution.docs_brief,
+        &[("slug", plan.slug.as_str())],
     )
 }
 

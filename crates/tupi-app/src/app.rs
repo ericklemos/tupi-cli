@@ -492,6 +492,7 @@ impl App {
         if self.mode() == tupi_kernel::AgentMode::Sdd
             && mode != tupi_kernel::AgentMode::Sdd
             && self.sdd_flow_started.load(Ordering::SeqCst)
+            && tupi_kernel::sdd_config().planning.lock_mode_on_open
         {
             self.events.publish(Event::Notice {
                 message: SDD_LOCK_NOTICE.to_string(),

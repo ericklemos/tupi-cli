@@ -8,7 +8,7 @@ mod render;
 mod tests;
 
 pub(crate) use args::{build_args, command_line, execute, timeout_for};
-pub(crate) use render::{clip, fingerprint, finish, sections_for};
+pub(crate) use render::{CacheNote, CacheOff, clip, fingerprint, finish, sections_for};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,8 @@ pub struct ExecTool {
     root_dir: PathBuf,
     store: Arc<ResponseStore>,
     default_budget_tokens: usize,
+    /// `false` desliga a chave: nenhum walk nem blake3 é calculado.
+    cache_enabled: bool,
     cache: Mutex<Option<Cached>>,
 }
 
@@ -100,6 +102,7 @@ impl ExecTool {
             root_dir,
             store,
             default_budget_tokens,
+            cache_enabled: true,
             cache: Mutex::new(None),
         }
     }
@@ -168,24 +171,15 @@ impl Tool for ExecTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let key =
-            fingerprint(&root, MAX_FINGERPRINT_FILES).map(|fp| format!("{}|{fp}", args.join(" ")));
 
-        let cached = if params.refresh {
-            None
-        } else if let Some(key) = &key {
-            self.cache
-                .lock()
-                .unwrap()
-                .clone()
-                .filter(|entry| &entry.key == key)
-                .map(|entry| (entry.output, Some(entry.at.elapsed())))
-        } else {
-            None
+        let (key, key_cost, off) = self.build_key(&args);
+        let cached = {
+            let cache = self.cache.lock().unwrap().clone();
+            cache_lookup(&cache, key.as_deref(), params.refresh)
         };
 
         let (output, age) = match cached {
-            Some(hit) => hit,
+            Some((output, age)) => (output, Some(age)),
             None => {
                 let output = execute(&root, &params, timeout_for(&params))?;
                 if let Some(key) = key {
@@ -199,7 +193,12 @@ impl Tool for ExecTool {
             }
         };
 
-        let sections = sections_for(&args, &output, age);
+        let note = render::CacheNote {
+            age,
+            key_cost: (key_cost > std::time::Duration::ZERO).then_some(key_cost),
+            off,
+        };
+        let sections = sections_for(&args, &output, note);
         let budget_tokens = params.budget_tokens.unwrap_or(self.default_budget_tokens);
         Ok(finish(&self.store, sections, budget_tokens))
     }
@@ -213,4 +212,55 @@ impl Tool for ExecTool {
             Err(_) => "exec".to_string(),
         }
     }
+}
+
+impl ExecTool {
+    /// Desliga o cache (`ToolsOptions::exec_cache == false`). Com o cache
+    /// desligado a chave nunca é construída: nenhum walk, nenhum blake3.
+    pub fn with_cache(mut self, enabled: bool) -> Self {
+        self.cache_enabled = enabled;
+        self
+    }
+
+    /// Chave de cache, custo de construí-la e motivo de ela não existir.
+    ///
+    /// `Err` não é falha da tool: é *miss* obrigatório (fail-closed).
+    pub(crate) fn build_key(
+        &self,
+        args: &[String],
+    ) -> (Option<String>, std::time::Duration, Option<render::CacheOff>) {
+        if !self.cache_enabled {
+            return (None, std::time::Duration::ZERO, None);
+        }
+        let root = self
+            .root_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.root_dir.clone());
+        let started = std::time::Instant::now();
+        let key =
+            fingerprint(&root, MAX_FINGERPRINT_FILES).map(|fp| format!("{}|{fp}", args.join(" ")));
+        let cost = started.elapsed();
+        match key {
+            Ok(key) => (Some(key), cost, None),
+            Err(off) => (None, cost, Some(off)),
+        }
+    }
+}
+
+/// Lookup puro do cache: sem lock, sem fingerprint, testável.
+///
+/// Sem chave (`None`) ou com `refresh`, é sempre *miss*.
+fn cache_lookup(
+    cache: &Option<Cached>,
+    key: Option<&str>,
+    refresh: bool,
+) -> Option<(Output, std::time::Duration)> {
+    if refresh {
+        return None;
+    }
+    let key = key?;
+    cache
+        .as_ref()
+        .filter(|entry| entry.key == key)
+        .map(|entry| (entry.output.clone(), entry.at.elapsed()))
 }

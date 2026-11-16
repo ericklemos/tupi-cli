@@ -98,6 +98,10 @@ impl SddStore for FsSddStore {
             self.write_text(&dir.join("result.md"), &render::render_result(plan))?;
         }
 
+        if tupi_kernel::sdd_config().runner.mirror_markdown {
+            crate::sdd::write_mirror(&self.root, plan).map_err(|error| error.to_string())?;
+        }
+
         Ok(())
     }
 

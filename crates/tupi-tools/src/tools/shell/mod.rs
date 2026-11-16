@@ -18,9 +18,13 @@ const MAX_TIMEOUT_SECS: u64 = 900;
 #[derive(Debug, Deserialize)]
 pub struct ShellParams {
     pub command: String,
-    /// Filtro duro: substring, case-insensitive, OR entre os termos.
+    /// Termos do filtro: substring, case-insensitive, OR entre eles.
+    /// Só filtram com `filter: true` explícito; sem isso a saída volta inteira.
     #[serde(default)]
     pub terms: Vec<String>,
+    /// Liga o filtro duro de `terms`. Ausente ou falso deixa a saída intacta.
+    #[serde(default)]
+    pub filter: Option<bool>,
     /// Ranking mole dos blocos por relevancia lexical.
     #[serde(default)]
     pub question: Option<String>,
@@ -62,16 +66,46 @@ pub(crate) fn allowed(command: &str, allow: &[String]) -> bool {
         "deno", "bun", "perl", "ruby", "php", "lua", "make", "just",
     ];
 
+    /// Subcomandos de leitura do git: escrever historico (checkout, commit,
+    /// reset, add) fica de fora mesmo quando o binario esta liberado.
+    const GIT_READ: &[&str] = &[
+        "status",
+        "diff",
+        "log",
+        "show",
+        "blame",
+        "annotate",
+        "grep",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "rev-list",
+        "describe",
+        "shortlog",
+        "cat-file",
+        "show-ref",
+        "name-rev",
+        "whatchanged",
+        "diff-tree",
+        "diff-files",
+        "diff-index",
+        "for-each-ref",
+        "merge-base",
+        "show-branch",
+        "check-ignore",
+        "check-attr",
+        "version",
+        "help",
+    ];
+
+    /// Globais que so tiram ruido: nenhum deles muda de diretorio nem abre pager.
+    const GIT_HARMLESS: &[&str] = &["--no-pager", "--no-optional-locks"];
+
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed
-        .chars()
-        .any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '$' | '\n' | '\r'))
-        || trimmed.contains('\u{0060}')
-        || trimmed.contains("--manifest-path")
-    {
+    if composes(trimmed) || trimmed.contains("--manifest-path") {
         return false;
     }
 
@@ -86,31 +120,55 @@ pub(crate) fn allowed(command: &str, allow: &[String]) -> bool {
         }
     }
 
-    let program = trimmed
-        .split_whitespace()
+    let mut tokens = trimmed.split_whitespace();
+    let program = tokens
         .next()
         .unwrap_or_default()
         .rsplit('/')
         .next()
         .unwrap_or_default();
-    // git -c e --config-env aceitam alias que rodam comando: a allowlist do
-    // binario seria contornada por dentro dele.
-    if program == "git"
-        && trimmed
-            .split_whitespace()
-            .skip(1)
-            .any(|arg| arg.starts_with("-c") || arg.starts_with("--config-env"))
-    {
+    let args: Vec<&str> = tokens.collect();
+
+    // Fora `cargo fmt`, ja liberado acima, o cargo fica com o tool exec, que roda
+    // build/test/check com os alvos declarados: o shell nao vira um `cargo run`.
+    if program == "cargo" {
         return false;
     }
+
+    if program == "git" {
+        // git -c e --config-env aceitam alias que rodam comando: a allowlist do
+        // binario seria contornada por dentro dele.
+        if args
+            .iter()
+            .any(|arg| arg.starts_with("-c") || arg.starts_with("--config-env"))
+        {
+            return false;
+        }
+        // So leitura, e sem -C/--git-dir/--work-tree: o subcomando precisa ser o
+        // primeiro argumento util, entao nenhum global com valor passa adiante.
+        let sub = args.iter().copied().find(|arg| !GIT_HARMLESS.contains(arg));
+        match sub {
+            Some(sub) if GIT_READ.contains(&sub) => {}
+            _ => return false,
+        }
+    }
+
     !WRAPPERS.contains(&program) && allow.iter().any(|name| name == program)
+}
+
+/// Composicao de shell: mais de um comando numa linha, redirecionamento ou
+/// substituicao por crase. Nenhum desses caracteres cabe num comando unico.
+fn composes(command: &str) -> bool {
+    command
+        .chars()
+        .any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '$' | '\n' | '\r' | '\u{0060}'))
 }
 
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell".to_string(),
-            description: "Roda um comando no root e devolve so os trechos da saida que casam com terms/question. O binario precisa estar na allowlist do projeto (ai.project.json, chave shell.allow); composicao de comandos nao e permitida.".to_string(),
+            description: "Roda um comando no root e devolve a saida. Por padrao a saida bruta volta inteira; terms so filtra com filter: true, e entao o cabecalho declara quantas linhas o filtro omitiu. O binario precisa estar na allowlist do projeto (ai.project.json, chave shell.allow); composicao de comandos nao e permitida. Fora `cargo fmt`, cargo pertence ao tool exec; git so roda subcomando de leitura (status, diff, log, show).".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -121,7 +179,11 @@ impl Tool for ShellTool {
                     "terms": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Filtro duro: devolve so os blocos cujas linhas contem algum termo (substring, case-insensitive). Nao e regex."
+                        "description": "Termos do filtro (substring, case-insensitive, nao e regex). Nao filtram por padrao: sem filter: true a saida volta inteira e o cabecalho avisa que terms foi ignorado."
+                    },
+                    "filter": {
+                        "type": "boolean",
+                        "description": "Liga o filtro duro de terms. Padrao false. Ligado, o cabecalho declara quantas linhas o filtro omitiu e o total real."
                     },
                     "question": {
                         "type": "string",
@@ -246,11 +308,132 @@ impl Tool for ShellTool {
             out
         }
 
+        /// Nomes que o bash resolve por dentro: nao existem como arquivo no
+        /// PATH, entao a checagem de instalacao nao se aplica a eles.
+        const BUILTINS: &[&str] = &[
+            "echo", "printf", "pwd", "test", "true", "false", "cd", "export", "alias", "type",
+            "read", "set", "unset", "source", "umask", "kill", "local", "shift", "return", "exit",
+        ];
+
+        /// Binarios que costumam faltar e o equivalente que a allowlist ja
+        /// aceita. E so sugestao: nada aqui e executado.
+        const EQUIVALENT: &[(&str, &str)] = &[
+            ("rg", "grep -rn -e \"<padrao>\" <caminho>"),
+            ("ripgrep", "grep -rn -e \"<padrao>\" <caminho>"),
+            ("ag", "grep -rn -e \"<padrao>\" <caminho>"),
+            ("ack", "grep -rn -e \"<padrao>\" <caminho>"),
+            ("fd", "find <caminho> -name \"<padrao>\""),
+            ("fdfind", "find <caminho> -name \"<padrao>\""),
+            ("bat", "sed -n '1,200p' <arquivo>"),
+            ("tree", "find <caminho> -maxdepth 2 -print"),
+            ("sd", "sed -i -e 's/<velho>/<novo>/g' <arquivo>"),
+        ];
+
+        /// Primeiro token do comando: o programa que o bash procuraria.
+        fn program_of(command: &str) -> &str {
+            command.split_whitespace().next().unwrap_or_default()
+        }
+
+        /// Caminho explicito e conferido no disco; nome simples vai no PATH do
+        /// proprio processo (o bash herda o mesmo ambiente). Sem PATH, nao bloqueia.
+        fn on_disk(token: &str, base: &std::path::Path) -> bool {
+            if token.contains('/') {
+                return base.join(token).is_file();
+            }
+            let Some(path) = std::env::var_os("PATH") else {
+                return true;
+            };
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(token))
+                .any(|full| full.is_file())
+        }
+
+        /// `false` so quando da para afirmar que o binario nao esta instalado.
+        fn installed(program: &str, base: &std::path::Path) -> bool {
+            let basename = program.rsplit('/').next().unwrap_or(program);
+            if basename.is_empty() || BUILTINS.contains(&basename) {
+                return true;
+            }
+            on_disk(program, base)
+        }
+
+        /// Tools nativas que fazem o trabalho de um binario fora da allowlist.
+        /// E so texto: nada daqui e executado nem amplia o que pode rodar.
+        const NATIVE: &[(&str, &str)] = &[
+            ("cat", "read"),
+            ("head", "read"),
+            ("tail", "read"),
+            ("sed", "edit"),
+            ("grep", "search"),
+            ("rg", "search"),
+            ("awk", "search"),
+            ("find", "map ou search"),
+            ("ls", "map"),
+            ("tree", "map"),
+            ("wc", "read"),
+            ("sha256sum", "read (o cabecalho traz o blake3 do arquivo)"),
+            ("sha1sum", "read (o cabecalho traz o blake3 do arquivo)"),
+            ("shasum", "read (o cabecalho traz o blake3 do arquivo)"),
+            ("md5sum", "read (o cabecalho traz o blake3 do arquivo)"),
+            ("curl", "fetch"),
+            ("wget", "fetch"),
+            ("rm", "move"),
+            ("mv", "move"),
+            ("cp", "move (copy: true)"),
+            ("touch", "write"),
+        ];
+
+        /// Substituto nativo do binario, quando existe um: a recusa termina
+        /// ensinando o que fazer sem liberar nada.
+        fn native_hint(basename: &str) -> String {
+            match NATIVE.iter().find(|(name, _)| *name == basename) {
+                Some((_, tool)) => format!(
+                    " Alternativa que nao precisa liberar nada: a tool `{tool}` faz o mesmo trabalho."
+                ),
+                None => String::new(),
+            }
+        }
+
+        /// Motivo da recusa e, principalmente, a alternativa equivalente:
+        /// recusar sem dizer o caminho custa um retry as cegas. Nada aqui
+        /// pede mais poder do que a regra ja permite.
+        fn refusal(command: &str, allow: &[String]) -> String {
+            let command = command.trim();
+            if composes(command) || command.contains("--manifest-path") {
+                return format!(
+                    "comando recusado: {command}. Composicao e redirecionamento nao sao permitidos \
+(|, ;, >, <, $, crase; tambem nao --manifest-path): um comando por chamada. Para varios padroes \
+no mesmo passo use um `-e` por padrao: grep -rn -e \"A\" -e \"B\" <caminho>; a tool `search` faz \
+o mesmo com `keywords: [\"A\", \"B\"]`."
+                );
+            }
+            let basename = program_of(command).rsplit('/').next().unwrap_or_default();
+            if basename.is_empty() {
+                return "comando recusado: comando vazio; informe um comando com o binario na allowlist do projeto".to_string();
+            }
+            if allow.iter().any(|name| name == basename) {
+                let rule = match basename {
+                    "git" => "o git no shell so aceita subcomando de leitura (status, diff, log, show, blame, rev-parse): escrever historico (checkout, commit, reset, add, stash) fica fora",
+                    "cargo" => "fora `cargo fmt`, o cargo pertence a tool exec (build, check, test, clippy), que declara os alvos",
+                    _ => "wrappers que executam outro comando (sh, bash, env, xargs, make) nao passam pelo shell nem quando estao em shell.allow: rode o comando final direto",
+                };
+                return format!(
+                    "comando recusado: {command}. O binario `{basename}` esta em shell.allow, mas {rule}.{}",
+                    native_hint(basename)
+                );
+            }
+            format!(
+                "comando recusado: {command}. O binario `{basename}` nao esta liberado: inclua \"{basename}\" na chave shell.allow de ai.project.json.{}",
+                native_hint(basename)
+            )
+        }
+
         /// Binarios liberados quando o projeto nao declara `shell.allow`.
+        /// `cargo` fica de fora: so `cargo fmt` passa, pela regra fixa de
+        /// formatador; build/test/run pertencem ao tool exec.
         const DEFAULT_ALLOW: &[&str] = &[
             "git", "rg", "grep", "ls", "cat", "head", "tail", "wc", "find", "jq", "sed", "awk",
             "sort", "uniq", "diff", "file", "stat", "du", "df", "tree", "echo", "pwd", "date",
-            "cargo",
         ];
 
         let params: ShellParams = serde_json::from_value(arguments)
@@ -277,10 +460,33 @@ impl Tool for ShellTool {
         let allow: Vec<String> = project_allow()
             .unwrap_or_else(|| DEFAULT_ALLOW.iter().map(|name| name.to_string()).collect());
         if !allowed(&params.command, &allow) {
-            return Err(ToolError::InvalidArguments(format!(
-                "comando recusado: {}. Libere o binario na chave shell.allow de ai.project.json; composicao nao e permitida",
+            return Err(ToolError::InvalidArguments(refusal(&params.command, &allow)));
+        }
+
+        // Binario ausente nao derruba o turno: nada roda, e a resposta diz o
+        // que falta e qual equivalente liberado faz o mesmo trabalho.
+        let program = program_of(params.command.trim());
+        let basename = program.rsplit('/').next().unwrap_or(program);
+        if !installed(program, &self.root_dir) {
+            let mut notice = format!(
+                "\n- comando: {}\n- binario: {basename} nao esta instalado neste ambiente · nada foi executado\n",
                 params.command.trim()
-            )));
+            );
+            match EQUIVALENT.iter().find(|(name, _)| *name == basename) {
+                Some((_, hint)) => notice.push_str(&format!(
+                    "- equivalente liberado: {hint}\n- repita a chamada com o equivalente acima\n"
+                )),
+                None => notice.push_str(
+                    "- sem equivalente conhecido: use um binario ja liberado (grep, sed, find, ls, cat, head, tail, stat, du, jq) ou libere o binario em shell.allow\n",
+                ),
+            }
+            let sections = vec![Section {
+                heading: "### shell — binario ausente".to_string(),
+                body: notice,
+                priority: 255,
+            }];
+            let budget_tokens = params.budget_tokens.unwrap_or(self.default_budget_tokens);
+            return Ok(finish(&self.store, sections, budget_tokens));
         }
 
         let root = self
@@ -309,7 +515,9 @@ impl Tool for ShellTool {
             .filter(|value| !value.is_empty());
         let context = params.context.unwrap_or(2).min(20);
         let max_blocks = params.max_blocks.unwrap_or(6).clamp(1, 40);
-        let filtered = !params.terms.is_empty() || question.is_some();
+        let filter_active = params.filter == Some(true) && !params.terms.is_empty();
+        let terms_ignored = !params.terms.is_empty() && !filter_active;
+        let filtered = filter_active || question.is_some();
 
         let mut candidates: Vec<crate::support::web::Block> = Vec::new();
         let mut matched = 0usize;
@@ -319,7 +527,7 @@ impl Tool for ShellTool {
             ("stderr", raw.stderr.as_str()),
         ] {
             total += text.lines().count();
-            let chunks = if !params.terms.is_empty() {
+            let chunks = if filter_active {
                 matched += count_matches(text, &params.terms);
                 chunk_lines(text, &params.terms, context)
             } else if question.is_some() {
@@ -346,9 +554,15 @@ impl Tool for ShellTool {
             params.command.trim(),
             raw.duration.as_secs_f64()
         );
-        if !params.terms.is_empty() {
+        if terms_ignored {
+            summary.push_str(
+                "- terms ignorados: o filtro so liga com \"filter\": true; nada foi omitido\n",
+            );
+        }
+        if filter_active {
             summary.push_str(&format!(
-                "- linhas: {matched} de {total} · {} blocos\n",
+                "- linhas: {matched} de {total} · {} linhas omitidas pelo filtro · {} blocos\n",
+                total.saturating_sub(matched),
                 ranked.len()
             ));
         } else if question.is_some() {
@@ -370,17 +584,31 @@ impl Tool for ShellTool {
             priority: 255,
         }];
 
-        if !params.terms.is_empty() && matched == 0 {
+        if filter_active && matched == 0 {
             let lines: Vec<&str> = combined.lines().collect();
-            let body = if lines.is_empty() {
-                "(sem saida)".to_string()
+            const HEAD: usize = 5;
+            const TAIL: usize = 5;
+            let (heading, body) = if lines.is_empty() {
+                (
+                    "#### nenhum termo casou · sem saida".to_string(),
+                    "\n~~~text\n(sem saida)\n~~~\n".to_string(),
+                )
+            } else if lines.len() <= HEAD + TAIL {
+                // Saida curta cabe inteira: aparece uma vez so, sem "..." e sem repetir linha.
+                (
+                    "#### nenhum termo casou · saida bruta".to_string(),
+                    format!("\n~~~text\n{}\n~~~\n", lines.join("\n")),
+                )
             } else {
-                let head = lines.iter().take(5).copied().collect::<Vec<_>>().join("\n");
-                let tail = lines[lines.len().saturating_sub(5)..].join("\n");
-                format!("\n~~~text\n{head}\n...\n{tail}\n~~~\n")
+                let head = lines[..HEAD].join("\n");
+                let tail = lines[lines.len() - TAIL..].join("\n");
+                (
+                    "#### nenhum termo casou · inicio e fim da saida".to_string(),
+                    format!("\n~~~text\n{head}\n...\n{tail}\n~~~\n"),
+                )
             };
             sections.push(Section {
-                heading: "#### 0 correspondencias".to_string(),
+                heading,
                 body,
                 priority: 240,
             });
@@ -556,6 +784,7 @@ mod tests {
             .call(serde_json::json!({
                 "command": format!("cat {log}"),
                 "terms": ["FAILED"],
+                "filter": true,
                 "context": 1
             }))
             .unwrap();
@@ -567,19 +796,28 @@ mod tests {
     }
 
     #[test]
-    fn no_match_returns_head_and_tail_and_the_counts() {
+    fn no_match_shows_the_whole_short_output_once() {
         let dir = tempfile::tempdir().unwrap();
         let tool = log_tool(dir.path());
         let log = log_file(dir.path(), "a1\na2\na3\na4\na5");
         let out = tool
             .call(serde_json::json!({
                 "command": format!("cat {log}"),
-                "terms": ["NAOEXISTE"]
+                "terms": ["NAOEXISTE"],
+                "filter": true
             }))
             .unwrap();
         assert!(out.contains("0 de 5"), "{out}");
         assert!(out.contains("a1"), "{out}");
         assert!(out.contains("a5"), "{out}");
+        assert!(
+            !out.contains("..."),
+            "saida curta cabe inteira, sem reticencias: {out}"
+        );
+        assert!(
+            !out.contains("0 correspondencias"),
+            "rotulo confuso quando nada casou: {out}"
+        );
     }
 
     #[test]
@@ -592,6 +830,39 @@ mod tests {
             .unwrap();
         assert!(out.contains("3 FAILED"), "{out}");
         assert!(!out.contains("linhas:"), "{out}");
+    }
+
+    #[test]
+    fn terms_without_filter_do_not_hide_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = log_tool(dir.path());
+        let log = log_file(dir.path(), "a1\n- b2\n- b3\n- b4\n- b5\n- b6");
+        let out = tool
+            .call(serde_json::json!({
+                "command": format!("cat {log}"),
+                "terms": ["-"]
+            }))
+            .unwrap();
+        assert!(out.contains("a1"), "{out}");
+        assert!(out.contains("- b6"), "{out}");
+        assert!(out.contains("terms ignorados"), "{out}");
+        assert!(!out.contains("linhas:"), "{out}");
+    }
+
+    #[test]
+    fn filter_declares_the_omitted_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = log_tool(dir.path());
+        let log = log_file(dir.path(), "a1\na2\n- b3\n- b4\n- b5\n- b6");
+        let out = tool
+            .call(serde_json::json!({
+                "command": format!("cat {log}"),
+                "terms": ["-"],
+                "filter": true
+            }))
+            .unwrap();
+        assert!(out.contains("4 de 6"), "{out}");
+        assert!(out.contains("2 linhas omitidas pelo filtro"), "{out}");
     }
 
     #[test]
@@ -659,5 +930,158 @@ mod tests {
         assert!(allowed("git status", &allow(&["git"])));
         assert!(!allowed("git -c alias.pwn=!id pwn", &allow(&["git"])));
         assert!(!allowed("git --config-env=x=Y status", &allow(&["git"])));
+    }
+
+    #[test]
+    fn cargo_outside_the_formatter_is_refused() {
+        // Build/test/run pertencem ao tool exec: aqui so passa o formatador.
+        assert!(!allowed("cargo run", &allow(&["cargo"])));
+        assert!(!allowed("cargo test", &allow(&["cargo"])));
+        assert!(!allowed("cargo install ripgrep", &allow(&["cargo"])));
+        assert!(allowed("cargo fmt", &[]));
+        assert!(allowed("cargo fmt --check", &[]));
+    }
+
+    #[test]
+    fn the_default_allowlist_refuses_cargo_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = tool_for(dir.path())
+            .call(serde_json::json!({"command": "cargo run"}))
+            .unwrap_err();
+        assert!(error.to_string().contains("comando recusado"), "{error}");
+    }
+
+    #[test]
+    fn git_is_restricted_to_read_subcommands() {
+        assert!(allowed("git status", &allow(&["git"])));
+        assert!(allowed("git diff --stat", &allow(&["git"])));
+        assert!(allowed("git --no-pager log -3", &allow(&["git"])));
+        assert!(allowed("/usr/bin/git show HEAD", &allow(&["git"])));
+        for write in [
+            "git checkout main",
+            "git commit -m x",
+            "git reset --hard",
+            "git add .",
+            "git stash",
+            "git -C /tmp status",
+        ] {
+            assert!(
+                !allowed(write, &allow(&["git"])),
+                "{write} deveria ser recusado"
+            );
+        }
+        assert!(!allowed("git status", &allow(&["grep"])));
+    }
+
+    #[test]
+    fn a_single_line_without_match_appears_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = log_tool(dir.path());
+        let log = log_file(dir.path(), "ZQXJ 1 .");
+        let out = tool
+            .call(serde_json::json!({
+                "command": format!("cat {log}"),
+                "terms": ["-"],
+                "filter": true
+            }))
+            .unwrap();
+        assert_eq!(
+            out.matches("ZQXJ").count(),
+            1,
+            "a unica linha apareceu repetida: {out}"
+        );
+        assert!(!out.contains("..."), "{out}");
+        assert!(!out.contains("0 correspondencias"), "{out}");
+    }
+
+    #[test]
+    fn long_output_without_match_keeps_head_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = log_tool(dir.path());
+        let text: Vec<String> = (1..=20).map(|n| format!("l{n}")).collect();
+        let log = log_file(dir.path(), &text.join("\n"));
+        let out = tool
+            .call(serde_json::json!({
+                "command": format!("cat {log}"),
+                "terms": ["NAOEXISTE"],
+                "filter": true
+            }))
+            .unwrap();
+        assert!(out.contains("l1"), "{out}");
+        assert!(out.contains("l20"), "{out}");
+        assert!(!out.contains("l10"), "o meio deveria estar elidido: {out}");
+        assert_eq!(out.matches("...").count(), 1, "elisao repetida: {out}");
+    }
+
+    #[test]
+    fn a_missing_binary_is_reported_instead_of_failing_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ai.project.json"),
+            r#"{"name":"x","shell":{"allow":["tupi-binario-ausente"]}}"#,
+        )
+        .unwrap();
+        let out = tool_for(dir.path())
+            .call(serde_json::json!({"command": "tupi-binario-ausente --version"}))
+            .unwrap();
+        assert!(out.contains("binario ausente"), "{out}");
+        assert!(
+            out.contains("tupi-binario-ausente nao esta instalado"),
+            "{out}"
+        );
+        assert!(out.contains("nada foi executado"), "{out}");
+        assert!(out.contains("sem equivalente conhecido"), "{out}");
+    }
+
+    #[test]
+    fn rg_without_ripgrep_points_to_grep() {
+        let has_rg = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join("rg").is_file()))
+            .unwrap_or(false);
+        if has_rg {
+            return; // maquina com rg: nao ha o que sugerir
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ai.project.json"),
+            r#"{"name":"x","shell":{"allow":["rg"]}}"#,
+        )
+        .unwrap();
+        let out = tool_for(dir.path())
+            .call(serde_json::json!({"command": "rg -n foo"}))
+            .unwrap();
+        assert!(out.contains("rg nao esta instalado"), "{out}");
+        assert!(out.contains("grep -rn -e"), "{out}");
+        assert!(!out.contains("command not found"), "{out}");
+    }
+
+    #[test]
+    fn a_composition_refusal_teaches_the_alternative() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = tool_for(dir.path())
+            .call(serde_json::json!({"command": "grep -rn 'A|B' src"}))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("comando recusado"), "{message}");
+        assert!(message.contains("grep -rn -e \"A\" -e \"B\""), "{message}");
+        assert!(message.contains("keywords: [\"A\", \"B\"]"), "{message}");
+        assert!(message.contains("`search`"), "{message}");
+    }
+
+    #[test]
+    fn a_binary_refusal_names_the_release_path_and_the_substitute() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = tool_for(dir.path())
+            .call(serde_json::json!({"command": "sha256sum target/debug/tupi"}))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("comando recusado"), "{message}");
+        assert!(
+            message.contains("shell.allow de ai.project.json"),
+            "{message}"
+        );
+        assert!(message.contains("`read`"), "{message}");
+        assert!(message.contains("blake3"), "{message}");
+        assert!(!message.contains("Composicao"), "{message}");
     }
 }

@@ -17,9 +17,11 @@ llama-cpp-2 = { version = "0.1.161", optional = true }
 [features]
 default = []
 local-models = ["dep:llama-cpp-2"]
-cuda = ["llama-cpp-2/cuda"]
-metal = ["llama-cpp-2/metal"]
-vulkan = ["llama-cpp-2/vulkan"]
+# O backend escolhe a GPU, mas nunca vem sem o código de inferência: `llama.cpp`
+# com CUDA e sem `local-models` carregaria a dependência sem uso.
+cuda = ["local-models", "llama-cpp-2/cuda"]
+metal = ["local-models", "llama-cpp-2/metal"]
+vulkan = ["local-models", "llama-cpp-2/vulkan"]
 
 [dev-dependencies]
 tempfile.workspace = true

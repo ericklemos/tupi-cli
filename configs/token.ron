@@ -2,5 +2,5 @@
 // Vale para cada turno do assistente; respostas que estourariam o teto
 // são cortadas pelo provedor.
 (
-    max_tokens: 4096
+    max_tokens: 6000
 )

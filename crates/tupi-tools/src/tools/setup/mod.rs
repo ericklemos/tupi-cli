@@ -67,26 +67,63 @@ fn block(specs: &[ToolSpec]) -> String {
         out.push_str(&format!("- **{}** — {}\n", spec.name, spec.description));
     }
     out.push_str(END);
+    out.push('\n');
     out
 }
 
 fn merge(existing: &str, block: &str) -> String {
-    if let Some(start) = existing.find(START)
-        && let Some(end) = existing[start..].find(END)
-    {
-        let end = start + end + END.len();
-        let mut out = String::new();
-        out.push_str(&existing[..start]);
-        out.push_str(block);
-        out.push_str(&existing[end..]);
-        return out;
+    let Some(start) = marker_line(existing, START) else {
+        return appended(existing, block);
+    };
+    let end = match marker_line(&existing[start.end..], END) {
+        Some(span) => start.end + span.end,
+        None => existing.len(),
+    };
+    let mut out = String::with_capacity(existing.len() + block.len());
+    out.push_str(&existing[..start.start]);
+    out.push_str(block);
+    out.push_str(&without_extra_blocks(&existing[end..]));
+    out
+}
+
+/// O marcador só conta quando ocupa a linha inteira: menção em prosa não é bloco.
+fn marker_line(text: &str, marker: &str) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if line.trim() == marker {
+            return Some(start..offset);
+        }
     }
+    None
+}
+
+/// Blocos repetidos de uma aplicação antiga não sobrevivem à próxima.
+fn without_extra_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = marker_line(rest, START) {
+        out.push_str(&rest[..start.start]);
+        let end = match marker_line(&rest[start.end..], END) {
+            Some(span) => start.end + span.end,
+            None => rest.len(),
+        };
+        rest = &rest[end..];
+        if let Some(stripped) = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n')) {
+            rest = stripped;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn appended(existing: &str, block: &str) -> String {
     let mut out = existing.trim_end().to_string();
     if !out.is_empty() {
         out.push_str("\n\n");
     }
     out.push_str(block);
-    out.push('\n');
     out
 }
 
@@ -201,6 +238,8 @@ impl Tool for SetupTool {
 mod tests {
     use super::*;
 
+    const AUTHORED: &str = "# AGENTS.md\n\n## Regras autorais\n\n- descoberta antes da resposta\n- tool vence a memória\n";
+
     fn tool(dir: &std::path::Path) -> SetupTool {
         SetupTool::new(
             dir.to_path_buf(),
@@ -224,6 +263,15 @@ mod tests {
         )
     }
 
+    fn marker_lines(text: &str) -> usize {
+        text.lines().filter(|line| line.trim() == START).count()
+    }
+
+    fn apply(dir: &std::path::Path) -> String {
+        Tool::call(&tool(dir), serde_json::json!({"action": "apply"})).unwrap();
+        std::fs::read_to_string(dir.join("AGENTS.md")).unwrap()
+    }
+
     #[test]
     fn preview_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -234,15 +282,68 @@ mod tests {
     }
 
     #[test]
-    fn apply_writes_once_and_updates_in_place() {
+    fn apply_twice_keeps_a_single_block_and_the_authored_text() {
         let dir = tempfile::tempdir().unwrap();
-        Tool::call(&tool(dir.path()), serde_json::json!({"action": "apply"})).unwrap();
-        let first = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-        assert!(first.contains(START));
-        Tool::call(&tool(dir.path()), serde_json::json!({"action": "apply"})).unwrap();
-        let second = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-        assert_eq!(second.matches(START).count(), 1);
+        std::fs::write(dir.path().join("AGENTS.md"), AUTHORED).unwrap();
+
+        let first = apply(dir.path());
+        assert!(first.starts_with(AUTHORED));
+        assert_eq!(marker_lines(&first), 1);
+        assert_eq!(first.matches(END).count(), 1);
+
+        let second = apply(dir.path());
+        assert_eq!(second, first);
+        assert!(second.starts_with(AUTHORED));
         assert!(dir.path().join("skills/tupi-tools/SKILL.md").exists());
+    }
+
+    #[test]
+    fn an_old_duplicate_block_collapses_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), AUTHORED).unwrap();
+        let first = apply(dir.path());
+        let generated = first[first.find(START).unwrap()..].to_string();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            format!("{first}{generated}"),
+        )
+        .unwrap();
+
+        let merged = apply(dir.path());
+
+        assert_eq!(merged, first);
+        assert_eq!(marker_lines(&merged), 1);
+        assert!(merged.starts_with(AUTHORED));
+    }
+
+    #[test]
+    fn a_marker_mentioned_in_prose_is_not_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let authored = format!(
+            "{AUTHORED}\nO bloco entre `{START}` e `{END}` é gerado pela tool setup.\n"
+        );
+        std::fs::write(dir.path().join("AGENTS.md"), &authored).unwrap();
+
+        let text = apply(dir.path());
+
+        assert!(text.starts_with(&authored));
+        assert_eq!(marker_lines(&text), 1);
+        let block = text.find("\n<!-- tupi-tools:start -->\n").unwrap();
+        assert_eq!(text[block..].matches(END).count(), 1);
+    }
+
+    #[test]
+    fn an_unterminated_block_is_replaced_instead_of_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let authored = format!("{AUTHORED}\n{START}\ntrecho sem marcador final\n");
+        std::fs::write(dir.path().join("AGENTS.md"), &authored).unwrap();
+
+        let text = apply(dir.path());
+
+        assert!(text.starts_with(AUTHORED));
+        assert_eq!(marker_lines(&text), 1);
+        assert!(!text.contains("trecho sem marcador final"));
+        assert_eq!(text.matches(END).count(), 1);
     }
 
     #[test]

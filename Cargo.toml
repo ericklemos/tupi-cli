@@ -14,6 +14,12 @@ members = [
     "crates/tupi",
 ]
 
+# O fork próprio do `llama-cpp-sys-2` (llama.cpp v0.8.0+, exigido pelo d1) NÃO
+# é patch daqui: `[patch.crates-io]` é resolvido pelo cargo mesmo com a feature
+# desligada, e um `git = ...` no manifesto quebraria `cargo check -p tupi-infer`
+# sem features. O pin vive em `scripts/infer/llama-cpp-fork.toml` e entra
+# explícito, junto da feature: `cargo --config scripts/infer/llama-cpp-fork.toml`.
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

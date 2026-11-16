@@ -54,10 +54,8 @@ pub struct ToolsOptions {
     pub state_dir: Option<std::path::PathBuf>,
     /// Liga o watcher do grafo.
     pub watcher: bool,
-    /// Liga o cache persistente de `exec`.
+    /// Liga o cache em RAM de `exec` (`false` desliga o fingerprint inteiro).
     pub exec_cache: bool,
-    /// Liga o cache persistente de web.
-    pub web_cache: bool,
     /// Persistência de planos SDD. `None` usa `InMemorySddStore`.
     pub sdd_store: Option<Arc<dyn crate::sdd::SddStore>>,
     /// Célula compartilhada com o `AgentMode` ativo (`0=Execution`, `1=Sdd`).
@@ -87,7 +85,6 @@ impl Default for ToolsOptions {
             state_dir: None,
             watcher: true,
             exec_cache: true,
-            web_cache: true,
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
@@ -107,7 +104,6 @@ impl ToolsOptions {
             state_dir: Some(state_dir),
             watcher: false,
             exec_cache: false,
-            web_cache: false,
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
@@ -195,6 +191,7 @@ pub fn register_with(
         )));
     }
     let watcher = options.watcher;
+    let exec_cache = options.exec_cache;
     let sdd_store = options
         .sdd_store
         .unwrap_or_else(|| Arc::new(crate::sdd::InMemorySddStore::default()));
@@ -294,7 +291,8 @@ pub fn register_with(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
-    )));
+    )
+    .with_cache(exec_cache)));
     registry.register(Arc::new(crate::test_many::TestManyTool::new(
         root_dir.clone(),
         store.clone(),
@@ -368,7 +366,7 @@ pub fn register_with(
         root_dir.clone(),
         sdd_store,
         mode_cell,
-        DEFAULT_BUDGET_TOKENS,
+        tupi_kernel::sdd_config().planning.tool_budget_tokens.unwrap_or(DEFAULT_BUDGET_TOKENS),
     )
     .with_response_store(store.clone())
     .with_docs(!options.docs_folders.is_empty());

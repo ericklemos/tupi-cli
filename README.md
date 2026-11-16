@@ -6,6 +6,17 @@ projeto sem receber o projeto inteiro.
 
 A descoberta começa em `map`: o prompt não carrega o repositório.
 
+## Como o Tupi pensa
+
+- **Local para o que é mecânico** — embedding, resumo e transcrição rodam na
+  máquina, sem sair do projeto.
+- **API só onde há raciocínio** — o turno principal e o executor do SDD.
+- **Nenhuma liberdade ao modelo** — tools fechadas, root confinado, edição com
+  hash, shell de leitura e orçamentos de contexto e de passos.
+
+O detalhamento de cada princípio, com o código que o sustenta hoje e o que
+ainda não existe, está em [`docs/philosophy.md`](docs/philosophy.md).
+
 ## Ferramentas
 
 - **Leitura e busca** — `read` (esqueleto do arquivo ou corpo de um símbolo,
@@ -30,6 +41,22 @@ A descoberta começa em `map`: o prompt não carrega o repositório.
 - **Web** — `fetch` (baixa uma URL e devolve os blocos relevantes com âncoras),
   `websearch` (busca sem provedor pago) e `research` (busca, baixa as melhores
   fontes e devolve a evidência com URL).
+- **Projeto** — `docs` consulta as pastas de `docs_folders` (`map`, `query`,
+  `read`, `status` e `refresh`; `write` só dentro delas), funde o lexical com o
+  vetorial quando o embedder está carregado e é core: só o modo SDD a vê. `sdd`
+  mantém o plano em tasks e subtasks — `upsert_spec`, `set_tasks` e `close` no
+  planejamento, `progress` na execução —, grava o estado em `.tupi/sdd` com
+  espelho em `.agents/tupi/sdd/<slug>.md` e retoma com `/sdd <slug>`. `workflow`
+  lista e lê procedimentos em três escopos: nativo (embutido no binário), global
+  (`~/.agents/workflows`, `~/.tupi/workflows`) e local (`.agents/workflows`,
+  `.tupi/workflows`); o usuário invoca com `/workflows/<nome>`. Ao fim da
+  execução de um plano, um agente de docs escreve sob `docs_folders` e reindexa
+  o que mudou.
+- **Acervo** — `archive` (`status`, `index` e `aliases` do acervo) e
+  `investigate` (`plan`, `run`, `status`, `report` e `cancel` para investigar o
+  acervo por pessoa ou assunto) só entram no registry quando um acervo está
+  configurado. A seção `archive` do `ai.project.json` já é validada, mas nada a
+  converte em registry: as duas tools não aparecem no binário hoje.
 - **Sessão** — `ledger` (fatos duráveis por repositório), `state` (notas,
   tarefas e retomada), `env` (allowlist estrita) e `setup` (gera a documentação
   das tools em `AGENTS.md` e na skill).
@@ -38,11 +65,57 @@ O root das leituras é o diretório onde o Tupi foi aberto. A v1 entende AST de
 Rust; arquivos de outras linguagens caem no fallback de conteúdo inteiro,
 limitado pelo mesmo orçamento.
 
+## Transcrição
+
+`tupi transcribe` transcreve áudio na máquina, sem provedor: whisper.cpp para o
+ASR e dois modelos locais menores para segmentação e diarização, baixados sob
+demanda no diretório de dados.
+
+```bash
+tupi transcribe palestra.m4a --timestamps
+tupi transcribe a.wav b.wav --out transcricoes/ --speakers 2
+```
+
+- `--out` aponta o arquivo de saída e, com vários áudios, precisa ser
+  diretório; sem ele o `.txt` fica ao lado do áudio. Dois áudios que gerariam o
+  mesmo arquivo são recusados antes de qualquer trabalho.
+- `--model` aceita `base`, `small`, `medium`, `turbo` e `auto` (o padrão) ou um
+  caminho `.bin`. No `auto` o modelo vem da GPU detectada; se o backend CUDA não
+  subir, a execução avisa e troca o modelo de GPU pelo de CPU.
+- `--language` começa em `pt` (`auto` deixa o whisper decidir), `--speakers`
+  fixa o número de vozes e `--timestamps` prefixa cada linha com o tempo.
+- Os áudios rodam em paralelo até o número de núcleos (no máximo 8), cada um com
+  o seu relatório de decode, ASR e diarização; o comando termina com o resumo e
+  devolve código 1 quando algum arquivo falha.
+
+O subcomando responde antes de abrir o store e a TUI, depende da feature
+`transcribe` e exige `ffmpeg` no `PATH`.
+
+## Dashboard
+
+`tupi --web` sobe o painel no início da sessão e `/dashboard` o abre durante
+ela. A porta vem de `--web-port`, depois de `dashboard_web_port` no
+`ai.project.json`; sem nenhuma das duas o sistema escolhe uma porta livre. O
+launcher sobe o servidor uma vez e abre o navegador.
+
+O servidor é local: `Host`, `Origin` e `Sec-Fetch-Site` fora de
+`127.0.0.1`/`localhost` recebem 403 e toda resposta sai com `no-store`. O painel
+mostra visão geral, histórico, workflows, busca e vizinhança e caminhos do grafo,
+memória, notas de `state`, telemetria recente e os eventos do turno por SSE.
+
 ## Requisitos
 
-- Rust 1.99+
-- Uma chave da plataforma DeepSeek
-- `git` para `diff`, `why` e `patch`; `curl` para as tools de web
+- Toolchain Rust com `edition = "2024"` (1.85 ou mais novo).
+- Uma credencial de provedor, escolhida por `TUPI_PROVIDER`:
+  - `deepseek` (padrão) — exige `DEEPSEEK_API_KEY`.
+  - `antigravity` — dispensa a chave DeepSeek: usa as credenciais salvas no
+    redb da sessão ou, na primeira execução, um arquivo do disco
+    (`antigravity.json` no diretório de estado do Tupi ou
+    `antigravity-accounts.json` em `$HOME/opencode`).
+- `git` para `diff`, `why` e `patch`; `curl` para as tools de web; `ffmpeg`
+  para `tupi transcribe`.
+- Nada mais para os modelos locais: embedder (LFM2.5-Embedding-350M) e gerador
+  de resumos (LFM3-1.7B) são baixados sob demanda com a feature `local-models`.
 
 ## Instalação
 
@@ -98,35 +171,54 @@ API, nunca abre o store de sessão e nunca sobe a TUI.
 
 ## Configuração
 
-| Variável | Obrigatória | Padrão |
-|---|---|---|
-| `TUPI_CLI_DEEPSEEK_PLATAFORM_APIKEY` | sim | — |
-| `TUPI_MODEL` | não | `deepseek-flash` |
-| `TUPI_LOG` | não | `warn` |
+Toda variável abaixo é lida do ambiente ou de um `.env` (na raiz do projeto ou
+nos diretórios acima — **o ambiente tem precedência**). Nenhuma delas amplia o
+poder do modelo: orçamento de tokens, passos de tool e compactação de contexto
+ficam nos arquivos do projeto (`configs/token.ron`, `configs/tools.ron` e
+`configs/context.ron`).
 
-As variáveis podem vir do ambiente ou de um arquivo `.env` (o Tupi procura na
-raiz do projeto e nos diretórios acima). **O ambiente tem precedência** sobre o
-arquivo.
+| Variável | Padrão | Efeito |
+|---|---|---|
+| `TUPI_PROVIDER` | `deepseek` | provedor do turno principal e do executor do SDD (`deepseek`, `antigravity`) |
+| `DEEPSEEK_API_KEY` | — | chave da plataforma DeepSeek; obrigatória só no provedor `deepseek` |
+| `TUPI_MODEL` | `deepseek-flash` (`antigravity-gemini-3.8-flash` com `TUPI_PROVIDER=antigravity`) | modelo ativo; o escolhido em `/models` fica no redb e vence a variável |
+| `DEEPSEEK_MODEL` | — | alternativa a `TUPI_MODEL` quando ele não está definido |
+| `TUPI_LOG` | `info` | filtro do log (`tracing`/`EnvFilter`) |
+| `TUPI_SPACE` | ligado | `off` desliga o índice vetorial local que o `search` usa |
+| `TUPI_RAG_EMBEDDING` | ligado | `off`, `0` ou `false` desliga o embedder local e o download dele |
+| `TUPI_RAG_SUMMARIES` | ligado | `off`, `0` ou `false` desliga o gerador de resumos e o download dele |
+| `TUPI_TELEMETRY` | ligado | `0`, `off` ou `false` desliga a telemetria |
+| `TUPI_TELEMETRY_PATH` | `.agents/tupi/debug/telemetry.jsonl` | arquivo de telemetria |
+| `TUPI_TELEMETRY_SHELL_PATH` | derivado de `TUPI_TELEMETRY_PATH` | arquivo bifurcado das execuções da tool `shell` |
+| `TUPI_TELEMETRY_BODY` | desligado | `1`, `on`, `true` ou `yes` grava o corpo do prompt na telemetria |
+
+As variáveis de `space` e de RAG dependem da feature `local-models` compilada;
+o diretório de estado (redb, log e `antigravity.json`) é `$XDG_STATE_HOME/tupi`,
+com fallback para `~/.local/state/tupi`.
 
 O prompt que configura o agente fica em `configs/prompts.ron`, no campo
 `system`. Se o arquivo faltar ou estiver inválido, o Tupi usa o prompt padrão
 do código.
 
 ```bash
-cp .env.example .env
-# edite .env e preencha TUPI_CLI_DEEPSEEK_PLATAFORM_APIKEY
+# DeepSeek: a chave é a única variável obrigatória
+printf 'DEEPSEEK_API_KEY=sk-...' > .env
 cargo run -p tupi
+
+# Antigravity: dispensa a chave DeepSeek e usa as credenciais salvas
+TUPI_PROVIDER=antigravity cargo run -p tupi
 ```
 
 Ou direto no ambiente:
 
 ```bash
-export TUPI_CLI_DEEPSEEK_PLATAFORM_APIKEY="sk-..."
+export DEEPSEEK_API_KEY="sk-..."
 cargo run -p tupi
 ```
 
-O `.env` é ignorado pelo git; o `.env.example` é versionado. Sem a chave, o
-programa falha antes de abrir a TUI, citando o nome da variável.
+O `.env` é ignorado pelo git. Sem chave no provedor `deepseek` e sem
+credencial salva no `antigravity`, o programa falha antes de abrir a TUI,
+citando o nome da variável.
 
 ## Controles
 

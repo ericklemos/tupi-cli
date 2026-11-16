@@ -74,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     // exige chave de API, não abre o redb, não baixa modelo e não sobe a TUI.
     let argv: Vec<String> = std::env::args().collect();
     // `tupi transcribe` também responde antes de abrir o redb e a TUI.
+    #[cfg(feature = "transcribe")]
     if let Some(args) = tupi_transcribe::subcommand(&argv) {
         std::process::exit(transcribe::run(args).await?);
     }
@@ -189,8 +190,9 @@ async fn main() -> anyhow::Result<()> {
             .join(", "),
         "pastas de documentação do projeto"
     );
-    let space_enabled =
-        project.space_enabled() && std::env::var("TUPI_SPACE").ok().as_deref() != Some("off");
+    let space_enabled = config::LOCAL_MODELS
+        && project.space_enabled()
+        && std::env::var("TUPI_SPACE").ok().as_deref() != Some("off");
     let tokens = token::load_token(&root);
     tracing::debug!(
         max_tokens = tokens.max_tokens,
@@ -271,12 +273,7 @@ async fn main() -> anyhow::Result<()> {
         registry
     });
     let active_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let auto_execute = store
-        .setting("sdd.auto_execute")
-        .ok()
-        .flatten()
-        .map(|value| value.trim() != "false")
-        .unwrap_or(true);
+    let runner = &tupi_kernel::sdd_config().runner;
     let mut tool_options = tupi_tools::ToolsOptions::default();
     tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
@@ -287,7 +284,6 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("TUPI_RAG_EMBEDDING").ok().as_deref(),
         ),
         space_enabled,
-        std::env::var("TUPI_SPACE").ok().as_deref(),
     );
     let embedder_slot = std::sync::Arc::new(tupi_kernel::embed::EmbedderSlot::empty());
     if config::local_embedding_enabled(
@@ -323,10 +319,12 @@ async fn main() -> anyhow::Result<()> {
     tool_options.space =
         space_enabled.then(|| std::sync::Arc::new(tupi_tools::space::SpaceIndex::load(&root)));
 
-    if config::summaries_enabled(
-        &docs_folders,
+    // O gerador segue a feature `local-models`; o download só vale quando há
+    // pasta de documentação, porque é a tool `docs` que consome os resumos.
+    let summaries_enabled = config::summaries_enabled(
         std::env::var("TUPI_RAG_SUMMARIES").ok().as_deref(),
-    ) {
+    );
+    if summaries_enabled && !docs_folders.is_empty() {
         let generator_slot = std::sync::Arc::new(tupi_kernel::generate::GeneratorSlot::empty());
         let slot = std::sync::Arc::clone(&generator_slot);
         let base = data_dir(|key| std::env::var(key).ok());
@@ -365,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
             (registry, docs)
         }) as tupi_app::sdd_run::DocsAgentFactory)
     };
-    if auto_execute {
+    if runner.auto_execute {
         if let Some(provider_impl) = registry.get(&provider) {
             let executor = std::sync::Arc::new(AgentExecutor {
                 store: sdd_store_for_tools.clone(),
@@ -375,14 +373,10 @@ async fn main() -> anyhow::Result<()> {
                 events: events.clone(),
                 agent_tools,
                 docs_agent: docs_agent.clone(),
-                max_parallel: setting_usize(&store, "sdd.max_parallel", 4),
-                agent_max_steps: sdd_agent_steps(&store, tool_limits.max_tool_steps),
+                max_parallel: runner.max_parallel,
+                agent_max_steps: runner.agent_max_steps,
                 max_tokens: tokens.max_tokens as usize,
-                agent_timeout: std::time::Duration::from_secs(setting_usize(
-                    &store,
-                    "sdd.agent_timeout_seconds",
-                    600,
-                ) as u64),
+                agent_timeout: std::time::Duration::from_secs(runner.agent_timeout_secs),
                 agent_prefix: tupi_app::sdd::compose_agent_prefix(&prefix),
                 repo_key: repo_key.clone(),
                 active: active_cell.clone(),
@@ -860,26 +854,6 @@ mod cli_tests {
 }
 
 #[cfg(test)]
-mod sdd_steps_tests {
-    use super::sdd_agent_steps;
-
-    #[test]
-    fn the_sdd_agent_budget_follows_the_turn_budget_unless_overridden() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = tupi_store::Store::open(dir.path().join("tupi.redb")).unwrap();
-
-        assert_eq!(
-            sdd_agent_steps(&store, 100),
-            100,
-            "sem setting, o agente SDD usa o orçamento do turno principal"
-        );
-
-        store.save_setting("sdd.agent_max_steps", "40").unwrap();
-        assert_eq!(sdd_agent_steps(&store, 100), 40);
-    }
-}
-
-#[cfg(test)]
 mod model_window_tests {
     use super::record_model_window;
     use crate::project_config;
@@ -952,4 +926,5 @@ mod web_port_tests {
 }
 
 // Subcomando `tupi transcribe` (feature `transcribe`).
+#[cfg(feature = "transcribe")]
 mod transcribe;

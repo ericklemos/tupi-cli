@@ -18,7 +18,7 @@ tupi-web.workspace = true
 tupi-store.workspace = true
 tupi-tools.workspace = true
 tupi-infer = { workspace = true, default-features = false }
-tupi-transcribe.workspace = true
+tupi-transcribe = { workspace = true, optional = true }
 anyhow.workspace = true
 async-trait.workspace = true
 dotenvy.workspace = true
@@ -32,18 +32,28 @@ serde.workspace = true
 serde_json.workspace = true
 
 [features]
-# O default é o mesmo de antes: `local-models` (llama.cpp) sempre entra e `cuda`
-# escolhe o backend. A diferença é que agora dá para desligar:
-# `cargo build -p tupi --no-default-features` compila sem `llama-cpp-2`, que é o
-# maior custo de build nativo do binário (ver docs/perf/baseline.md).
+# Uma feature por família de IA local; fora delas o binário não tem IA nenhuma.
 #
-# Transcrição NÃO é feature: `tupi transcribe` faz parte do binário final em
-# todas as variantes (CPU, CUDA, Vulkan, Metal).
-default = ["local-models", "cuda"]
+# - `local-models`: embedder (espaço vetorial e docs) e gerador (resumos).
+# - `transcribe`: Whisper/Sherpa do `tupi transcribe`.
+# - `cuda`/`metal`/`vulkan`: backend de GPU. Cada uma implica as duas acima,
+#   porque GPU sem inferência compilada não serve para nada.
+#
+# O default continua CUDA (`cargo build` = binário com tudo). Build de CPU sem
+# IA local é `cargo build -p tupi --no-default-features`; inferência em CPU sem
+# transcrição é `--no-default-features --features local-models`.
+# O default é o build leve de CPU: `cargo build` compila `local-models` sem
+# backend de GPU nenhum. GPU é opt-in explícito (`--features cuda`), porque
+# `llama.cpp` com CUDA exige toolkit e host compatível — quem só quer inferência
+# em CPU não paga por isso. Build sem IA local é
+# `cargo build -p tupi --no-default-features`; transcrição sem GPU é
+# `--features transcribe`; GPU com tudo é `--features cuda` (ou `metal`/`vulkan`).
+default = ["local-models"]
 local-models = ["tupi-infer/local-models"]
-cuda = ["tupi-infer/cuda", "tupi-transcribe/cuda"]
-metal = ["tupi-infer/metal", "tupi-transcribe/metal"]
-vulkan = ["tupi-infer/vulkan", "tupi-transcribe/vulkan"]
+transcribe = ["dep:tupi-transcribe"]
+cuda = ["local-models", "transcribe", "tupi-infer/cuda", "tupi-transcribe/cuda"]
+metal = ["local-models", "transcribe", "tupi-infer/metal", "tupi-transcribe/metal"]
+vulkan = ["local-models", "transcribe", "tupi-infer/vulkan", "tupi-transcribe/vulkan"]
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -376,13 +376,13 @@ impl SddTool {
     fn execution_spec(&self) -> ToolSpec {
         ToolSpec {
             name: "sdd".to_string(),
-            description: "Consulta e atualiza o progresso de specs SDD no modo execução: status, list, activate, progress e execute.".to_string(),
+            description: tupi_kernel::sdd_config().tool.execution_description.to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "list", "activate", "progress", "execute"],
+                        "enum": tupi_kernel::sdd_config().tool.execution_actions,
                         "description": "Ação SDD disponível no modo Execution."
                     },
                     "slug": {
@@ -652,13 +652,13 @@ impl Tool for SddTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "sdd".to_string(),
-            description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade em .tupi/sdd/<slug>/: meta.json e tasks.json). Antes de upsert_spec, consulte a tool docs e registre as fontes como caminho:inicio-fim em goal, constraints, nuances e details.".to_string(),
+            description: tupi_kernel::sdd_config().tool.planning_description.to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["upsert_spec", "set_tasks", "status", "list", "activate", "close", "progress", "note"],
+                        "enum": tupi_kernel::sdd_config().tool.planning_actions,
                         "description": "Ação SDD. No modo SDD: upsert_spec, set_tasks, status, list, activate, close. Na execução: status, list, activate, progress."
                     },
                     "slug": {

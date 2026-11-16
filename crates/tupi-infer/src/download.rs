@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    EMBEDDING_BYTES, EMBEDDING_FILE, EMBEDDING_REPO, EMBEDDING_SHA256, InferError, LFM3_BYTES,
-    LFM3_FILE, LFM3_REPO, LFM3_SHA256, models_dir,
+    D1_BYTES, D1_FILE, D1_REPO, D1_SHA256, EMBEDDING_BYTES, EMBEDDING_FILE, EMBEDDING_REPO,
+    EMBEDDING_SHA256, InferError, LFM3_BYTES, LFM3_FILE, LFM3_REPO, LFM3_SHA256, models_dir,
 };
 
 #[async_trait]
@@ -36,6 +36,10 @@ pub fn embedding_model_path(base: &Path) -> PathBuf {
     models_dir(base, EMBEDDING_REPO).join(EMBEDDING_FILE)
 }
 
+pub fn decider_model_path(base: &Path) -> PathBuf {
+    models_dir(base, D1_REPO).join(D1_FILE)
+}
+
 pub async fn ensure_embedding_model(
     base: &Path,
     fetcher: &dyn Fetcher,
@@ -56,6 +60,13 @@ pub async fn ensure_generation_model(
     fetcher: &dyn Fetcher,
 ) -> Result<PathBuf, InferError> {
     ensure_model(base, LFM3_REPO, LFM3_FILE, LFM3_SHA256, LFM3_BYTES, fetcher).await
+}
+
+pub async fn ensure_decider_model(
+    base: &Path,
+    fetcher: &dyn Fetcher,
+) -> Result<PathBuf, InferError> {
+    ensure_model(base, D1_REPO, D1_FILE, D1_SHA256, D1_BYTES, fetcher).await
 }
 
 pub async fn ensure_model(
@@ -154,5 +165,51 @@ mod tests {
                 .join("LFM3-1.7B-Q4_K_M.gguf")
                 .exists()
         );
+    }
+
+    struct RecordingFetcher {
+        bytes: Vec<u8>,
+        reported: u64,
+        urls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Fetcher for RecordingFetcher {
+        async fn download(&self, url: &str, dest: &Path) -> Result<u64, InferError> {
+            self.urls.lock().unwrap().push(url.to_string());
+            std::fs::write(dest, &self.bytes)?;
+            Ok(self.reported)
+        }
+    }
+
+    #[test]
+    fn the_decider_model_path_is_the_verified_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("models").join(D1_REPO).join(D1_FILE);
+        assert_eq!(decider_model_path(dir.path()), expected);
+    }
+
+    #[tokio::test]
+    async fn the_decider_download_requests_the_verified_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = RecordingFetcher {
+            bytes: b"errado".to_vec(),
+            reported: D1_BYTES,
+            urls: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = ensure_decider_model(dir.path(), &fetcher).await;
+        assert!(matches!(result, Err(InferError::Checksum)), "{result:?}");
+        let url = fetcher.urls.lock().unwrap().clone();
+        assert_eq!(url.len(), 1);
+        assert_eq!(
+            url[0],
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf"
+        );
+        assert!(!decider_model_path(dir.path()).exists());
+        let leftovers: Vec<_> = std::fs::read_dir(models_dir(dir.path(), D1_REPO))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "sobrou {leftovers:?}");
     }
 }

@@ -251,6 +251,14 @@ impl Memory {
         arguments: &str,
         cancel: &AtomicBool,
     ) -> Option<MemoryBlock> {
+        // O `shell` é inspeção crua: anexar a memória do projeto ao resultado
+        // fazia o modelo ler um fato lembrado como saída do comando (telemetria
+        // do run 1794840347760-112433, seq 12, 20, 22 e 24). A memória entra no
+        // prefixo do turno, fora do bloco de resultado; aqui ela é suprimida.
+        const SHELL_TOOL: &str = "shell";
+        if tool == SHELL_TOOL {
+            return None;
+        }
         let root = self.active_root()?;
         let request = format!("{tool} {}", clip(arguments, 400));
         let key = format!("{request}|{}", fingerprint(&root));

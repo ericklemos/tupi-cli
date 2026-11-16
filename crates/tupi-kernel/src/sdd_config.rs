@@ -56,6 +56,8 @@ pub struct SddRunner {
 }
 
 mod embedded {
+    use super::*;
+
     include!(concat!(env!("OUT_DIR"), "/sdd_config_generated.rs"));
 }
 
