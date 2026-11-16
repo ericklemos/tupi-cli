@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -115,6 +116,34 @@ impl ModeMask {
     }
 }
 
+/// Conjunto de escrita de uma call.
+///
+/// `Writes` é a declaração exata que a tool conhece; `Opaque` é a ausência de
+/// declaração e vale por "pode ter mudado qualquer coisa". Não existe variante
+/// vazia: "muta e devolve conjunto vazio" é o fail-open que este enum elimina.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Não altera o workspace.
+    ReadOnly,
+    /// Altera exatamente estes caminhos.
+    Writes(Vec<PathBuf>),
+    /// Não declara o que altera: invalidação total.
+    Opaque,
+}
+
+impl Effect {
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Effect::ReadOnly)
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        match self {
+            Effect::Writes(paths) => paths,
+            Effect::ReadOnly | Effect::Opaque => &[],
+        }
+    }
+}
+
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
@@ -135,6 +164,16 @@ pub trait Tool: Send + Sync {
     /// executa em paralelo com outra call da mesma step.
     fn mutates(&self) -> bool {
         false
+    }
+
+    /// Conjunto de escrita da call. O padrão deriva de `mutates()`: quem muta
+    /// sem declarar caminhos devolve `Opaque` (invalidação total), nunca vazio.
+    fn effect(&self, _arguments: &Value) -> Effect {
+        if self.mutates() {
+            Effect::Opaque
+        } else {
+            Effect::ReadOnly
+        }
     }
 
     /// Em quais modos a tool existe. Fail-closed: o padrão é só execução.

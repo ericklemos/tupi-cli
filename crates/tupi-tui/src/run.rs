@@ -59,6 +59,9 @@ pub async fn run_with_dashboard(
     let mut events = buses.events.subscribe();
     let mut state = ChatState::default();
     let mut request: Option<RequestId> = None;
+    // Linha de tool pressionada no último clique: soltar no mesmo bloco sem
+    // arrasto alterna o detalhe; arrastar continua selecionando texto.
+    let mut pressed_tool: Option<usize> = None;
     state.workflows = workflow_names(&buses.queries).await;
     state.sdd_specs = sdd_spec_names(&buses.queries).await;
 
@@ -116,6 +119,14 @@ pub async fn run_with_dashboard(
                                                 )
                                             }
                                         }
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Char('o' | 'O') => {
+                                    // Atalho de teclado do clique: com overlay
+                                    // aberto a tecla não rouba o foco dele.
+                                    if !state.overlay_open() {
+                                        toggle_tool_detail(&mut state);
                                     }
                                     continue;
                                 }
@@ -529,6 +540,7 @@ pub async fn run_with_dashboard(
                     }
                     CrosstermEvent::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            pressed_tool = tool_entry_at(&state, mouse.column, mouse.row);
                             if let Some((row, column)) =
                                 transcript_position(&state, mouse.column, mouse.row)
                             {
@@ -548,13 +560,7 @@ pub async fn run_with_dashboard(
                             }
                         }
                         MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                            if state
-                                .selection
-                                .map(|selection| selection.is_empty())
-                                .unwrap_or(false)
-                            {
-                                state.selection = None;
-                            }
+                            finish_click(&mut state, pressed_tool.take(), mouse.column, mouse.row);
                         }
                         MouseEventKind::ScrollUp => scroll_up(&mut state, SCROLL_WHEEL),
                         MouseEventKind::ScrollDown => scroll_down(&mut state, SCROLL_WHEEL),
@@ -622,23 +628,31 @@ pub async fn run_with_dashboard(
                         request_id,
                         call_id,
                         name,
+                        arguments,
                         summary,
                         ..
                     }) if Some(request_id) == request => {
-                        state.push_tool_started(&call_id, &name, &summary);
+                        // Os argumentos da invocação não morrem aqui: são a
+                        // matéria-prima do detalhe expansível da linha.
+                        state.push_tool_started(&call_id, &name, &summary, &arguments);
                     }
                     Ok(Event::ToolFinished {
                         request_id,
                         call_id,
                         ok,
+                        detail,
                         duration_us,
                         ..
                     }) if Some(request_id) == request => {
                         // A duração vem de quem executou a tool: o evento já
                         // atravessou o bus, então medir aqui daria errado.
+                        // O detalhe chega pronto de quem executou a tool e
+                        // fica só na UI: expandir não publica no bus nem
+                        // altera o histórico enviado ao provedor.
                         state.finish_tool(
                             &call_id,
                             ok,
+                            (!detail.trim().is_empty()).then_some(detail),
                             Some(std::time::Duration::from_micros(duration_us)),
                         );
                     }
@@ -747,7 +761,7 @@ fn is_shortcut_char(key: crossterm::event::KeyEvent) -> bool {
 
 #[cfg(test)]
 mod key_tests {
-    use super::is_shortcut_char;
+    use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
@@ -767,6 +781,64 @@ mod key_tests {
         assert!(is_shortcut_char(ctrl_shift_v));
         assert!(!is_shortcut_char(altgr_at));
         assert!(!is_shortcut_char(plain));
+    }
+
+    /// `ctrl+o` é o atalho de teclado do clique: resolve o bloco pela
+    /// âncora da seleção e, sem seleção, cai na chamada mais recente em
+    /// vez de não fazer nada.
+    #[test]
+    fn ctrl_o_toggles_the_selected_tool_then_the_latest() {
+        let mut state = ChatState::default();
+        state.push_user("oi");
+        state.push_tool_started("c1", "read", "src/a.rs", "");
+        state.push_tool_started("c2", "edit", "src/b.rs", "");
+
+        // Teclado puro: sem seleção, o alvo é a última tool.
+        assert_eq!(shortcut_tool(&state), Some(2));
+        toggle_tool_detail(&mut state);
+        assert!(state.is_expanded(2));
+
+        let width = 80u16;
+        let transcript = transcript_layout_at(
+            &state.lines,
+            width,
+            false,
+            &mut crate::markdown::Cache::default(),
+            std::time::Instant::now(),
+        );
+        let row = transcript
+            .owners
+            .iter()
+            .position(|owner| *owner == Some(0))
+            .expect("linha da primeira tool");
+        let height = transcript.rows.len() as u16;
+        state.view.set(Some(crate::selection::TranscriptView {
+            rows: transcript.rows.len(),
+            start: 0,
+            width,
+            area: Rect::new(0, 0, width, height),
+        }));
+        *state.owners.borrow_mut() = std::rc::Rc::new(transcript.owners);
+
+        // A âncora da seleção vence o fallback da última tool.
+        state.selection = Some(crate::selection::Selection::new(row, 0));
+        assert_eq!(shortcut_tool(&state), Some(0));
+        toggle_tool_detail(&mut state);
+        assert!(state.is_expanded(0));
+    }
+
+    #[test]
+    fn ctrl_o_without_tools_only_leaves_a_notice() {
+        let mut state = ChatState::default();
+        state.push_user("oi");
+
+        toggle_tool_detail(&mut state);
+
+        assert!(state.expanded.is_empty());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("ctrl+o: nenhuma tool no transcript")
+        );
     }
 }
 
@@ -893,6 +965,84 @@ fn clamped_transcript_position(
     Some((index, local_column))
 }
 
+/// Dono da linha sob o ponteiro, lido do mapa que o último desenho publicou.
+/// Fora do transcript, ou numa linha sem dono, devolve `None`: aí o clique
+/// continua sendo uma seleção de texto, como antes.
+fn entry_at_pointer(state: &ChatState, column: u16, row: u16) -> Option<usize> {
+    let view = state.view.get()?;
+    let owners = state.owners.borrow();
+    hit_test(owners.as_slice(), view.start, view.area, Some((column, row)))
+}
+
+/// Índice de `ChatEntry::Tool` sob o ponteiro. Mensagem, memória e prompt não
+/// têm detalhe para abrir: nessas linhas o clique segue selecionando texto.
+fn tool_entry_at(state: &ChatState, column: u16, row: u16) -> Option<usize> {
+    let index = entry_at_pointer(state, column, row)?;
+    matches!(state.lines.get(index), Some(ChatEntry::Tool { .. })).then_some(index)
+}
+
+/// Fim de um clique: pressionar e soltar na mesma linha de tool, sem arrasto,
+/// alterna o bloco. Com arrasto o mouse continua selecionando texto — também
+/// sobre a linha da tool, que é o que permite copiá-la. Como o alvo sai de
+/// `owners`, o cabeçalho e as linhas de detalhe do bloco apontam para a mesma
+/// entrada e recolhem juntas.
+fn finish_click(state: &mut ChatState, pressed: Option<usize>, column: u16, row: u16) {
+    let target = tool_entry_at(state, column, row);
+    let dragged = state
+        .selection
+        .map(|selection| !selection.is_empty())
+        .unwrap_or(false);
+    if !dragged
+        && let Some(index) = target
+        && pressed == Some(index)
+    {
+        state.toggle_expanded(index);
+    }
+    if state
+        .selection
+        .map(|selection| selection.is_empty())
+        .unwrap_or(false)
+    {
+        state.selection = None;
+    }
+}
+
+/// Entrada dona de uma linha do transcript publicado pelo último frame.
+fn tool_entry_at_row(state: &ChatState, row: usize) -> Option<usize> {
+    let index = state.owners.borrow().get(row).copied().flatten()?;
+    matches!(state.lines.get(index), Some(ChatEntry::Tool { .. })).then_some(index)
+}
+
+/// Alvo do `ctrl+o`. A âncora da seleção de texto manda quando cai numa linha
+/// de tool; sem ela, o alvo é a chamada mais recente do transcript — teclado
+/// puro nunca teve ponteiro, e o último bloco é onde o olho está quando a
+/// tool termina. Por isso é fallback, e não um erro.
+fn shortcut_tool(state: &ChatState) -> Option<usize> {
+    if let Some(row) = state
+        .selection
+        .map(|selection| selection.normalized().0.0)
+        && let Some(index) = tool_entry_at_row(state, row)
+    {
+        return Some(index);
+    }
+    state
+        .lines
+        .iter()
+        .rposition(|entry| matches!(entry, ChatEntry::Tool { .. }))
+}
+
+/// `ctrl+o` é o mesmo toggle do clique: só mexe em `ChatState::expanded`,
+/// sem publicar no bus nem tocar no histórico enviado ao provedor.
+fn toggle_tool_detail(state: &mut ChatState) {
+    match shortcut_tool(state) {
+        Some(index) => {
+            state.toggle_expanded(index);
+        }
+        // Sem tool não há bloco: a tecla avisa em vez de parecer quebrada.
+        None => state.notice = Some("ctrl+o: nenhuma tool no transcript".to_string()),
+    }
+}
+
 fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect) {
     /// Sessão nova não tem histórico, então o transcript era um retângulo
     /// vazio e a primeira tela não ensinava nada. Estas linhas somem no
@@ -925,7 +1075,7 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
         ..area
     };
 
-    let rows = {
+    let transcript = {
         let mut cache = state.render_cache.borrow_mut();
         transcript_layout_at(
             &state.lines,
@@ -934,8 +1084,12 @@ fn draw_transcript(frame: &mut ratatui::Frame<'_>, state: &ChatState, area: Rect
             &mut cache,
             std::time::Instant::now(),
         )
-        .rows
     };
+    let rows = transcript.rows;
+    // O mapa linha→entrada do frame fica retido para o clique: abrir um bloco
+    // não refaz layout nem copia o mapa, e `owners` é produzido só pelo
+    // layout, nunca consumido por ele.
+    *state.owners.borrow_mut() = std::rc::Rc::new(transcript.owners);
     let visible = area.height as usize;
     let (start, end) = visible_range(rows.len(), visible, state.scroll);
 
@@ -1265,8 +1419,22 @@ fn draw_details(
         ),
     ]);
 
-    let full_hints = "shift+tab: modo · arraste para selecionar · ctrl+c copia · ctrl+q sai";
-    let short_hints = "ctrl+c copia · ctrl+q sai";
+    // O `ctrl+o` só entra no rodapé quando existe tool para abrir: atalho
+    // anunciado que não faz nada é pior do que atalho invisível.
+    let has_tool = state
+        .lines
+        .iter()
+        .any(|entry| matches!(entry, ChatEntry::Tool { .. }));
+    let full_hints: &str = if has_tool {
+        "shift+tab: modo · ctrl+o: detalhe da tool · arraste para selecionar · ctrl+c copia · ctrl+q sai"
+    } else {
+        "shift+tab: modo · arraste para selecionar · ctrl+c copia · ctrl+q sai"
+    };
+    let short_hints: &str = if has_tool {
+        "ctrl+o: detalhe · ctrl+c copia · ctrl+q sai"
+    } else {
+        "ctrl+c copia · ctrl+q sai"
+    };
 
     if let Some(ctx) = state.context {
         let percent = (ctx.budget > 0)
@@ -1572,9 +1740,14 @@ pub(crate) struct Transcript {
     pub owners: Vec<Option<usize>>,
 }
 
-#[allow(dead_code)]
-fn transcript_layout_at(
+/// Layout do transcript com os blocos abertos de `expanded`.
+///
+/// `expanded` entra como dado, nunca como consulta: o layout não vê o
+/// `ChatState`, o bus nem o disco. Um bloco aberto acrescenta linhas depois do
+/// cabeçalho, e o cabeçalho continua sendo uma linha por chamada.
+fn transcript_layout_expanded(
     lines: &[ChatEntry],
+    expanded: &std::collections::BTreeSet<usize>,
     width: u16,
     processing: bool,
     cache: &mut crate::markdown::Cache,
@@ -1646,9 +1819,12 @@ fn transcript_layout_at(
                 call_id,
                 name,
                 summary,
+                arguments,
+                detail,
                 ok,
                 started,
                 duration,
+                ..
             } => {
                 if !continuing_run {
                     let run_len = lines[index..]
@@ -1767,6 +1943,27 @@ fn transcript_layout_at(
                 ));
                 rows.push(Line::from(spans));
                 owners.push(Some(index));
+                // Bloco aberto: o cabeçalho acima continua sendo o cabeçalho
+                // e o detalhe entra como linhas extras, com o mesmo recuo do
+                // bloco (`lead`, que já carrega o recuo extra das
+                // subchamadas). Toda linha nova aponta para a mesma entrada,
+                // então clicar em qualquer uma delas recolhe o bloco inteiro.
+                if expanded.contains(&index) {
+                    let block_width = content_width.saturating_sub(lead_width);
+                    for line in args_rows(arguments, block_width) {
+                        rows.push(indent_line(line, lead_width));
+                        owners.push(Some(index));
+                    }
+                    // O resultado entra abaixo dos argumentos e só quando
+                    // existe: em voo a tool ainda não produziu corpo, e o
+                    // bloco fica nos argumentos em vez de inventar conteúdo.
+                    if ok.is_some() || detail.is_some() {
+                        for line in detail_rows(detail.as_deref(), summary, block_width) {
+                            rows.push(indent_line(line, lead_width));
+                            owners.push(Some(index));
+                        }
+                    }
+                }
                 continue;
             }
             ChatEntry::Memory { text } => {
@@ -1878,6 +2075,26 @@ fn transcript_layout_at(
     Transcript { rows, owners }
 }
 
+/// Layout sem bloco aberto: é o transcript fechado, uma linha por chamada.
+/// Quem tem blocos abertos chama [`transcript_layout_expanded`] direto.
+#[allow(dead_code)]
+fn transcript_layout_at(
+    lines: &[ChatEntry],
+    width: u16,
+    processing: bool,
+    cache: &mut crate::markdown::Cache,
+    now: std::time::Instant,
+) -> Transcript {
+    transcript_layout_expanded(
+        lines,
+        &std::collections::BTreeSet::new(),
+        width,
+        processing,
+        cache,
+        now,
+    )
+}
+
 #[allow(dead_code)]
 fn hit_test(
     owners: &[Option<usize>],
@@ -1925,6 +2142,187 @@ fn plain_rows(text: &str, width: usize) -> Vec<Line<'static>> {
         rows.push(Line::from(""));
     }
 
+    rows
+}
+
+/// Prefixo do bloco de argumentos de uma chamada aberta. Curto de propósito:
+/// em terminal estreito o marcador não pode comer a linha do conteúdo.
+const ARGS_MARKER: &str = "args · ";
+
+/// Teto de linhas do bloco de argumentos. Uma invocação `write` carrega o
+/// arquivo inteiro nos argumentos e, sem teto, um bloco aberto empurraria o
+/// transcript por centenas de linhas — o frame sairia do orçamento.
+const ARGS_MAX_ROWS: usize = 12;
+
+/// Linhas do bloco de argumentos de uma invocação expandida.
+///
+/// O `arguments` chega cru do modelo, como o JSON de uma linha só. Aqui ele é
+/// reformatado, nunca interpretado: JSON válido ganha o recuo do
+/// pretty-print, e vazio ou inválido vira um `—` explícito — bloco aberto
+/// sempre mostra alguma coisa, porque um bloco em branco pareceria bug de
+/// desenho. Nenhum I/O: o texto já está na entrada desde `Event::ToolStarted`,
+/// e o corte de caracteres é o de `tupi_domain::tool_detail_excerpt`.
+fn args_rows(arguments: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let marker_width = ARGS_MARKER.chars().count();
+    // Marcador e conteúdo só dividem a linha quando sobra espaço para o
+    // conteúdo: abaixo disso o marcador fica na própria linha e o texto usa a
+    // largura toda, em vez de espremer o JSON em duas colunas.
+    let hanging = width > marker_width + 8;
+    let body_width = if hanging { width - marker_width } else { width };
+
+    let body = match serde_json::from_str::<serde_json::Value>(arguments.trim()) {
+        Ok(value) => serde_json::to_string_pretty(&value)
+            .map(|pretty| tupi_domain::tool_detail_excerpt(&pretty))
+            .unwrap_or_default(),
+        // Vazio e inválido têm o mesmo destino: uma linha explícita em vez de
+        // um bloco aberto em branco, que pareceria bug de desenho.
+        Err(_) => String::new(),
+    };
+    let body = if body.trim().is_empty() {
+        "—".to_string()
+    } else {
+        body
+    };
+
+    let mut body = json_rows(&body, body_width);
+    if body.len() > ARGS_MAX_ROWS {
+        let omitted = body.len() - (ARGS_MAX_ROWS - 1);
+        body.truncate(ARGS_MAX_ROWS - 1);
+        body.push(format!("… ({omitted} linhas omitidas)"));
+    }
+
+    let marker = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if !hanging {
+        rows.push(Line::from(Span::styled(ARGS_MARKER, marker)));
+    }
+    for text in body {
+        let mut spans = Vec::with_capacity(2);
+        if hanging {
+            // Recuo pendurado: as continuações alinham sob o conteúdo.
+            let prefix = if rows.is_empty() {
+                Span::styled(ARGS_MARKER, marker)
+            } else {
+                Span::raw(" ".repeat(marker_width))
+            };
+            spans.push(prefix);
+        }
+        spans.push(Span::raw(text));
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+/// Prefixo do bloco de resultado de uma chamada aberta. Gêmeo do
+/// [`ARGS_MARKER`]: aberto, o bloco lê primeiro os argumentos e depois o
+/// resultado, e o marcador separa os dois sem gastar uma linha em branco.
+const DETAIL_MARKER: &str = "out · ";
+
+/// Teto de linhas do corpo do resultado. É o mesmo número do bloco de
+/// argumentos de propósito: quem abre uma chamada lê os dois juntos, e o teto
+/// de um não vale nada se o outro puder empurrar o transcript por centenas de
+/// linhas — o frame sairia do orçamento.
+const DETAIL_MAX_ROWS: usize = 12;
+
+/// Linhas do bloco de resultado de uma chamada expandida.
+///
+/// O corpo chega inteiro em `ChatEntry::Tool::detail`, já recortado por quem
+/// publicou (`tupi_domain::tool_detail_excerpt`); aqui ele só é quebrado na
+/// largura do bloco e limitado a [`DETAIL_MAX_ROWS`] linhas. Todo corte é
+/// anunciado: o de caracteres pelo marcador que veio no próprio texto, o de
+/// linhas pela última linha do bloco. Sem `detail`, a tool concluída ainda tem
+/// o resumo, e é ele que aparece no lugar do corpo; em voo não há nem um nem
+/// outro, e o chamador nem chega aqui. Nenhum I/O: o texto já está na entrada,
+/// porque expandir não pode custar frame.
+fn detail_rows(detail: Option<&str>, summary: &str, width: usize) -> Vec<Line<'static>> {
+    // Detalhe vazio não é detalhe: o resumo é o que sobrou de resultado.
+    let source = match detail.map(str::trim) {
+        Some(text) if !text.is_empty() => text,
+        _ => summary.trim(),
+    };
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let width = width.max(1);
+    let marker_width = DETAIL_MARKER.chars().count();
+    // Mesmo critério do bloco de argumentos: estreito demais para dividir a
+    // linha, o marcador fica sozinho e o texto usa a largura toda.
+    let hanging = width > marker_width + 8;
+    let body_width = if hanging { width - marker_width } else { width };
+
+    // `json_rows` só quebra texto preservando recuo — não interpreta JSON, e é
+    // esse recuo que o output de uma tool costuma carregar.
+    let mut body = json_rows(&tupi_domain::tool_detail_excerpt(source), body_width);
+    let mut cut_at = None;
+    if body.len() > DETAIL_MAX_ROWS {
+        let omitted = body.len() - (DETAIL_MAX_ROWS - 1);
+        body.truncate(DETAIL_MAX_ROWS - 1);
+        cut_at = Some(body.len());
+        body.push(format!("… ({omitted} linhas omitidas)"));
+    }
+
+    let marker = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if !hanging {
+        rows.push(Line::from(Span::styled(DETAIL_MARKER, marker)));
+    }
+    for (position, text) in body.into_iter().enumerate() {
+        let mut spans = Vec::with_capacity(2);
+        if hanging {
+            // Recuo pendurado: as continuações alinham sob o conteúdo.
+            let prefix = if position == 0 {
+                Span::styled(DETAIL_MARKER, marker)
+            } else {
+                Span::raw(" ".repeat(marker_width))
+            };
+            spans.push(prefix);
+        }
+        // A marca de corte não é saída da tool: sai apagada para não se passar
+        // por conteúdo do resultado.
+        let style = if cut_at == Some(position) {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(text, style));
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+/// Quebra o JSON já indentado preservando o recuo de cada linha.
+///
+/// `plain_rows`/`wrap_text` colapsam espaços: usá-los aqui achataria o
+/// pretty-print numa sopa de chaves. O recuo original é medido, guardado e
+/// reaplicado em cada pedaço, e nunca come a linha inteira — o conteúdo fica
+/// sempre com pelo menos uma coluna.
+fn json_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let indent = raw.chars().count() - trimmed.chars().count();
+        let indent = indent.min(width.saturating_sub(1));
+        let lead = " ".repeat(indent);
+        for piece in wrap_text(trimmed, width - indent) {
+            rows.push(format!("{lead}{piece}"));
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
     rows
 }
 
@@ -2388,6 +2786,232 @@ fn split_word(word: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn expanded_transcript(state: &ChatState, width: u16) -> Transcript {
+        transcript_layout_expanded(
+            &state.lines,
+            &state.expanded,
+            width,
+            false,
+            &mut crate::markdown::Cache::default(),
+            std::time::Instant::now(),
+        )
+    }
+
+    #[test]
+    fn expanded_tool_bounds_the_result_and_announces_the_cut() {
+        let detail = (0..40)
+            .map(|line| format!("saída {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "exec", "kind=check", "{\"kind\":\"check\"}");
+        state.finish_tool("c1", true, Some(detail), None);
+        state.toggle_expanded(0);
+
+        let transcript = expanded_transcript(&state, 80);
+        let texts: Vec<String> = transcript.rows.iter().map(row_text).collect();
+        let start = texts
+            .iter()
+            .position(|row| row.contains("out ·"))
+            .expect("marcador do resultado");
+        let body: Vec<&String> = texts[start..]
+            .iter()
+            .take_while(|row| !row.trim().is_empty())
+            .collect();
+
+        // Teto rígido de 12 linhas e corte sempre anunciado.
+        assert_eq!(body.len(), 12, "{body:?}");
+        assert!(body[11].contains("linhas omitidas"), "{body:?}");
+        // Toda linha do bloco é dona do mesmo índice: o clique recolhe tudo.
+        assert!(
+            transcript.owners[start..start + 12]
+                .iter()
+                .all(|owner| *owner == Some(0))
+        );
+    }
+
+    #[test]
+    fn expanded_tool_in_flight_shows_arguments_only() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "exec", "kind=check", "{\"kind\":\"check\"}");
+        state.toggle_expanded(0);
+
+        let transcript = expanded_transcript(&state, 80);
+        let text = transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("args ·"), "{text}");
+        assert!(!text.contains("out ·"), "{text}");
+    }
+
+    #[test]
+    fn expanded_tool_without_detail_falls_back_to_the_summary_indented() {
+        let mut state = ChatState::default();
+        state.push_tool_started("agent", "agent", "T1 — parser", "{\"task\":\"T1\"}");
+        state.push_tool_started("agent#1.0", "read", "src/a.rs", "{\"path\":\"src/a.rs\"}");
+        state.finish_tool("agent#1.0", true, None, None);
+        state.toggle_expanded(1);
+
+        let transcript = expanded_transcript(&state, 100);
+        let texts: Vec<String> = transcript.rows.iter().map(row_text).collect();
+        let parent = texts
+            .iter()
+            .find(|row| row.contains("agent · T1"))
+            .expect("linha do pai");
+        let header = texts
+            .iter()
+            .find(|row| row.contains("read · src/a.rs"))
+            .expect("linha da subchamada");
+        let result = texts
+            .iter()
+            .find(|row| row.contains("out ·"))
+            .expect("resumo no lugar do corpo");
+        // Recuo do conteúdo: o `└ ` conta como recuo, porque é sob ele que o
+        // bloco da subchamada alinha.
+        let indent = |row: &str| {
+            row.chars()
+                .take_while(|ch| *ch == ' ' || *ch == '└')
+                .count()
+        };
+
+        assert!(result.contains("src/a.rs"), "{result:?}");
+        // O detalhe herda o recuo da subchamada, não o do transcript.
+        assert_eq!(indent(result), indent(header), "{result:?}");
+        assert!(indent(result) > indent(parent), "{result:?} vs {parent:?}");
+    }
+
+    /// Fechado, o transcript continua uma linha por chamada: nenhuma sobra do
+    /// bloco aberto fica para trás, e é isso que mantém o transcript rolável
+    /// por linhas depois de abrir e recolher um detalhe.
+    #[test]
+    fn collapsed_tool_run_is_still_one_line_per_call() {
+        let mut state = ChatState::default();
+        state.push_user("leia e teste");
+        for (id, name, summary) in [
+            ("c1", "read", "src/a.rs"),
+            ("c2", "search", "fn parse"),
+            ("c3", "map", "crates/tupi-tui"),
+        ] {
+            state.push_tool_started(id, name, summary, "{\"path\":\"src/a.rs\"}");
+            state.finish_tool(
+                id,
+                true,
+                Some(format!("saída de {name}")),
+                Some(std::time::Duration::from_millis(200)),
+            );
+        }
+
+        let collapsed = transcript_layout_at(
+            &state.lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            std::time::Instant::now(),
+        );
+        let text = collapsed
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let owned: Vec<usize> = (1..state.lines.len())
+            .map(|index| {
+                collapsed
+                    .owners
+                    .iter()
+                    .filter(|owner| **owner == Some(index))
+                    .count()
+            })
+            .collect();
+
+        // Uma linha por chamada; a primeira ainda carrega o placar do grupo.
+        assert_eq!(owned, vec![2, 1, 1], "{text}");
+        assert!(!text.contains("args ·"), "{text}");
+        assert!(!text.contains("out ·"), "{text}");
+    }
+
+    /// Aberto, o bloco é acréscimo puro: o cabeçalho não é reescrito e as
+    /// demais chamadas continuam com uma linha cada. Tirar as linhas do bloco
+    /// devolve exatamente o transcript fechado.
+    #[test]
+    fn expanded_tool_block_only_adds_rows_under_its_header() {
+        let mut state = ChatState::default();
+        state.push_user("leia os dois arquivos");
+        state.push_tool_started("c1", "read", "src/a.rs", "{\"path\":\"src/a.rs\"}");
+        state.finish_tool(
+            "c1",
+            true,
+            Some("linha 1\nlinha 2".to_string()),
+            Some(std::time::Duration::from_millis(320)),
+        );
+        state.push_tool_started("c2", "search", "fn parse", "{\"query\":\"fn parse\"}");
+        state.finish_tool(
+            "c2",
+            true,
+            Some("achado".to_string()),
+            Some(std::time::Duration::from_millis(880)),
+        );
+        state.toggle_expanded(1);
+
+        let now = std::time::Instant::now();
+        let collapsed = transcript_layout_at(
+            &state.lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            now,
+        );
+        let expanded = expanded_transcript(&state, 100);
+        let collapsed_text: Vec<String> = collapsed.rows.iter().map(row_text).collect();
+        let expanded_text: Vec<String> = expanded.rows.iter().map(row_text).collect();
+
+        // Linhas da chamada aberta: a primeira é o cabeçalho, o resto é bloco.
+        let owned: Vec<usize> = (0..expanded.owners.len())
+            .filter(|&row| expanded.owners[row] == Some(1))
+            .collect();
+        let (header, block) = owned.split_first().expect("linha da chamada aberta");
+        let header = *header;
+        let block = block.to_vec();
+        assert!(block.len() > 1, "bloco aberto não acrescentou linha");
+        assert_eq!(block[0], header + 1, "bloco deveria vir colado no cabeçalho");
+        assert!(
+            block.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "bloco com buraco: {block:?}"
+        );
+
+        // Sem o bloco, aberto == fechado: o cabeçalho e as vizinhas não mudam.
+        let remaining: Vec<String> = expanded_text
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| !block.contains(row))
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(remaining, collapsed_text);
+
+        // O bloco é só o detalhe: argumentos e resultado, e nada de spinner
+        // nem de duração repetidos nas linhas extras.
+        let detail = block
+            .iter()
+            .map(|row| expanded_text[*row].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detail.contains("args ·"), "{detail}");
+        assert!(detail.contains("out ·"), "{detail}");
+        assert!(!detail.contains('✓'), "{detail}");
+
+        // A outra chamada não foi tocada: continua uma linha.
+        let other = expanded
+            .owners
+            .iter()
+            .filter(|owner| **owner == Some(2))
+            .count();
+        assert_eq!(other, 1, "chamada fechada ganhou linha");
+    }
+
     fn row_text(row: &Line<'_>) -> String {
         row.spans.iter().map(|span| span.content.as_ref()).collect()
     }
@@ -2487,6 +3111,8 @@ mod tests {
                 call_id: "c1".into(),
                 name: "read".into(),
                 summary: "src/a.rs".into(),
+                arguments: String::new(),
+                detail: None,
                 ok: Some(true),
                 started: now,
                 duration: Some(std::time::Duration::from_millis(250)),
@@ -2511,6 +3137,8 @@ mod tests {
                 call_id: "sdd#T1.1".into(),
                 name: "agent".into(),
                 summary: "T1.1 — Parser".into(),
+                arguments: String::new(),
+                detail: None,
                 ok: None,
                 started: now,
                 duration: None,
@@ -2519,6 +3147,8 @@ mod tests {
                 call_id: "sdd#T1.1#1.0".into(),
                 name: "read".into(),
                 summary: "src/a.rs".into(),
+                arguments: String::new(),
+                detail: None,
                 ok: Some(true),
                 started: now,
                 duration: Some(std::time::Duration::from_millis(300)),
@@ -2555,6 +3185,8 @@ mod tests {
             call_id: id.into(),
             name: name.into(),
             summary: "x".into(),
+            arguments: String::new(),
+            detail: None,
             ok,
             started: now,
             duration: ok.map(|_| std::time::Duration::from_millis(100)),
@@ -2582,6 +3214,8 @@ mod tests {
                 call_id: "c1".into(),
                 name: "read".into(),
                 summary: "a.rs".into(),
+                arguments: String::new(),
+                detail: None,
                 ok: Some(true),
                 started: now,
                 duration: Some(std::time::Duration::from_millis(100)),
@@ -2590,6 +3224,8 @@ mod tests {
                 call_id: "c2".into(),
                 name: "read".into(),
                 summary: "b.rs".into(),
+                arguments: String::new(),
+                detail: None,
                 ok: Some(true),
                 started: now,
                 duration: Some(std::time::Duration::from_millis(100)),
@@ -2608,6 +3244,8 @@ mod tests {
             call_id: "c1".into(),
             name: "exec".into(),
             summary: "cargo test".into(),
+            arguments: String::new(),
+            detail: None,
             ok: None,
             started,
             duration: None,
@@ -2652,6 +3290,8 @@ mod tests {
             call_id: "c1".into(),
             name: "read".into(),
             summary: "src/a.rs".into(),
+            arguments: String::new(),
+            detail: None,
             ok: Some(true),
             started: now,
             duration: Some(std::time::Duration::from_secs(3)),
@@ -2668,8 +3308,8 @@ mod tests {
         let mut state = ChatState::default();
         state.set_context(28_800, 32_000);
         for id in ["c1", "c2", "c3"] {
-            state.push_tool_started(id, "read", "a.rs");
-            state.finish_tool(id, id != "c2", None);
+            state.push_tool_started(id, "read", "a.rs", "");
+            state.finish_tool(id, id != "c2", None, None);
         }
 
         let backend = ratatui::backend::TestBackend::new(120, 1);
@@ -2697,8 +3337,8 @@ mod tests {
         let mut state = ChatState::default();
         state.set_context(28_800, 32_000);
         for id in ["c1", "c2", "c3"] {
-            state.push_tool_started(id, "read", "a.rs");
-            state.finish_tool(id, id != "c2", None);
+            state.push_tool_started(id, "read", "a.rs", "");
+            state.finish_tool(id, id != "c2", None, None);
         }
 
         let backend = ratatui::backend::TestBackend::new(65, 1);
@@ -2720,8 +3360,13 @@ mod tests {
     #[test]
     fn copying_a_tool_line_keeps_the_displayed_duration() {
         let mut state = ChatState::default();
-        state.push_tool_started("c1", "read", "src/a.rs");
-        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(1_250)));
+        state.push_tool_started("c1", "read", "src/a.rs", "");
+        state.finish_tool(
+            "c1",
+            true,
+            None,
+            Some(std::time::Duration::from_millis(1_250)),
+        );
 
         let width = 80u16;
         let rows = transcript_rows(
@@ -2761,27 +3406,33 @@ mod tests {
     fn visual_review_of_a_multi_tool_turn() {
         let mut state = ChatState::default();
         state.push_user("investigue o bug do parser e rode os testes");
-        state.push_tool_started("c1", "read", "src/parser.rs");
-        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(320)));
-        state.push_tool_started("c2", "search", "fn parse");
-        state.finish_tool("c2", true, Some(std::time::Duration::from_millis(880)));
-        state.push_tool_started("c3", "map", "crates/tupi-parser");
-        state.finish_tool("c3", false, Some(std::time::Duration::from_secs(2)));
+        state.push_tool_started("c1", "read", "src/parser.rs", "");
+        state.finish_tool("c1", true, None, Some(std::time::Duration::from_millis(320)));
+        state.push_tool_started("c2", "search", "fn parse", "");
+        state.finish_tool("c2", true, None, Some(std::time::Duration::from_millis(880)));
+        state.push_tool_started("c3", "map", "crates/tupi-parser", "");
+        state.finish_tool("c3", false, None, Some(std::time::Duration::from_secs(2)));
 
         // Pipeline: pai mais duas sub-chamadas, identificadas pelo `#` no id.
-        state.push_tool_started("p1", "pipeline", "corrigir e testar");
-        state.push_tool_started("p1#0.0", "edit", "src/parser.rs");
-        state.finish_tool("p1#0.0", true, Some(std::time::Duration::from_millis(600)));
-        state.push_tool_started("p1#0.1", "test_many", "parser");
+        state.push_tool_started("p1", "pipeline", "corrigir e testar", "");
+        state.push_tool_started("p1#0.0", "edit", "src/parser.rs", "");
+        state.finish_tool(
+            "p1#0.0",
+            true,
+            None,
+            Some(std::time::Duration::from_millis(600)),
+        );
+        state.push_tool_started("p1#0.1", "test_many", "parser", "");
         state.finish_tool(
             "p1#0.1",
             true,
+            None,
             Some(std::time::Duration::from_millis(1_400)),
         );
-        state.finish_tool("p1", true, Some(std::time::Duration::from_secs(2)));
+        state.finish_tool("p1", true, None, Some(std::time::Duration::from_secs(2)));
 
         // Tool em voo: o spinner e o tempo crescem com o `now` do tick.
-        state.push_tool_started("c4", "exec", "cargo test");
+        state.push_tool_started("c4", "exec", "cargo test", "");
         let started = std::time::Instant::now();
         let now = started + std::time::Duration::from_millis(1_200);
 

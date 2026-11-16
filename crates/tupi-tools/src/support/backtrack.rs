@@ -396,6 +396,18 @@ impl BacktrackGraph {
         }
     }
 
+    /// Quantos símbolos da cadeia estão conhecidos mas ainda sem corpo
+    /// entregue — a linha de fronteira do `lookup` sai daqui.
+    pub fn frontier_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nodes
+            .values()
+            .filter(|record| matches!(record.level, VisitLevel::Frontier))
+            .count()
+    }
+
     pub fn node_count(&self) -> usize {
         self.state
             .lock()

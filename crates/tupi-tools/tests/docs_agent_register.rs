@@ -19,7 +19,7 @@ fn docs_agent_registry_has_only_allowed_tools() {
     let names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
     assert_eq!(
         names,
-        vec!["read", "read_many", "search", "map", "peek", "docs"]
+        vec!["read", "lookup", "map", "peek", "docs"]
     );
     assert!(!registry.has("write"));
     assert!(!registry.has("edit"));

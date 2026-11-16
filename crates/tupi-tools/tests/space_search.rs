@@ -100,19 +100,27 @@ fn registry(dir: &Path, space: Option<Arc<SpaceIndex>>) -> ToolRegistry {
 }
 
 fn call(registry: &ToolRegistry, query: &str, path: Option<&str>) -> String {
-    let mut payload = json!({"query": query, "max_results": 5, "detail": "Signatures"});
+    let mut op = json!({"kind": "semantic", "query": query, "max_results": 5, "detail": "Signatures"});
     if let Some(path) = path {
-        payload["path"] = json!(path);
+        op["path"] = json!(path);
     }
-    registry.get("search").unwrap().call(payload).unwrap()
+    registry
+        .get("lookup")
+        .unwrap()
+        .call(json!({ "ops": [op] }))
+        .unwrap()
 }
 
 fn call_detail(registry: &ToolRegistry, query: &str, path: Option<&str>, detail: &str) -> String {
-    let mut payload = json!({"query": query, "max_results": 5, "detail": detail});
+    let mut op = json!({"kind": "semantic", "query": query, "max_results": 5, "detail": detail});
     if let Some(path) = path {
-        payload["path"] = json!(path);
+        op["path"] = json!(path);
     }
-    registry.get("search").unwrap().call(payload).unwrap()
+    registry
+        .get("lookup")
+        .unwrap()
+        .call(json!({ "ops": [op] }))
+        .unwrap()
 }
 
 #[test]

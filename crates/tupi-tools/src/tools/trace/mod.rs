@@ -101,10 +101,20 @@ impl Tool for TraceTool {
         let answer = match graph.trace(from, to, depth) {
             Some(path) => {
                 let mut body = format!("SIM — {}\n\n", path.join(" → "));
+                let mut anchored = 0usize;
                 for name in &path {
                     if let Some(def) = graph.matching(name).first() {
+                        anchored += 1;
                         body.push_str(&format!("- {name} ({}:{})\n", def.relative, def.start_line));
                     }
+                }
+                if anchored < path.len() {
+                    // Passo sem âncora é omissão declarada, não linha inventada.
+                    body.push_str(&format!(
+                        "({anchored} de {} passos com âncora; {} sem definição no grafo)\n",
+                        path.len(),
+                        path.len() - anchored
+                    ));
                 }
                 body
             }

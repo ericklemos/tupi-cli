@@ -33,40 +33,7 @@ impl RepairingTool {
     }
 
     fn paths(&self, arguments: &Value) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for key in ["path", "from", "to"] {
-            if let Some(path) = arguments.get(key).and_then(Value::as_str) {
-                paths.push(self.cache.root().join(path));
-            }
-        }
-        if let Some(writes) = arguments.get("writes").and_then(Value::as_array) {
-            for write in writes {
-                if let Some(path) = write.get("path").and_then(Value::as_str) {
-                    paths.push(self.cache.root().join(path));
-                }
-            }
-        }
-        if let Some(patch) = arguments.get("patch").and_then(Value::as_str) {
-            for line in patch.lines() {
-                if let Some(rest) = line
-                    .strip_prefix("+++ ")
-                    .or_else(|| line.strip_prefix("--- "))
-                {
-                    let raw = rest.split('\t').next().unwrap_or(rest).trim();
-                    if raw != "/dev/null" && !raw.is_empty() {
-                        let relative = raw
-                            .strip_prefix("b/")
-                            .or_else(|| raw.strip_prefix("a/"))
-                            .unwrap_or(raw);
-                        let candidate = self.cache.root().join(relative);
-                        if !paths.contains(&candidate) {
-                            paths.push(candidate);
-                        }
-                    }
-                }
-            }
-        }
-        paths
+        crate::support::effect::declared_paths(arguments)
     }
 }
 
@@ -76,14 +43,33 @@ impl Tool for RepairingTool {
     }
 
     fn call(&self, arguments: Value) -> Result<String, ToolError> {
-        let paths = self.paths(&arguments);
+        let effect = self.effect(&arguments);
         let result = self.inner.call(arguments)?;
-        self.cache.repair(&paths);
+        match &effect {
+            tupi_kernel::Effect::ReadOnly => {}
+            tupi_kernel::Effect::Writes(paths) => self.cache.repair(paths),
+            tupi_kernel::Effect::Opaque => self.cache.repair(&[]),
+        }
         Ok(result)
     }
 
     fn describe_call(&self, arguments: &Value) -> String {
         self.inner.describe_call(arguments)
+    }
+
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        match self.inner.effect(arguments) {
+            tupi_kernel::Effect::ReadOnly => tupi_kernel::Effect::ReadOnly,
+            tupi_kernel::Effect::Writes(paths) => tupi_kernel::Effect::Writes(paths),
+            tupi_kernel::Effect::Opaque => {
+                let declared = self.paths(arguments);
+                if declared.is_empty() {
+                    tupi_kernel::Effect::Opaque
+                } else {
+                    tupi_kernel::Effect::Writes(declared)
+                }
+            }
+        }
     }
 
     fn mutates(&self) -> bool {

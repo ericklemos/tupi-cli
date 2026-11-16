@@ -240,6 +240,12 @@ impl Tool for DiffTool {
                 compact_signature(&def.signature)
             ));
         }
+        if changed.len() > 20 {
+            summary.push_str(&format!(
+                "- (20 de {} símbolos alterados; refine com `path`)\n",
+                changed.len()
+            ));
+        }
         if changed.is_empty() && !files.is_empty() {
             for file in &files {
                 summary.push_str(&format!("- {file} (sem símbolo no grafo)\n"));
@@ -260,6 +266,12 @@ impl Tool for DiffTool {
                     def.qualified, def.relative, def.start_line
                 ));
             }
+            if callers.len() > 20 {
+                body.push_str(&format!(
+                    "(20 de {} chamadores externos; o corte é por item)\n",
+                    callers.len()
+                ));
+            }
             sections.push(Section {
                 heading: format!("#### chamadores externos ({})", callers.len()),
                 body: format!("\n{body}"),
@@ -272,6 +284,12 @@ impl Tool for DiffTool {
                 body.push_str(&format!(
                     "- {} ({}:{})\n",
                     def.qualified, def.relative, def.start_line
+                ));
+            }
+            if tests.len() > 20 {
+                body.push_str(&format!(
+                    "(20 de {} testes afetados; o corte é por item)\n",
+                    tests.len()
                 ));
             }
             sections.push(Section {

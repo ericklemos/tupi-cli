@@ -48,6 +48,10 @@ impl WriteTool {
 }
 
 impl Tool for WriteTool {
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        crate::support::effect::writes(arguments)
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write".to_string(),

@@ -389,6 +389,15 @@ impl Tool for DocsTool {
         }
     }
 
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        if !self.writable
+            || crate::support::effect::is_read_action(arguments, &["query", "read", "map"])
+        {
+            tupi_kernel::Effect::ReadOnly
+        } else {
+            tupi_kernel::Effect::Opaque
+        }
+    }
     fn mutates(&self) -> bool {
         self.writable
     }

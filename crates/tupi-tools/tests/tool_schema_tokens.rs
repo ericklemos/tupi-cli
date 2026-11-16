@@ -28,18 +28,19 @@ fn tokens_of(exposure: Exposure<'_>, root: &std::path::Path) -> (usize, usize) {
 /// importa é quanto `expose_all` acrescenta sobre o núcleo.
 #[test]
 fn the_agent_schema_costs_tokens_on_every_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let core = tokens_of(Exposure::Core, dir.path());
-    let all = tokens_of(Exposure::All, dir.path());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
 
-    assert_eq!(
-        core,
-        (12, 4_506),
-        "núcleo (Exposure::Core) mudou: atualize docs/perf/turn-latency.md"
-    );
-    assert_eq!(
-        all,
-        (30, 10_651),
-        "expose_all mudou: atualize docs/perf/turn-latency.md"
-    );
-}
+        assert_eq!(
+            tokens_of(Exposure::Core, &root),
+            (11, 4468),
+            "núcleo (Exposure::Core) mudou: atualize docs/perf/turn-latency.md"
+        );
+        assert_eq!(
+            tokens_of(Exposure::All, &root),
+            (29, 10613),
+            "exposição total (Exposure::All) mudou: atualize docs/perf/turn-latency.md"
+        );
+    }

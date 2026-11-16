@@ -39,6 +39,7 @@ async fn event_hub_replays_ring_buffer_and_emits_refresh_hint_on_mutating_tool()
         name: "write".to_string(),
         ok: true,
         summary: "gravou arquivo".to_string(),
+        detail: "ok".to_string(),
         // O dashboard web não exibe duração; o campo existe para a TUI.
         duration_us: 1_500,
     });

@@ -139,6 +139,43 @@ impl AgentMode {
     }
 }
 
+/// Teto de caracteres de `Event::ToolFinished::detail`.
+///
+/// O transcript da TUI é reconstruído a cada frame e rola por linhas:
+/// despejar o output inteiro de uma tool custaria o frame. O número vive
+/// aqui, junto do evento, para que quem publica e quem desenha não inventem
+/// tetos diferentes.
+pub const TOOL_DETAIL_MAX_CHARS: usize = 4_000;
+
+/// Excerto de um texto para `Event::ToolFinished::detail`: cabeça + cauda
+/// separadas por um marcador explícito de corte.
+///
+/// Texto que cabe no teto volta inteiro. O que não cabe volta com no máximo
+/// [`TOOL_DETAIL_MAX_CHARS`] caracteres e com o marcador dizendo quantos
+/// ficaram de fora — um detalhe cortado nunca se passa por completo, e um
+/// texto não vazio nunca encolhe sem aviso. O corte segue o mesmo critério de
+/// `crate::telemetry::clip`: nunca parte um `char` no meio, então o resultado
+/// é sempre UTF-8 válido.
+pub fn tool_detail_excerpt(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= TOOL_DETAIL_MAX_CHARS {
+        return text.to_string();
+    }
+
+    let marker = format!(
+        "\n... ({} caracteres omitidos) ...\n",
+        chars.len() - TOOL_DETAIL_MAX_CHARS
+    );
+    // A cabeça absorve o custo do marcador: o total nunca passa do teto.
+    let tail = TOOL_DETAIL_MAX_CHARS / 4;
+    let head = TOOL_DETAIL_MAX_CHARS.saturating_sub(tail + marker.chars().count());
+
+    let mut out: String = chars[..head].iter().collect();
+    out.push_str(&marker);
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Token {
@@ -199,6 +236,14 @@ pub enum Event {
         name: String,
         ok: bool,
         summary: String,
+        /// Excerto do corpo do resultado, cortado por [`tool_detail_excerpt`]
+        /// em no máximo [`TOOL_DETAIL_MAX_CHARS`] caracteres: cabeça + cauda
+        /// com marcador explícito de corte.
+        ///
+        /// Chega inteiro (ou truncado) de uma vez: `ToolFinished` é evento
+        /// único, não há streaming do output. Quem desenha não busca conteúdo
+        /// por conta própria nem inventa o que falta.
+        detail: String,
         /// Tempo de execução da tool em **microssegundos**: é a unidade que a
         /// telemetria da tool já usa, e micros inteiros evitam ter de
         /// serializar `std::time::Duration`. O consumidor escolhe a unidade

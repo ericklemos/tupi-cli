@@ -109,6 +109,10 @@ impl ExecTool {
 }
 
 impl Tool for ExecTool {
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "exec".to_string(),

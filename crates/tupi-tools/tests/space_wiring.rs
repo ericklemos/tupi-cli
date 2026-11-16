@@ -19,5 +19,7 @@ fn register_with_accepts_a_space_index_without_embedder() {
         ..ToolsOptions::default()
     };
     register_with(dir.path().to_path_buf(), &mut registry, options);
-    assert!(registry.get("search").is_some());
+    // O índice denso viaja dentro do `SearchTool`, que o `lookup` funde: é ele
+    // que precisa estar exposto para a perna semântica ter espaço.
+    assert!(registry.get("lookup").is_some());
 }

@@ -11,16 +11,13 @@
 use tupi_domain::ToolCall;
 use tupi_kernel::{AgentMode, ToolRegistry};
 
-/// Leitura barata e sem efeito próprio: pode rodar junto das vizinhas do mesmo
-/// passo sem mudar a ordem observável da história.
-const BATCHABLE_READS: &[&str] = &["read", "read_many", "peek", "search", "docs", "assert"];
-
-/// `true` quando a call pode rodar junto das vizinhas do mesmo passo.
+/// `true` quando a call declara efeito de leitura no modo atual. A declaração
+/// vem da própria tool: nome na lista não é contrato.
 pub(crate) fn call_is_parallel(tools: &ToolRegistry, call: &ToolCall, mode: AgentMode) -> bool {
-    if !BATCHABLE_READS.contains(&call.name.as_str()) {
+    let Some(tool) = tools.get(&call.name) else {
         return false;
-    }
-    tools
-        .get(&call.name)
-        .is_some_and(|tool| !tool.mutates() && tool.mode_mask().contains(mode))
+    };
+    let arguments: serde_json::Value =
+        serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+    tool.effect(&arguments).is_read_only() && tool.mode_mask().contains(mode)
 }

@@ -1679,6 +1679,7 @@ impl App {
                         name: call.name.clone(),
                         ok,
                         summary: summary.clone(),
+                        detail: tupi_domain::tool_detail_excerpt(&content),
                         duration_us: crate::telemetry::micros(duration).max(1),
                     });
 

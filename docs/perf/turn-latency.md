@@ -46,16 +46,16 @@ registradas, não só o núcleo. Número medido localmente (nenhuma API),
 
 | exposição | tools | tokens de schema por passo |
 | --- | --- | --- |
-| `Exposure::Core` (12 tools) | 12 | 4.506 |
-| `Exposure::All` (30 tools, `expose_all`) | 30 | 10.651 |
+| `Exposure::Core` (11 tools) | 11 | 4.468 |
+| `Exposure::All` (29 tools, `expose_all`) | 29 | 10.613 |
 | diferença | +18 | **+6.145** |
 
 Leitura: `expose_all` custa 2,4× o núcleo em tokens de schema e soma 6.145
 tokens a **cada** passo — 9,6% do `budget` de 64.000 e 19,2% do `target` de
 32.000 (`configs/context.ron`). Como `plan_context` subtrai esses tokens do
 orçamento de mensagens (`crates/tupi-app/src/app.rs:142-168`), o schema encurta
-o histórico útil antes do previsto: com `expose_all` sobram 53.349 tokens de
-mensagem em vez de 59.494.
+o histórico útil antes do previsto: com `expose_all` sobram 53.387 tokens de
+mensagem em vez de 59.532.
 
 O número é medido com o mesmo estimador do planejador
 (`tool_spec_tokens`, `crates/tupi-app/src/app.rs:170-174`, sobre
@@ -81,14 +81,14 @@ A diferença entre os dois é o que a correção de escala mede: `estimate_scale
 (`estimate_tokens` × `scale_ppm`) é o valor que se compara com `prompt_tokens`,
 e `scale_ppm` guarda a correção em vigor no passo. Para atribuir tokens de
 schema no relatório, a conta é `prompt_tokens − estimate_scaled` no passo, e o
-piso dessa diferença é o schema: 4.506 tokens no núcleo, 10.651 com
+piso dessa diferença é o schema: 4.468 tokens no núcleo, 10.613 com
 `expose_all`. Não somar `tool_tokens` com `estimate_tokens` para "prever"
 `prompt_tokens` — há também o template, que não é medido localmente.
 
 ## Re-leituras por turno (T6.2)
 
 `tupi telemetry` conta, por turno, as chamadas de leitura — `read`,
-`read_many` e `peek` — no campo `re-read` da tabela e no total
+`lookup` e `peek` — no campo `re-read` da tabela e no total
 (`crates/tupi/src/telemetry_report.rs:142-219`). O nome da tool vem de
 `ToolFinished.name` (`crates/tupi-app/src/telemetry.rs:537`); o resto das tools
 fica fora da conta, então uma chamada de `exec` não infla o número.
@@ -153,7 +153,7 @@ configuração, não a latência.
 Duas leituras na mesma resposta do modelo rodam juntas; mutante continua serial
 e na ordem declarada. A regra vive em `call_is_parallel`
 (`crates/tupi-app/src/tool_batch.rs`): só entra no lote o que é leitura barata —
-`read`, `read_many`, `peek`, `search`, `docs`, `assert` — e que não declara
+`read`, `peek`, `lookup`, `docs`, `assert` — e que não declara
 `mutates()`. `exec`, `test_many` e `map` ficam fora: disputam `target/` ou pagam
 construção de índice, e escondem trabalho longo da linha viva da TUI.
 

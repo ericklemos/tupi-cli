@@ -227,6 +227,7 @@ async fn run_agent_loop(turn: &AgentTurn<'_>, mut messages: Vec<Message>) -> Age
                     name: call.name.clone(),
                     ok,
                     summary: crate::app::summarize(&content),
+                    detail: tupi_domain::tool_detail_excerpt(&content),
                     duration_us: crate::telemetry::micros(elapsed).max(1),
                 });
             }
@@ -524,6 +525,7 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
         name: "agent".to_string(),
         ok: outcome.ok,
         summary: summarize_outcome(&outcome),
+        detail: tupi_domain::tool_detail_excerpt(&outcome.output),
         duration_us: crate::telemetry::micros(started.elapsed()).max(1),
     });
 

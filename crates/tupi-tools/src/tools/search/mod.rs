@@ -55,7 +55,7 @@ struct Rendered {
 }
 
 pub struct SearchTool {
-    root_dir: PathBuf,
+    pub(crate) root_dir: PathBuf,
     scanner: LexicalScanner,
     pub(crate) store: Arc<ResponseStore>,
     ledger: Arc<DeliveryLedger>,
@@ -64,7 +64,7 @@ pub struct SearchTool {
     graph: Option<Arc<crate::graph::GraphCache>>,
     space: Option<Arc<crate::space::SpaceIndex>>,
     embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
-    backtrack: Arc<crate::backtrack::BacktrackGraph>,
+    pub(crate) backtrack: Arc<crate::backtrack::BacktrackGraph>,
 }
 
 impl SearchTool {

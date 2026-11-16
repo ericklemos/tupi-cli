@@ -5,6 +5,7 @@ pub(crate) mod budget;
 // o `allow` sai junto com o último chamador.
 #[allow(dead_code)]
 pub(crate) mod dense;
+pub(crate) mod effect;
 pub mod graph;
 pub(crate) mod ledger;
 pub(crate) mod paths;

@@ -139,6 +139,18 @@ impl Tool for WhyTool {
                 body.push('\n');
             }
         }
+        // Corte silencioso é o que se paga: cada omissão é declarada aqui.
+        if commits.len() >= limit {
+            body.push_str(&format!(
+                "(no máximo {limit} commits por definição; aumente `max_commits` para ver o resto)\n"
+            ));
+        }
+        if definitions.len() > 3 {
+            body.push_str(&format!(
+                "(3 de {} definições consultadas; refine `symbol`)\n",
+                definitions.len()
+            ));
+        }
 
         let section = Section {
             heading: format!("### why — {symbol}"),

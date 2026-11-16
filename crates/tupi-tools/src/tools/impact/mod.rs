@@ -114,6 +114,12 @@ impl Tool for ImpactTool {
             for def in definitions.iter().take(5) {
                 summary.push_str(&format!("  {}\n", line_for(def)));
             }
+            if definitions.len() > 5 {
+                summary.push_str(&format!(
+                    "  (5 de {} definições; refine `symbol_name`)\n",
+                    definitions.len()
+                ));
+            }
         }
         summary.push_str(&format!("- chamadores: {}\n", external.len()));
         if !params.include_tests {
@@ -131,13 +137,15 @@ impl Tool for ImpactTool {
 
         if !external.is_empty() {
             let mut body = String::new();
-            for (index, def) in external.iter().enumerate() {
-                if index >= 20 {
-                    body.push_str(&format!("(+{} chamadores)\n", external.len() - 20));
-                    break;
-                }
+            for def in external.iter().take(20) {
                 body.push_str(&line_for(def));
                 body.push('\n');
+            }
+            if external.len() > 20 {
+                body.push_str(&format!(
+                    "(20 de {} chamadores; o corte é por item)\n",
+                    external.len()
+                ));
             }
             sections.push(Section {
                 heading: "#### chamadores".to_string(),
@@ -151,6 +159,9 @@ impl Tool for ImpactTool {
             for def in tests.iter().take(20) {
                 body.push_str(&line_for(def));
                 body.push('\n');
+            }
+            if tests.len() > 20 {
+                body.push_str(&format!("(20 de {} testes; o corte é por item)\n", tests.len()));
             }
             sections.push(Section {
                 heading: "#### testes".to_string(),

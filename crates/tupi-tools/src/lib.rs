@@ -10,7 +10,7 @@ pub(crate) use support::{
 
 pub use tools::sdd;
 pub(crate) use tools::{
-    assert, clock, context_graph, diff, edit, env, exec, facts, feedback, fetch, impact, map, patch,
+    assert, clock, context_graph, diff, edit, env, exec, facts, feedback, fetch, impact, lookup, map, patch,
     peek, read, read_many, relocate, research, search, setup, shell, state, test_many, trace,
     websearch, why, workflow, write, write_many,
 };
@@ -229,8 +229,7 @@ pub fn register_with(
     );
 
     registry.register(read.clone());
-    registry.register(Arc::new(ReadManyTool::new(read)));
-    registry.register(Arc::new(
+    let search = Arc::new(
         SearchTool::new(
             root_dir.clone(),
             store.clone(),
@@ -242,7 +241,15 @@ pub fn register_with(
         .with_optional_space(options.space.clone())
         .with_optional_embedder(options.embedder.clone())
         .with_backtrack(backtrack),
-    ));
+    );
+    registry.register(Arc::new(crate::lookup::LookupTool::new(
+        read,
+        search,
+        root_dir.clone(),
+        store.clone(),
+        ledger.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
     registry.register(Arc::new(
         WorkflowTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
             .with_docs_folders(options.docs_folders.clone()),
@@ -287,16 +294,24 @@ pub fn register_with(
         )),
         graph.clone(),
     )));
-    registry.register(Arc::new(crate::exec::ExecTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )
-    .with_cache(exec_cache)));
-    registry.register(Arc::new(crate::test_many::TestManyTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
+        Arc::new(
+            crate::exec::ExecTool::new(
+                root_dir.clone(),
+                store.clone(),
+                DEFAULT_BUDGET_TOKENS,
+            )
+            .with_cache(exec_cache),
+        ),
+        graph.clone(),
+    )));
+    registry.register(Arc::new(crate::graph::RepairingTool::new(
+        Arc::new(crate::test_many::TestManyTool::new(
+            root_dir.clone(),
+            store.clone(),
+            DEFAULT_BUDGET_TOKENS,
+        )),
+        graph.clone(),
     )));
     registry.register(Arc::new(crate::graph::RepairingTool::new(
         Arc::new(crate::shell::ShellTool::new(
@@ -317,11 +332,6 @@ pub fn register_with(
         DEFAULT_BUDGET_TOKENS,
     )));
     registry.register(Arc::new(crate::impact::ImpactTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::context_graph::ContextTool::new(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
@@ -448,11 +458,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "edit",
     "exec",
     "feedback",
+    "lookup",
     "map",
     "patch",
     "read",
-    "read_many",
-    "search",
     "write",
 ];
 
@@ -549,17 +558,17 @@ mod tests {
         );
 
         let read = registry.get("read").unwrap();
-        let search = registry.get("search").unwrap();
+        let lookup = registry.get("lookup").unwrap();
 
         read.call(serde_json::json!({ "path": "a.rs" })).unwrap();
-        let search_alpha = search
-            .call(serde_json::json!({ "query": "alpha" }))
+        let search_alpha = lookup
+            .call(serde_json::json!({ "ops": [{ "kind": "semantic", "query": "alpha" }] }))
             .unwrap();
         assert!(search_alpha.contains("1. `alpha_two`"), "{search_alpha}");
         assert!(search_alpha.contains("2. `alpha_one`"), "{search_alpha}");
 
-        search
-            .call(serde_json::json!({ "query": "verify_token" }))
+        lookup
+            .call(serde_json::json!({ "ops": [{ "kind": "semantic", "query": "verify_token" }] }))
             .unwrap();
         read.call(serde_json::json!({ "path": "token.rs", "symbol": "decode_jwt" }))
             .unwrap();
@@ -589,7 +598,7 @@ mod tests {
             .map(|s| s.name)
             .collect();
 
-        for required in ["sdd", "read", "read_many", "search", "map", "peek"] {
+        for required in ["sdd", "read", "lookup", "map", "peek"] {
             assert!(
                 sdd_names.iter().any(|n| n == required),
                 "esperava {required} em SDD: {sdd_names:?}"

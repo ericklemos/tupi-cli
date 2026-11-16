@@ -12,6 +12,7 @@ pub(crate) mod feedback;
 pub(crate) mod fetch;
 pub(crate) mod impact;
 pub(crate) mod investigate;
+pub(crate) mod lookup;
 pub(crate) mod map;
 pub(crate) mod patch;
 pub(crate) mod peek;

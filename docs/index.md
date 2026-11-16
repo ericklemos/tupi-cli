@@ -11,6 +11,10 @@
 
 ## Ferramentas
 
+- [Tool `lookup`](features/lookup-tool.md) — um lote heterogêneo de ops
+  (`symbol`, `skeleton`, `lines`, `text`, `semantic`, `graph`) com um orçamento,
+  cap por item, corte anunciado, erro por item e dedupe por ledger; fundiu
+  `read_many` e `search` e cortou o schema para 4.468 tokens no núcleo.
 - [Tool `shell`](features/shell-tool.md) — saída bruta por padrão (`terms` só
   filtra com `filter: true`), allowlist restrita (`cargo` fora, `git` só leitura),
   binário ausente vira aviso com equivalente e recusa sempre ensina a alternativa;
@@ -39,8 +43,8 @@
 ## Performance
 
 - [Latência do turno](perf/turn-latency.md) — split provider×tool por turno, teto
-  de passos (200 → 30, dois tetos separados), tokens de schema por passo: 10.651
-  com `expose_all` contra 4.506 no núcleo (+6.145 por passo), `estimate_tokens` e
+  de passos (200 → 30, dois tetos separados), tokens de schema por passo: 10.613
+  com `expose_all` contra 4.468 no núcleo (+6.145 por passo), `estimate_tokens` e
   `prompt_tokens` separados e a queda de re-leitura esperada.
 - [Baseline de performance](perf/baseline.md) — números de build e do grafo,
   ajustes aplicados e lacunas de medição.
@@ -82,11 +86,14 @@
   root confinado, edição com hash, allowlist no `shell`, orçamentos em
   `configs/` e descoberta obrigatória por `map`.
 - [ADR 0005](decisions/0005-expose-all.md) — `expose_all` fica: o schema custa
-  +6.145 tokens por passo (10.651 contra 4.506 no núcleo), mas é prefixo
+  +6.145 tokens por passo (10.613 contra 4.468 no núcleo), mas é prefixo
   cacheado e não round trip — cortar arrisca passo extra de ~5,4 s.
 - [ADR 0006](decisions/0006-teto-de-passos.md) — teto de 30 passos (2,5× sobre os
   12 medidos) e dois tetos com dois números: o turno lê `max_tool_steps`, o
   subagente do SDD lê `agent_max_steps` do request.
+- [ADR 0007](decisions/0007-fusao-lookup.md) — `read_many` e `search` viram
+  `lookup(ops)`: um orçamento, erro por item e cap declarado; o schema cai para
+  4.468 (núcleo) e 10.613 (`expose_all`).
 
 ## Regras
 

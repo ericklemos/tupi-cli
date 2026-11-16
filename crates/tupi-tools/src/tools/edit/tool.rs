@@ -1,6 +1,10 @@
 use super::*;
 
 impl Tool for EditTool {
+    fn effect(&self, arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        crate::support::effect::writes(arguments)
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit".to_string(),

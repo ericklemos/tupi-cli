@@ -143,6 +143,10 @@ fn rollback(planned: &[Planned]) -> Vec<String> {
 }
 
 impl Tool for WriteManyTool {
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        crate::support::effect::writes(arguments)
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_many".to_string(),

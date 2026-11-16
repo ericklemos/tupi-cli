@@ -178,6 +178,10 @@ fn stats(patch: &str) -> (usize, usize) {
 }
 
 impl Tool for PatchTool {
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        crate::support::effect::writes(arguments)
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "patch".to_string(),

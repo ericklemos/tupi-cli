@@ -104,7 +104,7 @@ where
                 row.tool_calls += 1;
                 row.tool_us += value["duration_us"].as_u64().unwrap_or_default();
                 // Só as tools de leitura contam como re-leitura.
-                if matches!(name, "read" | "read_many" | "peek") {
+                if matches!(name, "read" | "lookup" | "peek") {
                     row.rereads += 1;
                 }
             }
@@ -242,7 +242,7 @@ pub fn render(report: &Report, path: &Path, limit: usize) -> String {
         share(wall.saturating_sub(provider + tool), wall)
     ));
     out.push_str(&format!(
-        "re-leituras: {} read/read_many/peek no total · {:.2} por turno\n",
+        "re-leituras: {} read/lookup/peek no total · {:.2} por turno\n",
         rereads,
         rereads as f64 / turns.len() as f64
     ));

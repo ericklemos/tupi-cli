@@ -112,6 +112,10 @@ fn failure_tail(stdout: &str) -> Option<String> {
 }
 
 impl Tool for TestManyTool {
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "test_many".to_string(),

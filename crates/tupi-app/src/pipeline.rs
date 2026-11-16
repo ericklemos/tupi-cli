@@ -274,9 +274,23 @@ fn publish_finished(
     result: &Result<String, String>,
     duration: std::time::Duration,
 ) {
-    let (ok, summary) = match result {
-        Ok(content) => (true, summarize(content)),
-        Err(error) => (false, summarize(error)),
+    // O corpo do resultado sai daqui uma vez só: a TUI recebe o excerto já
+    // cortado (`tupi_domain::tool_detail_excerpt`, teto
+    // `TOOL_DETAIL_MAX_CHARS`) e não vai buscar conteúdo no render. O critério
+    // de corte é o mesmo de `crate::telemetry::clip` (limite de caractere,
+    // nunca byte no meio de UTF-8); só o tamanho é outro, porque aqui o
+    // consumidor é uma linha de transcript, não o arquivo de telemetria.
+    let (ok, summary, detail) = match result {
+        Ok(content) => (
+            true,
+            summarize(content),
+            tupi_domain::tool_detail_excerpt(content),
+        ),
+        Err(error) => (
+            false,
+            summarize(error),
+            tupi_domain::tool_detail_excerpt(error),
+        ),
     };
     events.publish(Event::ToolFinished {
         request_id,
@@ -284,6 +298,7 @@ fn publish_finished(
         name: call.name.clone(),
         ok,
         summary,
+        detail,
         // Medido ao redor da chamada que roda a tool, não no consumidor: o
         // evento atravessa o bus e pode ser lido bem depois. O piso de 1µs
         // mantém `duration_us > 0` numa chamada instantânea, para que zero
@@ -422,5 +437,78 @@ mod tests {
         let body = out.split("\n\n…").next().unwrap();
         assert!(body.chars().all(|ch| ch == 'á'));
         assert!(tupi_domain::tokens::estimate_tokens(body) <= 10);
+    }
+
+    #[test]
+    fn finished_tool_publishes_the_detail_with_an_announced_cut() {
+        let events = EventBus::new(8);
+        let mut rx = events.subscribe();
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        };
+
+        let long = "á".repeat(tupi_domain::TOOL_DETAIL_MAX_CHARS * 2);
+        publish_finished(
+            &events,
+            7,
+            &call,
+            &Ok(long.clone()),
+            std::time::Duration::from_millis(5),
+        );
+        let Event::ToolFinished {
+            request_id,
+            ok,
+            detail,
+            duration_us,
+            ..
+        } = rx.try_recv().expect("evento publicado")
+        else {
+            panic!("esperava ToolFinished");
+        };
+        assert_eq!(request_id, 7);
+        assert!(ok);
+        assert!(duration_us >= 1, "piso de tempo perdido: {duration_us}");
+        // O detalhe atravessa o bus já cortado e com o corte anunciado: o
+        // consumidor nunca recebe 8 mil caracteres para desenhar num frame.
+        assert!(
+            detail.chars().count() <= tupi_domain::TOOL_DETAIL_MAX_CHARS,
+            "detalhe acima do teto: {}",
+            detail.chars().count()
+        );
+        assert!(
+            detail.contains("caracteres omitidos"),
+            "corte sem aviso: {detail:?}"
+        );
+        assert_ne!(detail, long, "detalhe cortado se passou por completo");
+
+        // Texto que cabe volta inteiro; o corpo de uma falha também chega,
+        // junto de `ok = false`.
+        publish_finished(
+            &events,
+            8,
+            &call,
+            &Ok("ok".to_string()),
+            std::time::Duration::ZERO,
+        );
+        let Event::ToolFinished { ok, detail, .. } = rx.try_recv().unwrap() else {
+            panic!("esperava ToolFinished");
+        };
+        assert!(ok);
+        assert_eq!(detail, "ok");
+
+        publish_finished(
+            &events,
+            9,
+            &call,
+            &Err("falhou".to_string()),
+            std::time::Duration::ZERO,
+        );
+        let Event::ToolFinished { ok, detail, .. } = rx.try_recv().unwrap() else {
+            panic!("esperava ToolFinished");
+        };
+        assert!(!ok);
+        assert_eq!(detail, "falhou");
     }
 }

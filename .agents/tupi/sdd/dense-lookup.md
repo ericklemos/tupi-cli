@@ -2,7 +2,7 @@
 
 # Saída densa canônica e tool `lookup(ops)` — fundir read/read_many/search (`dense-lookup`)
 
-**Status:** closed
+**Status:** failed
 
 ## Objetivo
 
@@ -41,23 +41,23 @@ Criar um contrato de saída denso único (seções com prioridade, um orçamento
   - [x] **T1.1** `aggregate` acumula por `name` — Teste com três tools fixa chamadas, falhas, bytes e truncados por nome; linha malformada continua contada em `malformed`.
   - [x] **T1.2** `render` imprime top-N e a coluna de truncados — Cabeçalho e ordem determinísticos travados por teste, no estilo de `the_report_names_the_columns_of_the_split`.
   - [x] **T1.3** Baseline registrada em docs/ — `docs/perf/turn-latency.md` ganha a tabela por tool do run atual e o comando reproduzível.
-- [ ] **T2** Contrato denso canônico: um helper para todas as tools
+- [x] **T2** Contrato denso canônico: um helper para todas as tools
   - Extrair de `ReadTool::finish`/`ReadTool::settle` e do fim de `SearchTool::search` o caminho único: ordenar por priority, `budget::select`, `store.insert(omitted)`, `budget::render` com handle, ledger por seção. Assinatura alvo: `dense(sections, budget, ledger, store) -> String`. Fonte: crates/tupi-tools/src/tools/read/render.rs:268-289; crates/tupi-tools/src/tools/search/query.rs:323-486; crates/tupi-tools/src/support/budget.rs:64-119, :198-223.
   - [x] **T2.1** Helper + testes de prioridade, envelope e ledger — Teste fixa que seção de maior prioridade entra primeiro, que o excedente vira handle e que seção já entregue vira ponteiro.
   - [x] **T2.2** Migrar `read`/`search` para o helper sem mudar a saída — `a_small_budget_truncates_and_peek_recovers`, `the_batch_shares_one_budget_and_the_tail_is_recoverable` e `a_read_delivery_makes_the_search_a_pointer` seguem verdes sem alteração de expectativa.
-  - [ ] **T2.3** Migrar as tools de lista: `impact_check`, `diff`, `trace`, `why` — Cada uma declara `N de M` quando corta e o excedente volta por `peek`; teste por tool.
-- [ ] **T3** Tool `lookup`: fusão de `read`, `read_many` e `search`
+  - [x] **T2.3** Migrar as tools de lista: `impact_check`, `diff`, `trace`, `why` — Cada uma declara `N de M` quando corta e o excedente volta por `peek`; teste por tool.
+- [x] **T3** Tool `lookup`: fusão de `read`, `read_many` e `search`
   - Schema `ops: [{kind, ...}]` com `kind` em symbol|skeleton|lines|text|semantic|graph, `mode` como atalho de op única, um `budget_tokens`, um ledger. Erro por item em seção priority 255; `describe_call` resume o lote. Fonte: crates/tupi-tools/src/tools/read/mod.rs:35-43, :177-206; crates/tupi-tools/src/tools/read_many/mod.rs:42-181, :185-229; crates/tupi-tools/src/tools/search/mod.rs:121-167.
-  - [ ] **T3.1** Params, schema e parse por `kind` — Op sem o campo obrigatório do seu `kind` é recusada nomeando o campo; `mode` gera uma op única equivalente.
-  - [ ] **T3.2** Execução por `kind` reusando `ReadTool::prepare`/`render` e `SearchTool::search` — Lote misto (symbol + skeleton + semantic) devolve as três seções na ordem pedida, com um único orçamento.
-  - [ ] **T3.3** Saída densa única, erro por item e linha de fronteira — Item inexistente vira seção de topo e os demais continuam; o topo mostra quantos símbolos da cadeia ainda estão `Frontier`.
-  - [ ] **T3.4** Registro, exposição e prompts — `lookup` entra em `register_with`/`CORE_TOOLS` e no `agent_register`; `TUPI_SYSTEM`, `configs/prompts.ron` e `NATIVE`/`native_hint` nomeiam `lookup`; `setup` regenera AGENTS.md e skill sem menção a tool removida.
-  - [ ] **T3.5** Aposentar `read_many` e `search` como tools — Nenhum teste de exposição espera as duas; `tool_schema_tokens` mostra queda no total de tokens de schema (ou o topo justifica por escrito se não houver queda).
-- [ ] **T4** Ops `text` e `lines`: absorver o draft `native-search`
+  - [x] **T3.1** Params, schema e parse por `kind` — Op sem o campo obrigatório do seu `kind` é recusada nomeando o campo; `mode` gera uma op única equivalente.
+  - [x] **T3.2** Execução por `kind` reusando `ReadTool::prepare`/`render` e `SearchTool::search` — Lote misto (symbol + skeleton + semantic) devolve as três seções na ordem pedida, com um único orçamento.
+  - [x] **T3.3** Saída densa única, erro por item e linha de fronteira — Item inexistente vira seção de topo e os demais continuam; o topo mostra quantos símbolos da cadeia ainda estão `Frontier`.
+  - [x] **T3.4** Registro, exposição e prompts — `lookup` entra em `register_with`/`CORE_TOOLS` e no `agent_register`; `TUPI_SYSTEM`, `configs/prompts.ron` e `NATIVE`/`native_hint` nomeiam `lookup`; `setup` regenera AGENTS.md e skill sem menção a tool removida.
+  - [x] **T3.5** Aposentar `read_many` e `search` como tools — Nenhum teste de exposição espera as duas; `tool_schema_tokens` mostra queda no total de tokens de schema (ou o topo justifica por escrito se não houver queda).
+- [~] **T4** Ops `text` e `lines`: absorver o draft `native-search`
   - `kind: text` devolve `caminho:linha:texto` agrupado por arquivo, com `alternatives`, `regex` opt-in, `glob`/`exclude`, `max_matches`; `kind: lines` cobre faixa, `tail` e `head` numerados. Reusar `LexicalScanner` e o walk existente; excluir `.agents/tupi`, `target` e `.git`. Fonte: .tupi/sdd/native-search/tasks.json; crates/tupi-tools/src/support/scanner.rs:24-200; crates/tupi-tools/src/tools/exec/render.rs:56-137.
-  - [ ] **T4.1** Estender o scanner com glob, exclude e alternatives — Teste por filtro; `an_empty_term_list_finds_nothing` e o caminho semântico continuam verdes.
-  - [ ] **T4.2** Render `caminho:linha:texto` com contagem e cap — Saída agrupada por arquivo com total de casamentos e corte anunciado; excedente em `peek`.
-  - [ ] **T4.3** Faixa de linhas, `tail` e `head` numerados — `lines: "66-73"` de um `.ron` sem símbolos devolve 8 linhas numeradas; `tail: 6` de um `.md` devolve as 6 últimas sem descartar nenhuma.
+  - [x] **T4.1** Estender o scanner com glob, exclude e alternatives — Teste por filtro; `an_empty_term_list_finds_nothing` e o caminho semântico continuam verdes.
+  - [x] **T4.2** Render `caminho:linha:texto` com contagem e cap — Saída agrupada por arquivo com total de casamentos e corte anunciado; excedente em `peek`.
+  - [x] **T4.3** Faixa de linhas, `tail` e `head` numerados — `lines: "66-73"` de um `.ron` sem símbolos devolve 8 linhas numeradas; `tail: 6` de um `.md` devolve as 6 últimas sem descartar nenhuma.
   - [ ] **T4.4** Cenário de aceitação derivado do log de shell — As 10 consultas do run 1794840347760-112433 são reproduzíveis por `lookup` sozinho, com saída equivalente ou melhor.
 - [ ] **T5** Fechamento: números, doc e aposentadoria do plano `native-search`
   - Medir antes/depois no cenário fixo e fechar contrato em `docs/`. Fonte: docs/philosophy.md (P5, P6); docs/perf/turn-latency.md:1-63.

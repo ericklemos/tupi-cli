@@ -120,6 +120,10 @@ fn importers(root: &Path, source: &Path, dest: &Path) -> Vec<String> {
 }
 
 impl Tool for MoveTool {
+    fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
+        crate::support::effect::writes(arguments)
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "move".to_string(),

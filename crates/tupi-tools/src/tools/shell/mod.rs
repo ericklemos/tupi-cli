@@ -377,10 +377,10 @@ impl Tool for ShellTool {
             ("head", "read"),
             ("tail", "read"),
             ("sed", "edit"),
-            ("grep", "search"),
-            ("rg", "search"),
-            ("awk", "search"),
-            ("find", "map ou search"),
+            ("grep", "lookup"),
+            ("rg", "lookup"),
+            ("awk", "lookup"),
+            ("find", "map ou lookup"),
             ("ls", "map"),
             ("tree", "map"),
             ("wc", "read"),
@@ -776,7 +776,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("nao volta por shell.allow"), "{message}");
-        assert!(message.contains("`search`"), "{message}");
+        assert!(message.contains("`lookup`"), "{message}");
         assert!(message.contains("feedback"), "{message}");
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("comando recusado"), "{message}");
-        assert!(message.contains("`search`"), "{message}");
+        assert!(message.contains("`lookup`"), "{message}");
         assert!(!message.contains("nao esta instalado"), "{message}");
     }
 

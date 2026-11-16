@@ -48,6 +48,14 @@ pub enum ChatEntry {
         call_id: String,
         name: String,
         summary: String,
+        /// Argumentos da invocação, como chegaram em `Event::ToolStarted`.
+        /// É a matéria-prima do detalhe expansível: o resumo compacta o que a
+        /// tool achou importante, os argumentos mostram o pedido inteiro.
+        arguments: String,
+        /// Corpo do resultado, já recortado por quem publica. `None` enquanto
+        /// a tool roda (ou quando não houve detalhe): a TUI nunca inventa
+        /// conteúdo no render nem vai buscar o corpo por conta própria.
+        detail: Option<String>,
         ok: Option<bool>,
         /// Quando a tool começou. Nasce aqui, no estado, e não no render:
         /// um `Instant` criado por frame reiniciaria o cronômetro a cada
@@ -97,6 +105,15 @@ pub struct ChatState {
     pub sdd_specs: Vec<String>,
     /// Sessão marcada para apagar com o segundo `d`, se houver.
     pub pending_delete: Option<String>,
+    /// Índices de `ChatEntry::Tool` com o detalhe aberto. Só estado de UI:
+    /// nada daqui volta para o bus nem para o histórico enviado ao provedor,
+    /// e `/new` esvazia o conjunto junto com o resto do transcript.
+    pub expanded: std::collections::BTreeSet<usize>,
+    /// Dono de cada linha do transcript, publicado junto com `view` pelo
+    /// último desenho. Compartilhado por `Rc` para o clique não copiar o mapa
+    /// a cada frame, e lido só no evento de mouse: o layout nunca consulta
+    /// este campo, então expandir não custa leitura de disco nem de store.
+    pub(crate) owners: std::cell::RefCell<std::rc::Rc<Vec<Option<usize>>>>,
     pending_memory: Vec<String>,
     streaming_index: Option<usize>,
     streaming_metrics: Option<crate::metrics::ReplyMetrics>,
@@ -169,7 +186,13 @@ impl ChatState {
 
     /// Uma tool começa: a bolha em stream termina e a chamada vira uma linha.
     /// `summary` já vem descrito pela tool (ex.: `path=a.rs · symbol=new`).
-    pub fn push_tool_started(&mut self, call_id: &str, name: &str, summary: &str) {
+        pub fn push_tool_started(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        summary: &str,
+        arguments: &str,
+    ) {
         // Um turno com tools tem vários balões: as métricas migram para o
         // balão final, e a janela da taxa inclui o tempo de execução das tools.
         if let Some(index) = self.streaming_index
@@ -183,6 +206,8 @@ impl ChatState {
             call_id: call_id.to_string(),
             name: name.to_string(),
             summary: compact_summary(summary),
+            arguments: arguments.to_string(),
+            detail: None,
             ok: None,
             started: std::time::Instant::now(),
             duration: None,
@@ -237,9 +262,18 @@ impl ChatState {
         }
     }
 
-    pub fn finish_tool(&mut self, call_id: &str, ok: bool, elapsed: Option<std::time::Duration>) {
+        pub fn finish_tool(
+        &mut self,
+        call_id: &str,
+        ok: bool,
+        detail: Option<String>,
+        elapsed: Option<std::time::Duration>,
+    ) {
         if let Some(ChatEntry::Tool {
-            ok: slot, duration, ..
+            ok: slot,
+            detail: detail_slot,
+            duration,
+            ..
         }) = self
             .lines
             .iter_mut()
@@ -247,6 +281,9 @@ impl ChatState {
             .find(|entry| matches!(entry, ChatEntry::Tool { call_id: id, .. } if id == call_id))
         {
             *slot = Some(ok);
+            // O detalhe do resultado vem de quem executou a tool e chega uma
+            // vez só: nada de streaming nem de rebuscar conteúdo no render.
+            *detail_slot = detail;
             // A duração vem de quem executou a tool e é opcional: um evento
             // sem medição não vira tempo inventado na tela.
             *duration = elapsed;
@@ -522,10 +559,14 @@ impl ChatState {
                     ok,
                     duration_us,
                 } => {
-                    self.push_tool_started(&call_id, &name, &summary);
+                    // O transcript salvo guarda só a linha fechada: sem
+                    // argumentos e sem o corpo do resultado, a sessão retomada
+                    // reconstrói o cabeçalho e nada expande.
+                    self.push_tool_started(&call_id, &name, &summary, "");
                     self.finish_tool(
                         &call_id,
                         ok,
+                        None,
                         Some(std::time::Duration::from_micros(duration_us)),
                     );
                 }
@@ -639,6 +680,23 @@ impl ChatState {
         self.refresh_suggestions();
     }
 
+    /// Alterna o detalhe da entrada `index` e devolve `true` quando o bloco
+    /// ficou aberto. Não valida o tipo da entrada: quem chama resolve o índice
+    /// a partir de um `ChatEntry::Tool` (`hit_test`/seleção), e um índice de
+    /// outra variante apenas não tem detalhe para desenhar.
+    pub fn toggle_expanded(&mut self, index: usize) -> bool {
+        if self.expanded.remove(&index) {
+            false
+        } else {
+            self.expanded.insert(index);
+            true
+        }
+    }
+
+    pub fn is_expanded(&self, index: usize) -> bool {
+        self.expanded.contains(&index)
+    }
+
     /// `/new`: limpa o transcript local preservando o modo e os catálogos que
     /// não vêm do app (workflows e planos SDD retomáveis). O app não publica
     /// `ModeChanged` no `/new`, então o modo local precisa continuar igual.
@@ -647,6 +705,9 @@ impl ChatState {
         let sdd_specs = std::mem::take(&mut self.sdd_specs);
         let mode = self.mode;
         *self = ChatState::default();
+        // O transcript que guardava os blocos abertos foi descartado: sessão
+        // nova começa com todo detalhe fechado.
+        self.expanded.clear();
         self.workflows = workflows;
         self.sdd_specs = sdd_specs;
         self.mode = mode;
@@ -723,7 +784,7 @@ mod tests {
         let mut state = ChatState::default();
         state.begin_assistant();
         state.append_token("vou ler");
-        state.push_tool_started("c1", "read", "path=a.rs · symbol=new");
+        state.push_tool_started("c1", "read", "path=a.rs · symbol=new", "");
 
         assert_eq!(state.lines.len(), 2);
         match &state.lines[1] {
@@ -754,10 +815,15 @@ mod tests {
     #[test]
     fn finish_tool_updates_only_the_matching_call() {
         let mut state = ChatState::default();
-        state.push_tool_started("c1", "read", "path=a.rs");
-        state.push_tool_started("c2", "peek", "handle=h_1");
+        state.push_tool_started("c1", "read", "path=a.rs", "");
+        state.push_tool_started("c2", "peek", "handle=h_1", "");
 
-        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(250)));
+        state.finish_tool(
+            "c1",
+            true,
+            None,
+            Some(std::time::Duration::from_millis(250)),
+        );
 
         match &state.lines[0] {
             ChatEntry::Tool {
@@ -785,15 +851,41 @@ mod tests {
     }
 
     #[test]
+    fn tool_entry_keeps_the_arguments_and_the_finished_detail() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "read", "path=a.rs", "{\"path\":\"a.rs\"}");
+        state.finish_tool("c1", true, Some("linha 1\nlinha 2".to_string()), None);
+
+        match &state.lines[0] {
+            ChatEntry::Tool { arguments, detail, .. } => {
+                // Os argumentos chegam prontos em `ToolStarted` e ficam no
+                // estado: o render não os busca em lugar nenhum.
+                assert_eq!(arguments, "{\"path\":\"a.rs\"}");
+                assert_eq!(detail.as_deref(), Some("linha 1\nlinha 2"));
+            }
+            other => panic!("esperava tool, veio {other:?}"),
+        }
+
+        // Sem detalhe publicado, o campo fica vazio: a TUI não inventa corpo
+        // no render nem pede o resultado por conta própria.
+        state.push_tool_started("c2", "peek", "handle=h_1", "{}");
+        state.finish_tool("c2", true, None, None);
+        assert!(matches!(
+            &state.lines[1],
+            ChatEntry::Tool { detail: None, .. }
+        ));
+    }
+
+    #[test]
     fn tool_stats_count_failures_and_ignore_pipeline_children() {
         let mut state = ChatState::default();
-        state.push_tool_started("p1", "pipeline", "2 passos");
-        state.push_tool_started("p1#0.0", "read", "a.rs");
-        state.push_tool_started("c2", "exec", "cargo test");
+        state.push_tool_started("p1", "pipeline", "2 passos", "");
+        state.push_tool_started("p1#0.0", "read", "a.rs", "");
+        state.push_tool_started("c2", "exec", "cargo test", "");
 
-        state.finish_tool("p1#0.0", true, None);
-        state.finish_tool("p1", false, None);
-        state.finish_tool("c2", true, None);
+        state.finish_tool("p1#0.0", true, None, None);
+        state.finish_tool("p1", false, None, None);
+        state.finish_tool("c2", true, None, None);
 
         // A sub-chamada de pipeline não infla o placar do turno.
         assert_eq!(state.turn_tool_stats(), (2, 1));
@@ -803,10 +895,10 @@ mod tests {
     #[test]
     fn subagent_tools_are_inserted_under_their_own_agent() {
         let mut state = ChatState::default();
-        state.push_tool_started("sdd#T1.1", "agent", "T1.1 — A");
-        state.push_tool_started("sdd#T1.2", "agent", "T1.2 — B");
-        state.push_tool_started("sdd#T1.1#1.0", "read", "a.rs");
-        state.push_tool_started("sdd#T1.2#1.0", "read", "b.rs");
+        state.push_tool_started("sdd#T1.1", "agent", "T1.1 — A", "");
+        state.push_tool_started("sdd#T1.2", "agent", "T1.2 — B", "");
+        state.push_tool_started("sdd#T1.1#1.0", "read", "a.rs", "");
+        state.push_tool_started("sdd#T1.2#1.0", "read", "b.rs", "");
 
         // Agentes paralelos intercalam eventos; a linha de cada tool precisa
         // ficar no grupo do seu próprio subagente.
@@ -1042,7 +1134,7 @@ mod tests {
         let mut state = ChatState::default();
         state.begin_assistant();
         state.append_token("vou ler");
-        state.push_tool_started("c1", "read", "path=a.rs");
+        state.push_tool_started("c1", "read", "path=a.rs", "");
         state.append_token("pronto");
 
         let ChatEntry::Message { metrics: None, .. } = &state.lines[0] else {
@@ -1314,5 +1406,32 @@ mod tests {
             &state.lines[0],
             ChatEntry::Message { content, .. } if content == "nova"
         ));
+    }
+
+    #[test]
+    fn toggle_expanded_twice_returns_to_the_initial_state() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "read", "path=a.rs", "{\"path\":\"a.rs\"}");
+
+        assert!(!state.is_expanded(0));
+        assert!(state.toggle_expanded(0));
+        assert!(state.is_expanded(0));
+        assert!(!state.toggle_expanded(0));
+        assert!(!state.is_expanded(0));
+        assert!(state.expanded.is_empty());
+    }
+
+    #[test]
+    fn new_session_clears_the_expanded_blocks() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "read", "path=a.rs", "{\"path\":\"a.rs\"}");
+        state.push_tool_started("c2", "edit", "path=b.rs", "{\"path\":\"b.rs\"}");
+        state.toggle_expanded(0);
+        state.toggle_expanded(1);
+
+        state.reset_for_new_session();
+
+        assert!(state.expanded.is_empty());
+        assert!(!state.is_expanded(0) && !state.is_expanded(1));
     }
 }

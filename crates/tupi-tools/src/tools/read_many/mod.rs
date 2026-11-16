@@ -468,8 +468,7 @@ mod tests {
             names,
             vec![
                 "read",
-                "read_many",
-                "search",
+                "lookup",
                 "workflow",
                 "edit",
                 "write",
@@ -499,6 +498,10 @@ mod tests {
                 "setup",
             ]
         );
+        // `read_many` e `search` viraram `kind` de `lookup`: o nome antigo não
+        // pode voltar a ser anunciado sem uma op que o substitua.
+        assert!(!registry.has("read_many"), "read_many não é mais exposto");
+        assert!(!registry.has("search"), "search não é mais exposto");
     }
 
     #[test]

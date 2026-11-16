@@ -53,18 +53,25 @@ pub fn register_agent(
     );
 
     registry.register(read.clone());
-    registry.register(Arc::new(crate::read_many::ReadManyTool::new(read)));
-    registry.register(Arc::new(
+    let search = Arc::new(
         crate::search::SearchTool::new(
             root_dir.clone(),
             store.clone(),
-            ledger,
+            ledger.clone(),
             DEFAULT_BUDGET_TOKENS,
         )
         .with_parse_cache(parse_cache)
         .with_graph_cache(graph.clone())
         .with_backtrack(backtrack),
-    ));
+    );
+    registry.register(Arc::new(crate::lookup::LookupTool::new(
+        read,
+        search,
+        root_dir.clone(),
+        store.clone(),
+        ledger.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
     registry.register(Arc::new(RepairingTool::new(
         Arc::new(crate::edit::EditTool::new(
             root_dir.clone(),
@@ -191,8 +198,7 @@ pub fn register_docs_agent(
     );
 
     registry.register(read.clone());
-    registry.register(Arc::new(crate::read_many::ReadManyTool::new(read)));
-    registry.register(Arc::new(
+    let search = Arc::new(
         crate::search::SearchTool::new(
             root_dir.clone(),
             store.clone(),
@@ -202,7 +208,15 @@ pub fn register_docs_agent(
         .with_parse_cache(parse_cache)
         .with_graph_cache(graph.clone())
         .with_backtrack(backtrack),
-    ));
+    );
+    registry.register(Arc::new(crate::lookup::LookupTool::new(
+        read,
+        search,
+        root_dir.clone(),
+        store.clone(),
+        ledger.clone(),
+        DEFAULT_BUDGET_TOKENS,
+    )));
     registry.register(Arc::new(crate::map::MapTool::new(
         root_dir.clone(),
         store.clone(),

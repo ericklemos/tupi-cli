@@ -11,7 +11,7 @@ fn agent_registry_has_code_tools_and_no_orchestration_tools() {
     );
     for name in [
         "read",
-        "search",
+        "lookup",
         "edit",
         "write",
         "exec",
@@ -23,6 +23,8 @@ fn agent_registry_has_code_tools_and_no_orchestration_tools() {
     }
     for name in [
         "sdd",
+        "read_many",
+        "search",
         "pipeline",
         "workflow",
         "fetch",

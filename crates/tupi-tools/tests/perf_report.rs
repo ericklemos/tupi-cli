@@ -55,7 +55,7 @@ fn perf_report() {
         .expect("raiz do workspace");
     let (registry, _state) = registry(&root);
     let map = registry.get("map").expect("tool map");
-    let search = registry.get("search").expect("tool search");
+    let lookup = registry.get("lookup").expect("tool lookup");
 
     let mut lines =
         String::from("# relatorio de performance (perfil dev, workspace em opt-level 0)\n");
@@ -81,9 +81,11 @@ fn perf_report() {
         let mut search_bytes = 0;
         for _ in 0..ROUNDS {
             let start = Instant::now();
-            let output = search
-                .call(json!({"query": query, "repeat": "allow"}))
-                .expect("search");
+            let output = lookup
+                .call(json!({
+                    "ops": [{ "kind": "semantic", "query": query, "repeat": "allow" }]
+                }))
+                .expect("lookup semantic");
             search_ms.push(ms(start.elapsed()));
             search_bytes = output.len();
         }
