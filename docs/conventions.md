@@ -9,6 +9,13 @@
   (ex.: `crates/tupi/src/install.rs` — `plan` decide, `apply` escreve).
 - Subcomando de manutenção é despachado no `main` **antes** de env/redb/provider,
   para rodar sem chave de API e sem subir a TUI.
+- Texto novo no transcript da TUI nasce dentro de `transcript_layout_at`
+  (`crates/tupi-tui/src/run.rs`), como `Line` + `owners.push(...)`: row desenhada
+  fora quebra o hit-test de seleção e a cópia por arraste
+  (ver [`features/tui-tool-usage.md`](features/tui-tool-usage.md)).
+- Tempo de execução é medido por quem executa o efeito, não por quem consome o
+  evento: o dado atravessa bus assíncrono e chegaria tarde. Na TUI, o relógio de
+  uma tool nasce no estado (`push_tool_started`), nunca no render.
 - Documentação de projeto e regra vivem sob `docs/` (ver
   [knowledge-placement](rules/knowledge-placement.md)).
 
@@ -24,6 +31,8 @@
   provar que o locale **não** decide o idioma da saída.
 - Idempotência se prova rodando duas vezes e comparando o arquivo, não por
   inspeção do código.
+- Formato visual da TUI é contrato: teste que trava a linha exata (glifos, tempo,
+  indentação) se atualiza junto com o render, não se contorna.
 
 ## Commits
 

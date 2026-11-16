@@ -4,6 +4,12 @@
 
 - [Arquitetura](architecture.md) — camadas, fronteiras e componentes do workspace.
 
+## Interface (TUI)
+
+- [Uso das ferramentas na TUI](features/tui-tool-usage.md) — linha viva por tool
+  (spinner, duração, glifo por categoria), agrupamento por turno e sub-chamadas de
+  `pipeline` indentadas.
+
 ## Performance
 
 - [Baseline de performance](perf/baseline.md) — números de build e do grafo,

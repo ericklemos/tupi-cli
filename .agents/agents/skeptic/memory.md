@@ -25,6 +25,12 @@
    - Guards: `exec/tests.rs` — same-len + restored mtime, `.cargo/config.toml`, `.json` fixture, gitignored `.json`, dir symlink, agent bookkeeping, env injection, cache-age label (20 tests green).
    - Reports: `.agents/results/skeptic/2026-11-11-exec-cache-stale-green.md`, `2026-11-11-exec-cache-fix.md`.
 
+12. **[RESOLVED 2026-11-16] "The `exec` cache may never hit" (old #10) — the key includes Tupi's own session log**
+   - `fingerprint_with` excludes only `target/`, `.git/`, `.brain/` and `.agents/tupi/` (`crates/tupi-tools/src/tools/exec/render.rs:88`); `.tupi/sessions/<id>/log.jsonl` is appended on every tool interaction (measured 139,534 -> 141,168 bytes in 4s), so the key dies between any two `exec` calls. Four identical `exec kind=check package=tupi-kernel` in one session: zero hits.
+   - Not the process lifetime: one `ExecTool` per registry (`crates/tupi-tools/src/lib.rs:293`).
+   - Also dead: `ToolsOptions::{exec_cache, web_cache}` claim a "cache persistente" (`lib.rs:57-60`), default `true` (`:89-90`), and are read nowhere.
+   - Report: `.agents/results/skeptic/2026-11-16-exec-cache-never-hits.md`.
+
 ## Open Systemic Risks (unfalsified — do not trust)
 
 8. **[OPEN] Universal `repeat="allow"` pruning pointer invites non-idempotent re-execution (`tupi-domain/src/context.rs:284-338`)**
@@ -32,11 +38,11 @@
 
 9. **[OPEN] `tools::workflow::tests` (6 tests) fail on this tree** — the catalog returns zero `WorkflowSource::Native` entries while `every_native_workflow_is_valid_ron_in_configs` passes. Not caused by the exec change (different module); **not verified as pre-existing** (no git in session). Falsifier: `cargo test -p tupi-tools --lib tools::workflow` on a clean checkout.
 
-10. **[OPEN] The `exec` cache may never hit — pure cost, zero reuse**
-    - Five identical `exec kind=check package=tupi-tools` calls in one session; none printed `em cache há`.
-    - The cap is not the cause: a temporary probe measured `fingerprint(<workspace root>, 5_001) = Some(64)` in 0.01s.
-    - Hypotheses: (i) `ExecTool`/process is recreated per call and the in-RAM `Mutex<Option<Cached>>` dies; (ii) some file under the root changes between calls.
-    - If (i) holds, every `exec` pays ~10 ms of walk plus a full content read for nothing. Falsifier: an integration test that instantiates `ExecTool` and calls `call` twice on the same instance.
+10. **[OPEN] Closing the `exec` cache miss activates a stale-green: the key ignores everything outside the root**
+    - `fingerprint` hashes only the `RUSTUP_TOOLCHAIN` *name* (`crates/tupi-tools/src/tools/exec/render.rs:39-45`), never the resolved toolchain: `rustup update` swaps the compiler without touching a byte in the key.
+    - `~/.cargo/config.toml`, `CARGO_HOME`, `CARGO_NET_OFFLINE`, `SQLX_OFFLINE`, `DATABASE_URL`, `CC`/`CFLAGS` and `PATH` are absent from the key; a cached `ok` outlives all of them.
+    - The hit path has no end-to-end test: `exec/tests.rs:177` hands an age to `sections_for`; nothing calls `call` twice and asserts `em cache há`.
+    - Falsifier: exclude `.tupi/`, run the same `exec` twice (hit), then `rustup update` + repeat — a hit across a different compiler proves the stale-green.
 
 11. **[OPEN] `.agents/tupi/` is the one exclusion without proof** — it is the tool's own state (`facts.jsonl`, `pending.jsonl`, `debug/`); no lexical hit shows a test reading it as input, but if one ever does, the exclusion becomes a silent hole and nothing fails. Guard today only pins the exclusion (`fingerprint_ignores_the_agents_own_bookkeeping`).
 

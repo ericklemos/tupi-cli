@@ -24,12 +24,19 @@ const MAX_TEXT_BYTES: usize = 512 * 1024;
 const PROMPT_PREVIEW_BYTES: usize = 4 * 1024;
 const ROTATE_BYTES: u64 = 32 * 1024 * 1024;
 const ROTATE_KEEP: usize = 3;
+/// Tool cujas execuções ganham arquivo próprio (bifurcação).
+const SHELL_TOOL: &str = "shell";
+/// Nome do arquivo irmão que recebe só as execuções da tool `shell`.
+pub const SHELL_FILE: &str = "telemetry.shell.jsonl";
+/// Variável que troca o destino do arquivo bifurcado.
+const SHELL_PATH_ENV: &str = "TUPI_TELEMETRY_SHELL_PATH";
 
 /// Handle barato e clonável para a telemetria. Quando desligado, todos os
 /// métodos são praticamente no-op.
 #[derive(Clone)]
 pub struct Telemetry {
     inner: Arc<Inner>,
+    shell: Option<Arc<Inner>>,
 }
 
 struct Inner {
@@ -98,64 +105,42 @@ impl Telemetry {
                 path: None,
                 stats: Stats::default(),
             }),
+            shell: None,
         }
     }
 
     /// Abre o caminho em modo append. Nunca falha: em erro, devolve uma
     /// telemetria desligada e registra um warning no log textual.
     pub fn open(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref().to_path_buf();
+        Self::open_paired(path.as_ref(), None)
+    }
 
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && let Err(error) = create_dir(parent)
-        {
-            tracing::warn!(%error, path = %parent.display(), "telemetria desligada");
+    /// Abre o arquivo principal e bifurca as execuções da tool `shell` para
+    /// `shell_path`. Os dois arquivos compartilham o `run` e numeram `seq` de
+    /// forma independente.
+    pub fn open_with_shell(path: impl AsRef<Path>, shell_path: impl AsRef<Path>) -> Self {
+        Self::open_paired(path.as_ref(), Some(shell_path.as_ref()))
+    }
+
+    /// Fecha o par: erro ao abrir o principal desliga tudo; erro só no arquivo
+    /// bifurcado desliga apenas a bifurcação.
+    fn open_paired(path: &Path, shell_path: Option<&Path>) -> Self {
+        let run = run_id();
+        let Some(inner) = open_sink(path, &run, "tupi-telemetry") else {
             return Self::disabled();
-        }
-
-        if let Err(error) = trim(&path) {
-            tracing::warn!(%error, path = %path.display(), "falha ao cortar telemetria");
-        }
-
-        let file = match open_file(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "telemetria desligada");
-                return Self::disabled();
-            }
         };
 
-        let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
-        let writer_path = path.clone();
-        let joiner = std::thread::Builder::new()
-            .name("tupi-telemetry".to_string())
-            .spawn(move || writer(file, writer_path, receiver));
+        let shell = shell_path
+            .filter(|shell| *shell != path)
+            .and_then(|shell| open_sink(shell, &run, "tupi-telemetry-shell"));
 
-        let joiner = match joiner {
-            Ok(joiner) => joiner,
-            Err(error) => {
-                tracing::warn!(%error, "telemetria desligada");
-                return Self::disabled();
-            }
-        };
-
-        Self {
-            inner: Arc::new(Inner {
-                sender: Some(sender),
-                joiner: Mutex::new(Some(joiner)),
-                seq: Mutex::new(0),
-                run: run_id(),
-                enabled: AtomicBool::new(true),
-                path: Some(path),
-                stats: Stats::default(),
-            }),
-        }
+        Self { inner, shell }
     }
 
     /// Respeita TUPI_TELEMETRY (0/off/false desliga), TUPI_TELEMETRY_PATH
-    /// (troca o destino) e TUPI_TELEMETRY_BODY (1/on/true/yes guarda o corpo
-    /// do prompt; desligado por padrão).
+    /// (troca o destino), TUPI_TELEMETRY_BODY (1/on/true/yes guarda o corpo do
+    /// prompt; desligado por padrão) e TUPI_TELEMETRY_SHELL_PATH (troca o
+    /// arquivo bifurcado das execuções da tool `shell`).
     pub fn from_env(default_path: PathBuf) -> Self {
         if let Ok(value) = std::env::var("TUPI_TELEMETRY")
             && matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
@@ -166,7 +151,11 @@ impl Telemetry {
         let path = std::env::var_os("TUPI_TELEMETRY_PATH")
             .map(PathBuf::from)
             .unwrap_or(default_path);
-        Self::open(path)
+        let shell = std::env::var_os(SHELL_PATH_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| shell_path_for(&path));
+
+        Self::open_with_shell(path, shell)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -175,6 +164,11 @@ impl Telemetry {
 
     pub fn path(&self) -> Option<&Path> {
         self.inner.path.as_deref()
+    }
+
+    /// Caminho do arquivo bifurcado das execuções da tool `shell`, quando ligado.
+    pub fn shell_path(&self) -> Option<&Path> {
+        self.shell.as_deref().and_then(|shell| shell.path.as_deref())
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -193,8 +187,9 @@ impl Telemetry {
         }
     }
 
-    /// Serializa e enfileira um evento. Nunca bloqueia; se a fila encher, a
-    /// linha é contada como descartada.
+    /// Serializa e enfileira um evento no arquivo principal. As execuções da
+    /// tool `shell` são copiadas também para o arquivo bifurcado. Nunca
+    /// bloqueia; se a fila encher, a linha é contada como descartada.
     pub fn record(&self, event: TelemetryEvent) {
         if !self.is_enabled() {
             return;
@@ -202,47 +197,19 @@ impl Telemetry {
 
         event.absorb(&self.inner.stats);
 
-        let mut seq = self
-            .inner
-            .seq
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next = *seq + 1;
-
-        let mut value = match serde_json::to_value(&event) {
+        let value = match serde_json::to_value(&event) {
             Ok(value) => value,
             Err(_) => return,
         };
+        let ts_ms = now_ms().min(u64::MAX as u128) as u64;
 
-        if let Some(map) = value.as_object_mut() {
-            map.insert("schema".to_string(), serde_json::json!(SCHEMA));
-            map.insert(
-                "ts_ms".to_string(),
-                serde_json::json!(now_ms().min(u64::MAX as u128) as u64),
-            );
-            map.insert("seq".to_string(), serde_json::json!(next));
-            map.insert("run".to_string(), serde_json::json!(self.inner.run));
-        }
+        // O principal recebe tudo; o bifurcado só as execuções da tool `shell`.
+        write_line(&self.inner, &value, ts_ms);
 
-        let mut bytes = match serde_json::to_vec(&value) {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
-        bytes.push(b'\n');
-
-        let Some(sender) = self.inner.sender.as_ref() else {
-            return;
-        };
-
-        match sender.try_send(bytes) {
-            Ok(()) => *seq = next,
-            Err(TrySendError::Full(_)) => {
-                self.inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.inner.enabled.store(false, Ordering::Relaxed);
-                self.inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        if is_shell_tool(&event)
+            && let Some(shell) = self.shell.as_ref()
+        {
+            write_line(shell, &value, ts_ms);
         }
     }
 
@@ -350,6 +317,7 @@ pub struct RunStarted {
     pub root: String,
     pub state_dir: String,
     pub telemetry_path: Option<String>,
+    pub telemetry_shell_path: Option<String>,
     pub log_filter: String,
     pub max_tokens: usize,
     pub max_tool_steps: usize,
@@ -1002,6 +970,12 @@ fn run_id() -> String {
     format!("{}-{}", now_ms(), std::process::id())
 }
 
+/// Arquivo bifurcado que acompanha o principal: `telemetry.jsonl` vira
+/// `telemetry.shell.jsonl` no mesmo diretório.
+pub fn shell_path_for(main: &Path) -> PathBuf {
+    main.with_file_name(SHELL_FILE)
+}
+
 fn create_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1013,6 +987,54 @@ fn create_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         std::fs::create_dir_all(path)
+    }
+}
+
+/// Um evento só vai para o arquivo bifurcado quando vem da tool `shell`.
+fn is_shell_tool(event: &TelemetryEvent) -> bool {
+    match event {
+        TelemetryEvent::ToolStarted(started) => started.name == SHELL_TOOL,
+        TelemetryEvent::ToolFinished(finished) => finished.name == SHELL_TOOL,
+        _ => false,
+    }
+}
+
+/// Serializa `base` com o envelope daquele sink e enfileira. O `seq` é por
+/// arquivo; `ts_ms` e `run` são iguais nas duas cópias.
+fn write_line(inner: &Inner, base: &serde_json::Value, ts_ms: u64) {
+    let Some(sender) = inner.sender.as_ref() else {
+        return;
+    };
+
+    let mut seq = inner
+        .seq
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let next = *seq + 1;
+
+    let mut value = base.clone();
+    if let Some(map) = value.as_object_mut() {
+        map.insert("schema".to_string(), serde_json::json!(SCHEMA));
+        map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
+        map.insert("seq".to_string(), serde_json::json!(next));
+        map.insert("run".to_string(), serde_json::json!(inner.run));
+    }
+
+    let mut bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    bytes.push(b'\n');
+
+    match sender.try_send(bytes) {
+        Ok(()) => *seq = next,
+        Err(TrySendError::Full(_)) => {
+            inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            inner.enabled.store(false, Ordering::Relaxed);
+            inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1035,6 +1057,54 @@ fn open_file(path: &Path) -> std::io::Result<File> {
     }
 
     Ok(file)
+}
+
+/// Cria o diretório, corta o arquivo e sobe a thread de escrita de um sink.
+/// Qualquer falha devolve `None` e desliga só aquele arquivo.
+fn open_sink(path: &Path, run: &str, thread: &str) -> Option<Arc<Inner>> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = create_dir(parent)
+    {
+        tracing::warn!(%error, path = %parent.display(), "telemetria desligada");
+        return None;
+    }
+
+    if let Err(error) = trim(path) {
+        tracing::warn!(%error, path = %path.display(), "falha ao cortar telemetria");
+    }
+
+    let file = match open_file(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "telemetria desligada");
+            return None;
+        }
+    };
+
+    let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
+    let writer_path = path.to_path_buf();
+    let joiner = std::thread::Builder::new()
+        .name(thread.to_string())
+        .spawn(move || writer(file, writer_path, receiver));
+
+    let joiner = match joiner {
+        Ok(joiner) => joiner,
+        Err(error) => {
+            tracing::warn!(%error, "telemetria desligada");
+            return None;
+        }
+    };
+
+    Some(Arc::new(Inner {
+        sender: Some(sender),
+        joiner: Mutex::new(Some(joiner)),
+        seq: Mutex::new(0),
+        run: run.to_string(),
+        enabled: AtomicBool::new(true),
+        path: Some(path.to_path_buf()),
+        stats: Stats::default(),
+    }))
 }
 
 fn writer(file: File, path: PathBuf, receiver: Receiver<Vec<u8>>) {
@@ -1351,5 +1421,49 @@ mod tests {
         assert!(truncated("> Resposta truncada: 2 seções omitidas", false));
         assert!(truncated("texto", true));
         assert!(!truncated("texto", false));
+    }
+
+    fn tool_started(name: &str) -> TelemetryEvent {
+        TelemetryEvent::ToolStarted(ToolStarted {
+            request: 1,
+            call: "c1".to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            arguments_chars: 2,
+            arguments_bytes: 2,
+            truncated: false,
+            summary: String::new(),
+        })
+    }
+
+    #[test]
+    fn shell_executions_are_forked_to_their_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("telemetry.jsonl");
+        let shell = dir.path().join(SHELL_FILE);
+        let telemetry = Telemetry::open_with_shell(&main, &shell);
+
+        telemetry.record(event("history"));
+        telemetry.record(tool_started(SHELL_TOOL));
+        telemetry.record(tool_started("read"));
+        drop(telemetry);
+
+        let main = line_events(&main);
+        let forked = line_events(&shell);
+        assert_eq!(main.len(), 3);
+        assert_eq!(forked.len(), 1);
+        assert_eq!(forked[0]["event"], "tool_started");
+        assert_eq!(forked[0]["seq"], 1);
+        assert_eq!(forked[0]["schema"], SCHEMA);
+        assert_eq!(forked[0]["run"], main[0]["run"]);
+    }
+
+    #[test]
+    fn the_shell_fork_is_a_sibling_of_the_main_file() {
+        let path = shell_path_for(Path::new("/repo/.agents/tupi/debug/telemetry.jsonl"));
+        assert_eq!(
+            path,
+            PathBuf::from("/repo/.agents/tupi/debug/telemetry.shell.jsonl")
+        );
     }
 }

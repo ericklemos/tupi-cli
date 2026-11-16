@@ -411,6 +411,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|path| path.display().to_string());
     let state_label = state_dir().display().to_string();
     let telemetry_path = telemetry.path().map(|path| path.display().to_string());
+    let telemetry_shell_path = telemetry
+        .shell_path()
+        .map(|path| path.display().to_string());
 
     telemetry.record(tupi_app::telemetry::TelemetryEvent::RunStarted(
         tupi_app::telemetry::RunStarted {
@@ -421,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
             root: root_label,
             state_dir: state_label,
             telemetry_path,
+            telemetry_shell_path,
             log_filter: config.log_filter.clone(),
             max_tokens: tokens.max_tokens as usize,
             max_tool_steps: tool_limits.max_tool_steps,

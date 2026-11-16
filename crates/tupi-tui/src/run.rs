@@ -1209,18 +1209,23 @@ fn draw_details(
         }
     }
 
-    /// Placar das tools do turno, ao lado do contexto. `None` quando o turno
-    /// não chamou nenhuma tool: rodapé sem tool continua idêntico.
-    fn placar_text(state: &ChatState) -> Option<String> {
+    /// Placar das tools do turno, ao lado do contexto: total em cinza e, se
+    /// houve falha, o marcador em vermelho. `None` quando o turno não chamou
+    /// nenhuma tool — rodapé sem tool continua idêntico ao de antes.
+    fn placar_spans(state: &ChatState) -> Option<(Vec<Span<'static>>, u16)> {
         let (total, failures) = state.turn_tool_stats();
         if total == 0 {
             return None;
         }
-        Some(if failures > 0 {
-            format!("⚙ {total} {failures}✗")
-        } else {
-            format!("⚙ {total}")
-        })
+        let head = format!("⚙ {total}");
+        let mut width = head.chars().count();
+        let mut spans = vec![Span::styled(head, Style::default().fg(Color::DarkGray))];
+        if failures > 0 {
+            let tail = format!(" {failures}✗");
+            width += tail.chars().count();
+            spans.push(Span::styled(tail, Style::default().fg(Color::Red)));
+        }
+        Some((spans, width as u16))
     }
 
     if area.width == 0 || area.height == 0 {
@@ -1280,11 +1285,11 @@ fn draw_details(
             None => format!("{} tokens", format_compact_tokens(ctx.tokens)),
         };
 
-        let placar = placar_text(state);
+        let placar = placar_spans(state);
         let placar_width = placar
             .as_ref()
-            .map(|text| text.chars().count() + 5)
-            .unwrap_or(0) as u16;
+            .map(|(_, width)| *width + 5)
+            .unwrap_or(0);
 
         let left_width = left.width() as u16;
         let ctx_width = ("ctx ".width() + value.width()) as u16;
@@ -1298,8 +1303,8 @@ fn draw_details(
                 format!("{hints}  ·  "),
                 Style::default().fg(Color::DarkGray),
             )];
-            if let Some(text) = placar.clone() {
-                spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+            if let Some((placar, _)) = &placar {
+                spans.extend(placar.iter().cloned());
                 spans.push(Span::raw("  ·  "));
             }
             spans.push(Span::styled("ctx ", Style::default().fg(Color::DarkGray)));
@@ -2679,6 +2684,121 @@ mod tests {
         let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
         assert!(row.contains("⚙ 3 1✗"), "{row}");
         assert!(row.contains("ctx 28.8k/32k"), "{row}");
+
+        // A falha do turno é o único pedaço do placar em vermelho.
+        let col = (0..120u16)
+            .find(|&x| buffer[(x, 0)].symbol() == "✗")
+            .expect("marcador de falha no placar");
+        assert_eq!(buffer[(col, 0)].fg, Color::Red);
+    }
+
+    #[test]
+    fn draw_details_drops_the_placar_before_the_context_when_narrow() {
+        let mut state = ChatState::default();
+        state.set_context(28_800, 32_000);
+        for id in ["c1", "c2", "c3"] {
+            state.push_tool_started(id, "read", "a.rs");
+            state.finish_tool(id, id != "c2", None);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(65, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_details(frame, &state, "modelo", "prov", frame.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..65).map(|x| buffer[(x, 0)].symbol()).collect();
+        let trimmed = row.trim_end();
+        // Em 65 colunas o placar é o primeiro a sair: o contexto fica.
+        assert!(trimmed.ends_with("ctx 28.8k/32k (90%)"), "{trimmed:?}");
+        assert!(!row.contains('⚙'), "placar deveria sair primeiro: {row:?}");
+    }
+
+    #[test]
+    fn copying_a_tool_line_keeps_the_displayed_duration() {
+        let mut state = ChatState::default();
+        state.push_tool_started("c1", "read", "src/a.rs");
+        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(1_250)));
+
+        let width = 80u16;
+        let rows = transcript_rows(
+            &state.lines,
+            width,
+            false,
+            &mut crate::markdown::Cache::default(),
+        );
+        let target = rows
+            .iter()
+            .position(|row| row_text(row).contains("read · src/a.rs"))
+            .expect("linha da tool");
+        state.view.set(Some(crate::selection::TranscriptView {
+            rows: rows.len(),
+            start: 0,
+            width,
+            area: Rect::new(0, 0, width, 6),
+        }));
+
+        let selection = crate::selection::Selection {
+            anchor: (target, 0),
+            cursor: (target, width - 1),
+        };
+        let copied = selected_text(&state, selection).expect("texto copiado");
+
+        // Copiar a linha devolve o que está na tela: nome, resumo, tempo e ✓.
+        assert!(copied.contains("read · src/a.rs"), "{copied:?}");
+        assert!(copied.contains("1,2s"), "{copied:?}");
+        assert!(copied.contains('✓'), "{copied:?}");
+    }
+
+    /// Revisão visual da entrega: imprime o transcript de um turno com várias
+    /// tools, um `pipeline` com sub-chamadas e uma tool em voo.
+    /// `cargo test -p tupi-tui --lib -- --ignored --nocapture visual_review`
+    #[test]
+    #[ignore]
+    fn visual_review_of_a_multi_tool_turn() {
+        let mut state = ChatState::default();
+        state.push_user("investigue o bug do parser e rode os testes");
+        state.push_tool_started("c1", "read", "src/parser.rs");
+        state.finish_tool("c1", true, Some(std::time::Duration::from_millis(320)));
+        state.push_tool_started("c2", "search", "fn parse");
+        state.finish_tool("c2", true, Some(std::time::Duration::from_millis(880)));
+        state.push_tool_started("c3", "map", "crates/tupi-parser");
+        state.finish_tool("c3", false, Some(std::time::Duration::from_secs(2)));
+
+        // Pipeline: pai mais duas sub-chamadas, identificadas pelo `#` no id.
+        state.push_tool_started("p1", "pipeline", "corrigir e testar");
+        state.push_tool_started("p1#0.0", "edit", "src/parser.rs");
+        state.finish_tool("p1#0.0", true, Some(std::time::Duration::from_millis(600)));
+        state.push_tool_started("p1#0.1", "test_many", "parser");
+        state.finish_tool(
+            "p1#0.1",
+            true,
+            Some(std::time::Duration::from_millis(1_400)),
+        );
+        state.finish_tool("p1", true, Some(std::time::Duration::from_secs(2)));
+
+        // Tool em voo: o spinner e o tempo crescem com o `now` do tick.
+        state.push_tool_started("c4", "exec", "cargo test");
+        let started = std::time::Instant::now();
+        let now = started + std::time::Duration::from_millis(1_200);
+
+        let transcript = transcript_layout_at(
+            &state.lines,
+            100,
+            false,
+            &mut crate::markdown::Cache::default(),
+            now,
+        );
+        let rendered = transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{rendered}");
     }
 
     #[test]

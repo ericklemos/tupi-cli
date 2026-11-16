@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "slug": "tui-tool-usage",
-  "updated_at": 1794704954,
+  "updated_at": 1794840060,
   "tasks": [
     {
       "id": "T1",
@@ -164,7 +164,7 @@
         "Se `call_id` não contiver '#', a chamada é top-level: o detector de profundidade não pode depender do NOME da tool ('pipeline' pode aparecer em tools de usuário)."
       ],
       "parallel": false,
-      "status": "in_progress",
+      "status": "done",
       "subtasks": [
         {
           "id": "T5.1",
@@ -188,7 +188,7 @@
           "acceptance": "1 ou 2 tools consecutivas renderizam exatamente como antes (linha única, sem cabeçalho de grupo).",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -201,7 +201,7 @@
         "Placar zero não deve aparecer: sem tool no turno, o rodapé continua idêntico ao atual."
       ],
       "parallel": false,
-      "status": "open",
+      "status": "done",
       "subtasks": [
         {
           "id": "T6.1",
@@ -209,7 +209,7 @@
           "acceptance": "Com 3 tools e 1 falha o rodapé mostra total 3 e o marcador de falha em vermelho.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T6.2",
@@ -217,7 +217,7 @@
           "acceptance": "O teste `draw_details_prioritizes_context_over_hints_when_narrow` continua passando em 65 colunas; o placar é o primeiro a sair.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     },
@@ -230,7 +230,7 @@
         "A seleção usa `transcript_rows` com a MESMA largura gravada em `state.view`; um teste de cópia sobre linha de tool pega divergência entre rows e view antes do usuário."
       ],
       "parallel": false,
-      "status": "open",
+      "status": "done",
       "subtasks": [
         {
           "id": "T7.1",
@@ -238,7 +238,7 @@
           "acceptance": "`cargo test` do workspace passa (no mínimo `-p tupi-tui -p tupi-domain -p tupi-app -p tupi-web`) e `cargo clippy --all-targets` sem novos avisos.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T7.2",
@@ -246,7 +246,7 @@
           "acceptance": "Existe teste que copia uma linha de tool e obtém o texto exibido, incluindo a duração.",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         },
         {
           "id": "T7.3",
@@ -254,7 +254,7 @@
           "acceptance": "Saída de `cargo run` com um turno multi-tool conferida e descrita (spinner animando, tempo congelando ao terminar, sub-calls indentadas).",
           "touches": [],
           "acceptance_test": null,
-          "status": "open"
+          "status": "done"
         }
       ]
     }

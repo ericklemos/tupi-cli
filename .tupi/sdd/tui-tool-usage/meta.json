@@ -2,7 +2,7 @@
   "schema": 1,
   "slug": "tui-tool-usage",
   "title": "Exibição viva do uso das ferramentas na TUI",
-  "status": "failed",
+  "status": "completed",
   "goal": "Tornar o uso das ferramentas visível e vivo apenas na TUI (crates/tupi-tui): cada chamada de tool passa a mostrar tempo decorrido ao vivo, resultado final com duração, ícone/cor por categoria e agrupamento por turno, com sub-chamadas de `pipeline` indentadas sob o pai em vez de competirem em pé de igualdade.\n\nEstado atual (fontes):\n- `crates/tupi-tui/src/run.rs:1549-1580` — cada tool é uma linha `⚙ nome · resumo ✓/✗/…`, sem tempo, sem categoria, sem hierarquia.\n- `crates/tupi-tui/src/state.rs:27-49` — `ChatEntry::Tool { call_id, name, summary, ok }`: única informação disponível.\n- `crates/tupi-tui/src/state.rs:147-163` / `:188-197` — `push_tool_started` e `finish_tool` apenas gravam `ok`.\n- `crates/tupi-tui/src/run.rs:50-518` — `run_with_dashboard`: desenha no topo do loop e bloqueia em `tokio::select!` (chaves + eventos), então nada anima sem evento novo.\n- `crates/tupi-domain/src/lib.rs:172-179` — `Event::ToolFinished { request_id, call_id, name, ok, summary }`, sem duração.\n- `crates/tupi-app/src/pipeline.rs:275-292` — `publish_finished` já tem `duration` em mãos (medida em `:170-200`) e a descarta ao publicar.\n- `crates/tupi-tui/src/metrics.rs:114-121` — `format_duration` já formata segundos/minutos com vírgula decimal: reutilizar.\nEscopo: só TUI como superfície final; alteração mínima e aditiva no evento de domínio para carregar a duração; dashboard web continua funcionando sem exibir duração.",
   "constraints": [
     "Superfície de saída é apenas a TUI (crates/tupi-tui); nenhuma mudança visual no dashboard web (crates/tupi-web).",
@@ -27,14 +27,19 @@
     "`ChatEntry::Tool` não guarda `Instant`: o relógio tem que nascer em `push_tool_started` (fonte única no estado), nunca no render, senão cada frame reinicia o cronômetro."
   ],
   "created_at": 1794703879,
-  "updated_at": 1794704954,
+  "updated_at": 1794840060,
   "closed_at": 1794703955,
-  "conclusion": "Execução SDD: 1/20 subtasks ok\n- T1.1 ok 24.2s — Adicionei `duration_us: u64` a `Event::ToolFinished` em `crates/tupi-domain/src/lib.rs`, com doc comment explicando a un\n- T1.2 falhou: limite de 24 passos\n",
+  "conclusion": "Documentação atualizada e reindexada (14 arquivos, 0 vetores pendentes).\n\n**Conclusão para `result.md` (≤10 linhas):**\n\n- O código desta entrega está no lugar (`duration_us` no `Event::ToolFinished`, medição em `app.rs`/`pipeline.rs`, relógio/duração no `ChatState`, linha viva com glifo, spinner, tempo e grupos em `transcript_layout_at`, tick de 100 ms), apesar de `meta.json`/`result.md` registrarem só 1/20 subtasks ok.\n- Criei `docs/features/tui-tool-usage.md`: formato da linha, onde mora cada peça, fluxo do dado (medido por quem executa → evento em micros com piso 1 µs → estado → render), invariantes (row com owner única, relógio nasce em `push_tool_started`, sem tick ocioso, web ignora a duração) e limitações.\n- `docs/index.md`: nova seção *Interface (TUI)* apontando para o documento.\n- `docs/conventions.md`: duas convenções duráveis — texto novo no transcript nasce em `transcript_layout_at` com `owners`; tempo é medido por quem executa, nunca derivado no consumidor; formato visual da TUI é contrato de teste.\n- `docs/architecture.md`: fronteira da medição (`duration_us` no evento) e componente *Transcript da TUI*.\n- Nenhum arquivo fora de `docs_folders` foi tocado.",
   "docs_feedback": {
-    "status": "skipped",
-    "files": [],
-    "reason": "plano falhou; docs não realimentados",
-    "reindexed": false
+    "status": "updated",
+    "files": [
+      "docs/features/tui-tool-usage.md",
+      "docs/index.md",
+      "docs/conventions.md",
+      "docs/architecture.md"
+    ],
+    "reason": "Documentação atualizada e reindexada (14 arquivos, 0 vetores pendentes).\n\n**Conclusão para `result.md` (≤10 linhas):**\n\n- O código desta entrega está no lugar (`duration_us` no `Event::ToolFinished`, medição em `app.rs`/`pipeline.rs`, relógio/duração no `ChatState`, linha viva com glifo, spinner, tempo e grupos em `transcript_layout_at`, tick de 100 ms), apesar de `meta.json`/`result.md` registrarem só 1/20 subtasks ok.\n- Criei `docs/features/tui-tool-usage.md`: formato da linha, onde mora cada peça, fluxo do dado (medido por quem executa → evento em micros com piso 1 µs → estado → render), invariantes (row com owner única, relógio nasce em `push_tool_started`, sem tick ocioso, web ignora a duração) e limitações.\n- `docs/index.md`: nova seção *Interface (TUI)* apontando para o documento.\n- `docs/conventions.md`: duas convenções duráveis — texto novo no transcript nasce em `transcript_layout_at` com `owners`; tempo é medido por quem executa, nunca derivado no consumidor; formato visual da TUI é contrato de teste.\n- `docs/architecture.md`: fronteira da medição (`duration_us` no evento) e componente *Transcript da TUI*.\n- Nenhum arquivo fora de `docs_folders` foi tocado.",
+    "reindexed": true
   },
   "activities": [
     {
@@ -318,6 +323,131 @@
       "at": 1794704954,
       "actor": "sdd",
       "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 25,
+      "at": 1794840009,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 26,
+      "at": 1794840011,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 27,
+      "at": 1794840015,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 28,
+      "at": 1794840051,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 29,
+      "at": 1794840054,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 30,
+      "at": 1794840060,
+      "actor": "sdd",
+      "action": "progress_updated",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 31,
+      "at": 1794840060,
+      "actor": "runner",
+      "action": "plan_completed",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 32,
+      "at": 1794840060,
+      "actor": "docs-agent",
+      "action": "docs_feedback_started",
+      "task": null,
+      "subtask": null,
+      "status": "info",
+      "duration_ms": null,
+      "files": [],
+      "note": null
+    },
+    {
+      "seq": 33,
+      "at": 1794840153,
+      "actor": "docs-agent",
+      "action": "docs_written",
+      "task": null,
+      "subtask": null,
+      "status": "ok",
+      "duration_ms": null,
+      "files": [
+        "docs/features/tui-tool-usage.md",
+        "docs/index.md",
+        "docs/conventions.md",
+        "docs/architecture.md"
+      ],
+      "note": "Documentação atualizada e reindexada (14 arquivos, 0 vetores pendentes).\n\n**Conclusão para `result.md` (≤10 linhas):**\n\n- O código desta entrega está no lugar (`duration_us` no `Event::ToolFinished`, medição em `app.rs`/`pipeline.rs`, relógio/duração no `ChatState`, linha viva com glifo, spinner, tempo e grupos em `transcript_layout_at`, tick de 100 ms), apesar de `meta.json`/`result.md` registrarem só 1/20 subtasks ok.\n- Criei `docs/features/tui-tool-usage.md`: formato da linha, onde mora cada peça, fluxo do dado (medido por quem executa → evento em micros com piso 1 µs → estado → render), invariantes (row com owner única, relógio nasce em `push_tool_started`, sem tick ocioso, web ignora a duração) e limitações.\n- `docs/index.md`: nova seção *Interface (TUI)* apontando para o documento.\n- `docs/conventions.md`: duas convenções duráveis — texto novo no transcript nasce em `transcript_layout_at` com `owners`; tempo é medido por quem executa, nunca derivado no consumidor; formato visual da TUI é contrato de teste.\n- `docs/architecture.md`: fronteira da medição (`duration_us` no evento) e componente *Transcript da TUI*.\n- Nenhum arquivo fora de `docs_folders` foi tocado."
+    },
+    {
+      "seq": 34,
+      "at": 1794840153,
+      "actor": "runner",
+      "action": "docs_reindexed",
       "task": null,
       "subtask": null,
       "status": "ok",

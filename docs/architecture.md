@@ -21,6 +21,9 @@ crates:
 - Efeito colateral (rede, arquivo, banco) fica na borda: `tupi` e `tupi-tools`.
 - O root das leituras de tool é o diretório onde o Tupi foi aberto; caminho que
   escapa dele é recusado.
+- Medição de tempo pertence a quem executa: `Event::ToolFinished` carrega
+  `duration_us` medido por `tupi-app`; o consumidor formata o número, nunca o
+  reinventa a partir de `Instant` (o evento atravessa o bus e chega tarde).
 - Subcomando de manutenção não sobe a pilha da TUI: `tupi install` responde no
   `main` antes de env, redb e provider (ver
   [`features/tupi-install.md`](features/tupi-install.md)).
@@ -32,6 +35,9 @@ crates:
   [`perf/baseline.md`](perf/baseline.md).
 - **Tools** (`tupi-tools`): `read`/`search`/`map`/`peek`, edição com hash,
   `exec`/`test_many`, grafo e web. `AGENTS.md` é gerado por `setup`.
+- **Transcript da TUI**: `ChatState` guarda o relógio e a duração de cada tool;
+  `transcript_layout_at` desenha linha viva, glifo por categoria e indentação de
+  sub-chamadas (ver [`features/tui-tool-usage.md`](features/tui-tool-usage.md)).
 - **Sessão**: redb local (`$XDG_DATA_HOME/tupi/tupi.redb`), ledger e state por
   repositório.
 - **Instalação**: `crates/tupi/src/install.rs` — `bin_dir`, `detect_shell`,

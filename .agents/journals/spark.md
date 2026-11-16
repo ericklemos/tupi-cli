@@ -164,3 +164,36 @@ para *conhecimento*. Servir o córtex a um CLI concorrente é treinar o cliente 
 não precisar de nós.
 
 **The Hidden Potential (da recusa):** a restrição **melhora** a tese. O espaço é
+## 2026-11-16 (sessão 6) - Tupi Veredito: o valor não está em escrever, está em decidir
+
+**The "Crazy" Idea:** O `d1-2B` está catalogado no projeto como "reranker da
+etapa 3" (`docs/superpowers/specs/2026-11-14-docs-rag-summaries-design.md:136-152`).
+Ele não é reranker: é um modelo de **decisão** — responde `noul`/`choice`/`score`
+sobre texto, JSON, imagem, vídeo e áudio, e não é modelo de chat. A ideia é
+promovê-lo de apêndice a **camada de decisão do binário**: todo ponto onde o
+Tupi escolhe (trecho é `match`? resultado responde à intenção? qual workflow?
+esta tool call deveria acontecer?) vira uma pergunta nomeada, respondida local,
+com confiança, antes de qualquer token. O provider caro deixa de ser motor e
+passa a responder **só as perguntas que o local errou com confiança baixa** — a
+Escada da sessão 4 ganha finalmente o seu contrato.
+
+**The Hidden Potential:** Hoje o `archive`/`investigate` — um pipeline de
+investigação inteiro — pede ao LFM3-1.7B um JSON array com `verdict`/`reason`
+(`crates/tupi-tools/src/archive/judge.rs:108-118`) e recebe três rótulos **sem
+nenhuma calibração** (`Verdict::parse`, `judge.rs:28-34`). E o `GeneratorSlot`
+só existe se houver pasta de docs configurada
+(`crates/tupi/src/main.rs:330` → `config.rs:326-328`): a inteligência local do
+Tupi está ligada por um interruptor de outro cômodo. Inverter a unidade de
+medida de "tokens economizados" (sessões 1–5) para **"decisões por real"** abre
+três mercados que só existem com gabarito: log de decisão auditável air-gapped,
+benchmark calibrado de decisões por dólar, e veredito como artefato de
+compliance.
+
+**First Step:** a bancada de A/B **já existe**. `judge_batch` cacheia por
+`(plan_hash, model, segment_id)` (`judge.rs:78-88`, tabela `VERDICTS`) e há teste
+provando que veredito não volta ao modelo (`judge.rs:178-240`). Rodar o mesmo
+plano com `model = lfm3-1.7b`, `d1-2b` e `deepseek` e dar `diff` nas três
+colunas: ≥20% de discordância com o caro certo = veredito é produto; ≥95% de
+concordância = o passo na nuvem era desperdício e o produto é economia. O
+experimento não pode dar errado. Doc: `.agents/results/spark/local-verdict-engine.md`.
+

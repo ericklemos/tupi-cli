@@ -1,0 +1,106 @@
+// Modo SDD: prompts e comportamento num só lugar.
+//
+// Este arquivo é EMBUTIDO no binário em tempo de compilação (build.rs de
+// tupi-kernel): não existe override por projeto, nem leitura em runtime, nem
+// env var. Mudar aqui exige rebuild de `tupi`.
+//
+// - `planning`: postura injetada no modo SDD, allowlist de tools do modo, trava
+//   do modo ao abrir o plano e budget default das tools.
+// - `execution`: textos usados pelos agentes e pelo handoff de execução.
+// - `tool`: contrato da tool `sdd` (ações e descrição por modo).
+// - `runner`: parâmetros do runner automático de subtasks.
+//
+// Todo campo é opcional. Omitir um texto equivale a não injetar nada; omitir
+// `planning.tools` equivale a não restringir por nome (vale a máscara de modo
+// de cada tool); omitir valores do `runner` mantém os defaults documentados
+// abaixo. Textos aceitam os placeholders descritos em cada bloco; `{{` e `}}`
+// escapam chaves literais.
+(
+    planning: (
+        // Postura anexada ao system prompt no modo SDD (somente leitura).
+        posture: "## Modo SDD (Planejamento)\n\nVocê está em modo SDD (somente leitura; edições e comandos estão bloqueados).\n1. Investigue o necessário com as tools de leitura/busca e faça perguntas objetivas de esclarecimento antes de propor soluções.\n2. Use a tool `sdd` (`upsert_spec`, `set_tasks`) para estruturar spec, restrições, nuances destiladas, tasks e subtasks autocontidas.\n3. Quando tiver contexto suficiente, avise em linguagem natural e pergunte se o usuário deseja continuar o debate ou fechar a spec.\n4. Só chame `sdd(action=\"close\")` após confirmação explícita do usuário.",
+        // Allowlist de tools do modo, por nome. Lista vazia = sem restrição
+        // adicional (só a máscara de modo de cada tool vale).
+        tools: [
+            "assert",
+            "clock",
+            "context_graph",
+            "diff",
+            "docs",
+            "env",
+            "facts",
+            "fetch",
+            "impact",
+            "map",
+            "peek",
+            "read",
+            "read_many",
+            "research",
+            "sdd",
+            "search",
+            "trace",
+            "websearch",
+            "why",
+            "workflow",
+        ],
+        // Trava o modo ao abrir o plano: sair de SDD exige concluir o fluxo.
+        lock_mode_on_open: true,
+        // Budget default de tokens das tools do modo. Omitido usa o padrão
+        // global das tools.
+        tool_budget_tokens: 2000,
+    ),
+    execution: (
+        // Prefixo do agente de implementação de uma subtask.
+        agent_prefix: "Você é um agente de implementação do tupi.\n\nImplemente exatamente a subtarefa descrita. Não edite o plano nem chame sdd.\nOutros agentes podem estar trabalhando em paralelo em outras partes do\nrepositório: trate o que já existe como verdade e não toque no que pertence a\noutra subtarefa. Use read/edit/exec como de costume.\n\nAo terminar, responda em até 3 linhas: o que mudou, arquivos e como verificou.",
+        // Prefixo do agente que realimenta a documentação.
+        docs_agent_prefix: "Você é o agente de documentação do Tupi. Leia o plano, consulte docs antes de escrever, só escreva sob docs_folders e responda uma conclusão curta.",
+        // Brief de execução de uma subtask. Placeholders: {subtask_id},
+        // {plan_title}, {plan_goal}, {constraints}, {nuances}, {next_step}.
+        subtask_brief: "Você é o agente de implementação da subtarefa {subtask_id}.\n\n# {plan_title}\nObjetivo: {plan_goal}\n{constraints}{nuances}{next_step}\nRegras:\n- Implemente apenas esta subtarefa; não toque no que pertence a outras.\n- Outros agentes podem estar trabalhando em paralelo em outras partes do repositório.\n- Não edite o plano nem chame sdd.\n- Ao terminar, responda em até 3 linhas com o que mudou e como verificou.\n",
+        // Brief do agente de documentação. Placeholder: {slug}.
+        docs_brief: "Você é o agente de documentação do plano SDD {slug}.\nLeia .tupi/sdd/{slug}/result.md, spec.md, tasks.json e meta.json.\nUse docs map/query/read para ver a documentação atual.\nSe o trabalho mudou conhecimento durável, atualize/crie arquivos sob docs_folders com docs write.\nSe nada mudou, não escreva nada.\nNo final, responda uma conclusão curta (até 10 linhas) para result.md.\nNão altere código, testes ou arquivos fora de docs_folders.",
+        // Handoff quando o plano ainda não foi executado (sem result.md).
+        // Placeholders: {slug}, {title}, {goal}, {constraints}, {nuances},
+        // {tasks}.
+        handoff_open: "SDD fechado. Inicie a execução seguindo exclusivamente o plano destilado abaixo (não reabra documentação já resolvida).\n\n# {title} (`{slug}`)\nObjetivo: {goal}\n{constraints}{nuances}\nTasks:\n{tasks}\n\nAtualize o progresso das tasks/subtasks via `sdd(action=\"progress\")` conforme concluir.",
+        // Handoff quando já existe relatório em .tupi/sdd/<slug>/result.md.
+        // Mesmos placeholders do handoff_open, mais {report}.
+        handoff_done: "SDD já executado com agentes. Use o relatório abaixo; não reexecute subtasks done.\n\n{report}\n\n# {title} (`{slug}`)\nObjetivo: {goal}\n{constraints}{nuances}\nTasks:\n{tasks}\n\nAtualize o progresso das tasks/subtasks via `sdd(action=\"progress\")` conforme concluir.",
+        // Relatório de execução do plano. Placeholders: {done}, {total},
+        // {unit} (tasks ou subtasks) e {lines}.
+        run_report: "Execução SDD: {done}/{total} {unit} ok\n{lines}",
+    ),
+    tool: (
+        // Ações aceitas no modo SDD (planejamento).
+        planning_actions: [
+            "upsert_spec",
+            "set_tasks",
+            "status",
+            "list",
+            "activate",
+            "close",
+            "progress",
+            "note",
+        ],
+        // Ações aceitas no modo Execution.
+        execution_actions: ["status", "list", "activate", "progress", "execute"],
+        // Descrição da tool no modo SDD.
+        planning_description: "Gerencia specs, tasks e subtasks de planejamento SDD (fonte de verdade em .tupi/sdd/<slug>/: meta.json e tasks.json). Antes de upsert_spec, consulte a tool docs e registre as fontes como caminho:inicio-fim em goal, constraints, nuances e details.",
+        // Descrição da tool no modo Execution.
+        execution_description: "Consulta e atualiza o progresso de specs SDD no modo execução: status, list, activate, progress e execute.",
+    ),
+    runner: (
+        // Subtasks simultâneas por stage.
+        max_parallel: 4,
+        // Passos máximos de cada agente de subtask.
+        agent_max_steps: 24,
+        // Teto de tempo de cada agente, em segundos.
+        agent_timeout_secs: 600,
+        // Fecha o plano e dispara o runner automaticamente.
+        auto_execute: true,
+        // Liga o agente de documentação ao fim da execução.
+        docs_agent: false,
+        // Grava o espelho markdown do plano em .agents/tupi/sdd/.
+        mirror_markdown: true,
+    ),
+)

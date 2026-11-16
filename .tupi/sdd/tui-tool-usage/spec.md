@@ -2,7 +2,7 @@
 
 # Exibição viva do uso das ferramentas na TUI (`tui-tool-usage`)
 
-**Status:** failed
+**Status:** completed
 
 ## Objetivo
 

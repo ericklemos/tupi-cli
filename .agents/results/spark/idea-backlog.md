@@ -107,3 +107,24 @@ não conhecimento.
 3. Quando uma 🟡 for implementada ou refutada, mover a linha para o fim da seção
    com `— resolvida` / `— refutada`, em vez de apagar.
 4. Qualquer ideia que dependa de expor o espaço a terceiros nasce 🔴 (§ restrição).
+
+## Sessão 6 — Decisão
+
+| # | Ideia | Estado | Doc / âncora |
+|---|---|---|---|
+| 6.1 | **Tupi Veredito** — camada de decisão local (`noul`/`choice`/`score` com confiança); o provider caro só responde o que o local errou | 🟢 | `local-verdict-engine.md`; `crates/tupi-kernel/src/generate.rs:23` |
+| 6.2 | **Arquivo multimodal** — d1 lê imagem/vídeo e d1-Omni lê áudio, no lugar de `CommandOcr`/`Transcriber` (hoje *shell-out*) | 🟡 | `archive/derive.rs:69-94` |
+| 6.3 | **Log de decisão auditável air-gapped** — "decidiu X, offline, confiança 0.93, hash do modelo Y" como artefato de compliance | 🟡 | reforça 5.8; deriva de 6.1 |
+| 6.4 | **Benchmark calibrado de decisões por dólar** — público, porque o gabarito já existe (`VERDICTS`) | 🟡 | `archive/store.rs`; complementa 2.4 |
+| 6.5 | **d1 como guardrail do loop de tools** — `noul` antes de efeito colateral | 🟡 | deriva de 6.1 |
+| 6.6 | **Spike do `/v1/systemone` em `llama-cpp-2`** — pré-requisito; se falhar, `Decider` sobre o `Generator` atual ainda vale | 🟠 | exige decisão sobre `llama-server` local |
+
+### Correções de fato (sessão 6)
+
+- **"O único consumidor dos dois modelos é a tool `docs`" está obsoleto.**
+  Consomem também `space/build.rs`, `tools/search/mod.rs:66` (embedder) e
+  `archive`/`investigate` (generator).
+- **O `GeneratorSlot` é gated por `docs_folders`**
+  (`crates/tupi/src/main.rs:330` → `config.rs:326-328`): sem pasta de docs, o
+  `archive` e o `investigate` ficam sem gerador — e o `Verdict` não tem campo de
+  confiança (`archive/judge.rs:13-17`).

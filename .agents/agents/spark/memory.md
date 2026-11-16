@@ -153,3 +153,25 @@ continua podendo virar cano — recibo é rede; conhecimento não é.)
   "cache por hash" e passa a ser "lint contínuo" — item 8.3 do backlog.
 - **Backlog completo de todas as ideias (sessões 1–5) com estado 🟢/🟡/🟠/🔴,
   gatilho e correções de fato:** `.agents/results/spark/idea-backlog.md`.
+
+## Sessão 6
+
+- **ESCOLHIDA — Tupi Veredito (decisões por real).** O `d1-2B` está rotulado no
+  projeto como "reranker da etapa 3"
+  (`docs/superpowers/specs/2026-11-14-docs-rag-summaries-design.md:136-152`), mas
+  é modelo de **decisão**, não de chat: responde `noul`/`choice`/`score` sobre
+  texto, JSON, imagem, vídeo e áudio. Tese: vira camada de decisão do binário
+  (`Decider` ao lado de `EmbedderSlot`/`GeneratorSlot`), com confiança, e o
+  provider caro só responde o que o local errou. Unidade de negócio muda de
+  "tokens economizados" para "decisões por real" — só decisão tem gabarito.
+  Doc: `.agents/results/spark/local-verdict-engine.md`.
+- **Fato que abriu a sessão:** `GeneratorSlot` só nasce se houver `docs_folders`
+  (`crates/tupi/src/main.rs:330` → `config.rs:326-328`), então `archive` e
+  `investigate` — que precisam do gerador — ficam sem ele por padrão. A
+  inteligência local está ligada por um interruptor de outro cômodo.
+- **Nano-teste quase grátis:** `judge_batch` já cacheia por
+  `(plan_hash, model, segment_id)` (`archive/judge.rs:78-88`), então dá para
+  A/B d1 vs. LFM3 vs. nuvem nos mesmos candidatos **sem código novo**. Não pode
+  dar errado: concordância = economia, discordância = calibração.
+- **Laterais vivas:** arquivo multimodal (d1 lê imagem/vídeo e o d1-Omni lê
+  áudio — hoje `CommandOcr { bin }` em `archive/derive.rs:69-94` chama binário
