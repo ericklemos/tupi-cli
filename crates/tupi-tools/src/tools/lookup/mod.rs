@@ -47,6 +47,10 @@ impl LookupTool {
 }
 
 impl Tool for LookupTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: NAME.to_string(),

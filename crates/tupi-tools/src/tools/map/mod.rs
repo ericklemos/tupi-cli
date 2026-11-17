@@ -145,6 +145,10 @@ fn dirs_sections(defs: &[&Def], incoming: &HashMap<&str, usize>) -> Vec<Section>
 }
 
 impl Tool for MapTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "map".to_string(),

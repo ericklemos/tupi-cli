@@ -56,6 +56,10 @@ fn evidence(defs: &[&crate::graph::Def]) -> String {
 }
 
 impl Tool for AssertTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "assert".to_string(),

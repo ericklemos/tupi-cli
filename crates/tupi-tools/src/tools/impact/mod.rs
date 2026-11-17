@@ -49,6 +49,10 @@ fn line_for(def: &Def) -> String {
 }
 
 impl Tool for ImpactTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "impact_check".to_string(),

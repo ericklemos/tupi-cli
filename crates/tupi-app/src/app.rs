@@ -2528,6 +2528,10 @@ mod prefix_tests {
         struct BigEcho;
 
         impl Tool for BigEcho {
+            fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+                tupi_kernel::Effect::ReadOnly
+            }
+
             fn spec(&self) -> ToolSpec {
                 ToolSpec {
                     name: "big".to_string(),
@@ -3347,6 +3351,10 @@ mod tests {
     }
 
     impl Tool for EchoTool {
+        fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+            tupi_kernel::Effect::ReadOnly
+        }
+
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: "echo".into(),
@@ -3769,6 +3777,10 @@ mod tests {
     struct SlowTool;
 
     impl Tool for SlowTool {
+        fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+            tupi_kernel::Effect::ReadOnly
+        }
+
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: "echo".into(),
@@ -3816,6 +3828,10 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         struct TrackedSlowTool(Arc<AtomicBool>);
         impl Tool for TrackedSlowTool {
+            fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+                tupi_kernel::Effect::ReadOnly
+            }
+
             fn spec(&self) -> ToolSpec {
                 ToolSpec {
                     name: "echo".to_string(),

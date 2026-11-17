@@ -149,6 +149,12 @@ pub trait Tool: Send + Sync {
 
     fn call(&self, arguments: Value) -> Result<String, ToolError>;
 
+    /// Conjunto de escrita da call. Declaração obrigatória e por call, tomada
+    /// dos mesmos argumentos que `call` executa: não existe default, então
+    /// omitir é erro de compilação. `Opaque` é o fallback explícito de quem não
+    /// consegue enumerar caminhos; `ReadOnly` só para quem não grava nada.
+    fn effect(&self, arguments: &Value) -> Effect;
+
     /// Descrição curta dos argumentos para a interface, sem expor o corpo lido.
     /// O padrão é o JSON compacto; a tool pode mostrar só o que importa.
     fn describe_call(&self, arguments: &Value) -> String {
@@ -158,22 +164,6 @@ pub trait Tool: Send + Sync {
             out.push('…');
         }
         out
-    }
-
-    /// A call altera o workspace (ou o estado durável): o runner não a
-    /// executa em paralelo com outra call da mesma step.
-    fn mutates(&self) -> bool {
-        false
-    }
-
-    /// Conjunto de escrita da call. O padrão deriva de `mutates()`: quem muta
-    /// sem declarar caminhos devolve `Opaque` (invalidação total), nunca vazio.
-    fn effect(&self, _arguments: &Value) -> Effect {
-        if self.mutates() {
-            Effect::Opaque
-        } else {
-            Effect::ReadOnly
-        }
     }
 
     /// Em quais modos a tool existe. Fail-closed: o padrão é só execução.
@@ -251,6 +241,10 @@ mod tests {
     struct EchoTool(&'static str);
 
     impl Tool for EchoTool {
+        fn effect(&self, _: &Value) -> Effect {
+            Effect::ReadOnly
+        }
+
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: self.0.to_string(),
@@ -339,6 +333,10 @@ mod tests {
 
         struct AllowedTool;
         impl Tool for AllowedTool {
+            fn effect(&self, _: &Value) -> Effect {
+                Effect::ReadOnly
+            }
+
             fn spec(&self) -> ToolSpec {
                 ToolSpec {
                     name: "read".into(),
@@ -377,6 +375,10 @@ mod tests {
         struct ModeSpecTool;
 
         impl Tool for ModeSpecTool {
+            fn effect(&self, _: &Value) -> Effect {
+                Effect::ReadOnly
+            }
+
             fn spec(&self) -> ToolSpec {
                 ToolSpec {
                     name: "sdd".into(),

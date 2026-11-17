@@ -84,6 +84,10 @@ fn byte_at_char(text: &str, chars: usize) -> usize {
 }
 
 impl Tool for PeekTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "peek".to_string(),

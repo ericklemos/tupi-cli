@@ -398,10 +398,6 @@ impl Tool for DocsTool {
             tupi_kernel::Effect::Opaque
         }
     }
-    fn mutates(&self) -> bool {
-        self.writable
-    }
-
     fn mode_mask(&self) -> tupi_kernel::ModeMask {
         tupi_kernel::ModeMask::SDD
     }

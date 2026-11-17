@@ -19,6 +19,8 @@ pub enum StateAction {
     Memory,
     Note,
     Task,
+    Record,
+    Forget,
     End,
 }
 
@@ -35,6 +37,8 @@ pub struct StateParams {
     pub symbol: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -185,6 +189,26 @@ impl StateTool {
         )
     }
 
+    fn fact_call(&self, params: &StateParams) -> Result<String, ToolError> {
+        let facts = crate::facts::FactsTool::new(
+            self.root_dir.clone(),
+            self.store.clone(),
+            self.default_budget_tokens,
+        );
+        let value = match params.action {
+            StateAction::Record => serde_json::json!({
+                "action": "record",
+                "text": params.text,
+                "tags": params.tags,
+            }),
+            _ => serde_json::json!({
+                "action": "forget",
+                "id": params.id,
+            }),
+        };
+        Tool::call(&facts, value)
+    }
+
     fn root(&self) -> PathBuf {
         self.root_dir
             .canonicalize()
@@ -278,6 +302,9 @@ impl Tool for StateTool {
         let params: StateParams = serde_json::from_value(arguments)
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
         let path = self.path();
+        if matches!(params.action, StateAction::Record | StateAction::Forget) {
+            return self.fact_call(&params);
+        }
         let mut entries = read_entries(&path);
 
         let (heading, body) = match params.action {
@@ -353,6 +380,11 @@ impl Tool for StateTool {
                 }
                 ("### state — memória".to_string(), body)
             }
+            // Record/Forget já retornaram em `fact_call`.
+            StateAction::Record | StateAction::Forget => (
+                "### state — fato".to_string(),
+                String::new(),
+            ),
             StateAction::End => (
                 "### state — fim".to_string(),
                 "\nSessão encerrada; nada foi apagado.\n".to_string(),
@@ -375,9 +407,8 @@ impl Tool for StateTool {
             .unwrap_or("?");
         format!("state: {action}")
     }
-
-    fn mutates(&self) -> bool {
-        true
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
     }
 }
 

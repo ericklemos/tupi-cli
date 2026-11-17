@@ -525,7 +525,7 @@ async fn run_docs_feedback(ctx: &RunContext, plan: &mut SddPlan) -> tupi_tools::
         name: "agent".to_string(),
         ok: outcome.ok,
         summary: summarize_outcome(&outcome),
-        detail: tupi_domain::tool_detail_excerpt(&outcome.output),
+        detail: tupi_domain::tool_detail_excerpt(&outcome.text),
         duration_us: crate::telemetry::micros(started.elapsed()).max(1),
     });
 
@@ -634,6 +634,7 @@ async fn run_one(ctx: &RunContext, plan: &SddPlan, sub_id: &str) -> (AgentOutcom
         name: "agent".to_string(),
         ok: outcome.ok,
         summary: summarize_outcome(&outcome),
+        detail: tupi_domain::tool_detail_excerpt(&outcome.text),
         duration_us: crate::telemetry::micros(elapsed).max(1),
     });
     (outcome, elapsed)
@@ -757,12 +758,17 @@ async fn run_acceptance(
         Ok(output) => (true, crate::app::summarize(output)),
         Err(error) => (false, error.clone()),
     };
+    let tool_detail = match &result {
+        Ok(output) => tupi_domain::tool_detail_excerpt(output),
+        Err(error) => tupi_domain::tool_detail_excerpt(error),
+    };
     ctx.events.publish(Event::ToolFinished {
         request_id: ctx.request_id,
         call_id,
         name: "exec".to_string(),
         ok,
         summary: detail,
+        detail: tool_detail,
         duration_us: crate::telemetry::micros(started.elapsed()).max(1),
     });
     let output = result?;
@@ -986,6 +992,10 @@ mod tests {
     }
 
     impl Tool for EchoTool {
+        fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+            tupi_kernel::Effect::ReadOnly
+        }
+
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: "echo".to_string(),
@@ -1006,6 +1016,10 @@ mod tests {
     }
 
     impl Tool for ExecTool {
+        fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+            tupi_kernel::Effect::Opaque
+        }
+
         fn spec(&self) -> ToolSpec {
             ToolSpec {
                 name: "exec".to_string(),

@@ -42,6 +42,10 @@ impl Provider for Scripted {
 struct Echo;
 
 impl Tool for Echo {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "echo".to_string(),

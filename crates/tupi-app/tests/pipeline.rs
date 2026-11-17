@@ -121,9 +121,8 @@ impl Tool for FakeTool {
             Behavior::Fail => Err(ToolError::Other("quebrou".to_string())),
         }
     }
-
-    fn mutates(&self) -> bool {
-        self.mutating
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        if self.mutating { tupi_kernel::Effect::Opaque } else { tupi_kernel::Effect::ReadOnly }
     }
 }
 

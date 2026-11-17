@@ -127,37 +127,11 @@ pub fn register_agent(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::assert::AssertTool::new(
+    registry.register(Arc::new(crate::graph_ops::GraphTool::new(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::impact::ImpactTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::context_graph::ContextTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::trace::TraceTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::diff::DiffTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::why::WhyTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::clock::ClockTool::new()));
     registry.register(Arc::new(crate::peek::PeekTool::new(
         store,
         DEFAULT_BUDGET_TOKENS,

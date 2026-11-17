@@ -92,7 +92,7 @@ impl OpKind {
                 "`semantic` exige `query` (descrição em linguagem natural); para literal exato use `kind: \"text\"`"
             }
             OpKind::Graph => {
-                "`graph` exige `symbol`; para o corpo do símbolo use `kind: \"symbol\"`"
+                "`graph` exige `symbol` — ou só `path`, que usa as defs do arquivo/prefixo como raízes; para o corpo do símbolo use `kind: \"symbol\"`"
             }
         }
     }
@@ -162,8 +162,10 @@ pub enum LookupOp {
         detail: Option<LookupDetail>,
         max_results: Option<usize>,
     },
+    /// `symbol` é o alvo; `path` sozinho usa as defs do arquivo/prefixo como
+    /// raízes. Nenhum dos dois? o parse recusa.
     Graph {
-        symbol: String,
+        symbol: Option<String>,
         path: Option<String>,
         depth: Option<usize>,
     },
@@ -383,11 +385,23 @@ fn resolve_op(raw: RawOp, position: usize) -> Result<LookupOp, String> {
             detail,
             max_results: raw.max_results,
         },
-        OpKind::Graph => LookupOp::Graph {
-            symbol: require("symbol", raw.symbol)?,
-            path: raw.path,
-            depth: raw.depth,
-        },
+        OpKind::Graph => {
+            // `symbol` é o alvo; `path` sozinho aponta o arquivo/prefixo cujas
+            // defs viram raízes (o que a antiga `context_graph` chamava de
+            // target de arquivo).
+            let symbol = raw
+                .symbol
+                .map(|symbol| symbol.trim().to_string())
+                .filter(|symbol| !symbol.is_empty());
+            if symbol.is_none() && raw.path.is_none() {
+                return Err(missing_field(position, kind, "symbol"));
+            }
+            LookupOp::Graph {
+                symbol,
+                path: raw.path,
+                depth: raw.depth,
+            }
+        }
     };
     Ok(op)
 }
@@ -399,12 +413,12 @@ pub fn schema() -> Value {
             "properties": {
                 "ops": {
                     "type": "array",
-                    "description": "Campos por kind: symbol path+symbol, skeleton path, lines path (+start/end ou tail/head), text text (+glob/exclude/alternatives), semantic query, graph symbol.",
+                    "description": "Campos por kind: symbol path+symbol, skeleton path, lines path (+start/end ou tail/head), text text (+glob/exclude/alternatives), semantic query, graph symbol (ou só path).",
                     "items": {
                         "type": "object",
                         "properties": {
                             "kind": { "type": "string", "enum": OP_KINDS },
-                            "path": { "type": "string", "description": "Relativo ao root; em text/semantic/graph é prefixo." },
+                            "path": { "type": "string", "description": "Relativo ao root; em text/semantic é prefixo e, em graph sem `symbol`, é o alvo-arquivo." },
                             "symbol": { "type": "string", "description": "Simples ou qualificado (Foo::new)." },
                             "rev": { "type": "string" },
                             "start": { "type": "integer" },
@@ -420,7 +434,7 @@ pub fn schema() -> Value {
                             "keywords": { "type": "array", "items": { "type": "string" } },
                             "detail": { "type": "string", "enum": ["auto", "full", "signatures"] },
                             "max_results": { "type": "integer" },
-                            "depth": { "type": "integer" }
+                            "depth": { "type": "integer", "description": "graph: saltos no grafo (1..3)." }
                         },
                         "required": ["kind"]
                     }

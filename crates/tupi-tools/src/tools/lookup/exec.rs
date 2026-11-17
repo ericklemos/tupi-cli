@@ -162,7 +162,7 @@ impl<'a> Engines<'a> {
                 depth,
             } => super::graph::sections(
                 self.root_dir,
-                Some(symbol.as_str()),
+                symbol.as_deref(),
                 path.as_deref(),
                 *depth,
                 priority,

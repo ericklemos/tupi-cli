@@ -77,9 +77,8 @@ impl Tool for MutatingProbe {
             schema: serde_json::json!({"type": "object"}),
         }
     }
-
-    fn mutates(&self) -> bool {
-        true
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
     }
 
     fn call(&self, arguments: serde_json::Value) -> Result<String, ToolError> {

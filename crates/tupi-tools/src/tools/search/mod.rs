@@ -118,6 +118,10 @@ impl SearchTool {
 }
 
 impl Tool for SearchTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search".to_string(),

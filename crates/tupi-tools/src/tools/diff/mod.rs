@@ -89,6 +89,10 @@ fn parse_diff(diff: &str) -> Vec<Change> {
 }
 
 impl Tool for DiffTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "diff".to_string(),

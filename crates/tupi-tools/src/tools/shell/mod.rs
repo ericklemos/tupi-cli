@@ -70,7 +70,7 @@ pub(crate) fn allowed(command: &str, allow: &[String]) -> bool {
     /// do `call`, entao repete os nomes para recusar antes da allowlist.
     const NATIVE_BINARIES: &[&str] = &[
         "cat", "head", "tail", "sed", "grep", "rg", "awk", "find", "ls", "tree", "wc", "sha256sum",
-        "sha1sum", "shasum", "md5sum", "curl", "wget", "rm", "mv", "cp", "touch",
+        "sha1sum", "shasum", "md5sum", "curl", "wget", "rm", "mv", "cp", "touch", "colab"
     ];
 
     /// Globais que so tiram ruido: nenhum deles muda de diretorio nem abre pager.
@@ -178,6 +178,10 @@ fn composes(command: &str) -> bool {
 }
 
 impl Tool for ShellTool {
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell".to_string(),

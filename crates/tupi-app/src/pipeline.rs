@@ -201,7 +201,7 @@ pub(crate) async fn execute(
         let serial = step.calls.iter().any(|pipeline_call| {
             tools
                 .get(&pipeline_call.tool)
-                .map(|tool| tool.mutates())
+                .map(|tool| !tool.effect(&pipeline_call.arguments).is_read_only())
                 .unwrap_or(false)
         });
 

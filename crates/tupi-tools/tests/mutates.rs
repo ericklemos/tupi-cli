@@ -8,7 +8,10 @@ fn mutating_tools_are_marked() {
         .specs()
         .into_iter()
         .map(|spec| spec.name)
-        .filter(|name| registry.get(name).unwrap().mutates())
+        .filter(|name| {
+            let tool = registry.get(name).unwrap();
+            !tool.effect(&serde_json::Value::Null).is_read_only()
+        })
         .collect();
     marked.sort();
 
@@ -16,12 +19,15 @@ fn mutating_tools_are_marked() {
         marked,
         vec![
             "edit",
+            "exec",
+            "feedback",
             "move",
             "patch",
             "sdd",
             "setup",
             "shell",
             "state",
+            "test_many",
             "write",
             "write_many"
         ]

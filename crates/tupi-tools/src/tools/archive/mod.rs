@@ -157,11 +157,9 @@ impl Tool for ArchiveTool {
             other_action => Err(ToolError::Other(format!("ação desconhecida: {other_action}"))),
         }
     }
-
-    fn mutates(&self) -> bool {
-        false
+    fn effect(&self, _arguments: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
     }
-
     fn mode_mask(&self) -> ModeMask {
         ModeMask::DOCS
     }

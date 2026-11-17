@@ -156,6 +156,7 @@ pub const TOOL_DETAIL_MAX_CHARS: usize = 4_000;
 /// texto não vazio nunca encolhe sem aviso. O corte segue o mesmo critério de
 /// `crate::telemetry::clip`: nunca parte um `char` no meio, então o resultado
 /// é sempre UTF-8 válido.
+/// Consumidores externos dependem desta função pública (`Event::detail`).
 pub fn tool_detail_excerpt(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= TOOL_DETAIL_MAX_CHARS {

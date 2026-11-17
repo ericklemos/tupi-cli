@@ -71,8 +71,4 @@ impl Tool for RepairingTool {
             }
         }
     }
-
-    fn mutates(&self) -> bool {
-        true
-    }
 }

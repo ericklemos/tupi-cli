@@ -179,7 +179,18 @@ fn stats(patch: &str) -> (usize, usize) {
 
 impl Tool for PatchTool {
     fn effect(&self, arguments: &Value) -> tupi_kernel::Effect {
-        crate::support::effect::writes(arguments)
+        // Mesmo parse que `call` executa: `PatchParams` + `touched_files`.
+        // Nada de heurística paralela sobre o JSON cru; parse que falha é
+        // `Opaque` (fail-closed).
+        let Ok(params) = serde_json::from_value::<PatchParams>(arguments.clone()) else {
+            return tupi_kernel::Effect::Opaque;
+        };
+        let files = touched_files(&params.patch);
+        if files.is_empty() {
+            tupi_kernel::Effect::Opaque
+        } else {
+            tupi_kernel::Effect::Writes(files.into_iter().map(PathBuf::from).collect())
+        }
     }
 
     fn spec(&self) -> ToolSpec {

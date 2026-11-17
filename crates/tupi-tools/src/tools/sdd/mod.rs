@@ -1160,11 +1160,9 @@ impl Tool for SddTool {
             None => action.to_string(),
         }
     }
-
-    fn mutates(&self) -> bool {
-        true
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
     }
-
     fn mode_mask(&self) -> tupi_kernel::ModeMask {
         tupi_kernel::ModeMask::EXECUTION.union(tupi_kernel::ModeMask::SDD)
     }

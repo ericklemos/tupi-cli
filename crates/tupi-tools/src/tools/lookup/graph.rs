@@ -2,7 +2,7 @@
 //!
 //! Era a tool `context_graph`; virou `kind` para o lote inteiro pagar um
 //! orçamento só. O alvo é um símbolo (`symbol`) ou um arquivo/prefixo
-//! (`path`), e `depth` limita os saltos.
+//! (`path`, quando `symbol` falta), e `depth` limita os saltos.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -13,6 +13,9 @@ use crate::ast::compact_signature;
 use crate::graph::{Def, GraphCache};
 use crate::support::budget::Section;
 use crate::support::dense::Item;
+
+#[cfg(test)]
+mod tests;
 
 /// Teto de saltos: o mesmo da tool que este `kind` absorveu.
 const MAX_DEPTH: usize = 3;

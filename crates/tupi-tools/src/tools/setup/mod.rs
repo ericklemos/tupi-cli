@@ -228,9 +228,8 @@ impl Tool for SetupTool {
             .unwrap_or("preview");
         format!("setup: {action}")
     }
-
-    fn mutates(&self) -> bool {
-        true
+    fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::Opaque
     }
 }
 

@@ -10,8 +10,8 @@ pub(crate) use support::{
 
 pub use tools::sdd;
 pub(crate) use tools::{
-    assert, clock, context_graph, diff, edit, env, exec, facts, feedback, fetch, impact, lookup, map, patch,
-    peek, read, read_many, relocate, research, search, setup, shell, state, test_many, trace,
+    assert, clock, diff, edit, env, exec, facts, feedback, fetch, graph_ops, impact, lookup, map, patch,
+    peek, read, relocate, research, search, setup, shell, state, test_many, trace,
     websearch, why, workflow, write, write_many,
 };
 
@@ -25,7 +25,6 @@ pub use store::ResponseStore;
 pub use edit::{EditParams, EditTool};
 pub use peek::PeekTool;
 pub use read::{ReadParams, ReadTool};
-pub use read_many::{ReadItem, ReadManyParams, ReadManyTool};
 pub use search::{SearchDetail, SearchParams, SearchTool};
 pub use workflow::{
     Catalog, WorkflowTool, catalog, global_agents_dir, local_agents_dir, prompt_section,
@@ -326,27 +325,7 @@ pub fn register_with(
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
     )));
-    registry.register(Arc::new(crate::assert::AssertTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::impact::ImpactTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::trace::TraceTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::diff::DiffTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    registry.register(Arc::new(crate::why::WhyTool::new(
+    registry.register(Arc::new(crate::graph_ops::GraphTool::new(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
@@ -362,12 +341,6 @@ pub fn register_with(
         DEFAULT_BUDGET_TOKENS,
     )));
     registry.register(Arc::new(crate::research::ResearchTool::new(
-        root_dir.clone(),
-        store.clone(),
-        DEFAULT_BUDGET_TOKENS,
-    )));
-    // A memória é por repositório (.agents/tupi), não pelo diretório de estado.
-    registry.register(Arc::new(crate::facts::FactsTool::new(
         root_dir.clone(),
         store.clone(),
         DEFAULT_BUDGET_TOKENS,
@@ -411,7 +384,6 @@ pub fn register_with(
         }
     };
     registry.register(Arc::new(state));
-    registry.register(Arc::new(crate::clock::ClockTool::new()));
     registry.register(Arc::new(crate::env::EnvTool::new()));
     registry.register(Arc::new(PeekTool::new(
         store.clone(),
@@ -454,7 +426,7 @@ mod agent_tools;
 /// `write`/`patch` ficam aqui porque `edit` só cobre símbolo Rust: sem eles
 /// `.md`, `.toml` e `.json` seriam somente leitura no modo exec.
 pub const CORE_TOOLS: &[&str] = &[
-    "clock",
+    "env",
     "edit",
     "exec",
     "feedback",
