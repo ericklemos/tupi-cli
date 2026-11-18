@@ -34,6 +34,19 @@ impl SseParser {
 
         payloads
     }
+
+    /// Fecha o stream: entrega o evento que sobrou no buffer mesmo sem a linha
+    /// em branco final e zera o estado — chamada repetida devolve vazio.
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        // Duas quebras de linha (LF) fecham o evento que falta.
+        self.buffer.extend_from_slice(&[10, 10]);
+        let payloads = self.push(&[]);
+        self.buffer.clear();
+        payloads
+    }
 }
 
 fn find_event_end(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -272,5 +285,32 @@ mod tests {
         let chunk = extract_chunk(payload).unwrap();
 
         assert_eq!(chunk.usage, None);
+    }
+
+    #[test]
+    fn cut_event_waits_for_flush_at_close() {
+        let mut parser = SseParser::new();
+        let lf = char::from(10u8);
+        let one = r#"data: {"choices":[{"delta":{"content":"um"}}]}"#;
+        let two = r#"data: {"choices":[{"delta":{"content":"dois"}}]}"#;
+        // Primeiro evento completo; o segundo é cortado entre duas leituras e
+        // nunca recebe a linha em branco final.
+        let text = format!("{one}{lf}{lf}{two}{lf}{lf}");
+        let full = text.as_bytes();
+        let cut = text.find("dois").unwrap();
+        let terminator = full.len() - 2;
+
+        let payloads = parser.push(&full[..cut]);
+        assert_eq!(payloads.len(), 1, "só o evento completo pode sair");
+        assert_eq!(extract_delta(&payloads[0]).unwrap(), Some("um".into()));
+
+        // A segunda leitura fecha o payload, mas sem terminador de evento.
+        let payloads = parser.push(&full[cut..terminator]);
+        assert!(payloads.is_empty(), "evento sem terminador não sai parcial");
+
+        let flushed = parser.finish();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(extract_delta(&flushed[0]).unwrap(), Some("dois".into()));
+        assert!(parser.finish().is_empty(), "buffer drenado uma única vez");
     }
 }

@@ -124,6 +124,10 @@ impl Tool for CountingTool {
         }
     }
 
+    fn effect(&self, _: &serde_json::Value) -> tupi_kernel::Effect {
+        tupi_kernel::Effect::ReadOnly
+    }
+
     fn call(&self, _arguments: serde_json::Value) -> Result<String, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok("ok".to_string())

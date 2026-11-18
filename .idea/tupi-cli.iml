@@ -22,6 +22,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/tmp-sha/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-transcribe/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/tupi-transcribe/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/tupi-providers/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

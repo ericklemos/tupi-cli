@@ -3,7 +3,7 @@
   "docs_folders": [
     "./docs"
   ],
-  "lang": "pt-br",
+  "lang": "pt-br (portugues brasileiro)",
   "models": {
     "antigravity/gemini-4-hydrogen-high": {
       "context_window": 200000
@@ -13,6 +13,12 @@
     },
     "deepseek/deepseek-v4-pro": {
       "context_window": 200000
+    },
+    "openai-plan/gpt-5.2-codex": {
+      "context_window": 200000
+    },
+    "openai-plan/gpt-6.2-sol": {
+      "context_window": 64000
     }
   },
   "name": "tupi-cli"

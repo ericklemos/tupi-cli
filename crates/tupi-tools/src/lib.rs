@@ -57,6 +57,9 @@ pub struct ToolsOptions {
     pub watcher: bool,
     /// Liga o cache em RAM de `exec` (`false` desliga o fingerprint inteiro).
     pub exec_cache: bool,
+    /// Allowlist da tool `shell`, já resolvida de `configs/tools.ron` (seção
+    /// `shell`). `None` deixa a tool ler `ai.project.json` (`shell.allow`).
+    pub shell_allow: Option<Vec<String>>,
     /// Persistência de planos SDD. `None` usa `InMemorySddStore`.
     pub sdd_store: Option<Arc<dyn crate::sdd::SddStore>>,
     /// Célula compartilhada com o `AgentMode` ativo (`0=Execution`, `1=Sdd`).
@@ -91,6 +94,7 @@ impl Default for ToolsOptions {
             state_dir: None,
             watcher: true,
             exec_cache: true,
+            shell_allow: None,
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
@@ -112,6 +116,7 @@ impl ToolsOptions {
             state_dir: Some(state_dir),
             watcher: false,
             exec_cache: false,
+            shell_allow: None,
             sdd_store: None,
             mode_cell: None,
             sdd_executor: None,
@@ -328,11 +333,10 @@ pub fn register_with(
         graph.clone(),
     )));
     registry.register(Arc::new(crate::graph::RepairingTool::new(
-        Arc::new(crate::shell::ShellTool::new(
-            root_dir.clone(),
-            store.clone(),
-            DEFAULT_BUDGET_TOKENS,
-        )),
+        Arc::new(
+            crate::shell::ShellTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
+                .with_allow(options.shell_allow.clone()),
+        ),
         graph.clone(),
     )));
     registry.register(Arc::new(crate::map::MapTool::new(

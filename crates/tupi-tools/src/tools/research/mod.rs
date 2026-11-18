@@ -97,12 +97,15 @@ impl Tool for ResearchTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let hits = crate::websearch::search_hits(query, params.locale.as_deref(), &root)?;
-        if hits.is_empty() {
-            return Ok(format!(
-                "### research — {query}\n\nNÃO — nenhum resultado.\n"
-            ));
-        }
+        let hits = match crate::websearch::search_hits(query, params.locale.as_deref(), &root)? {
+            crate::websearch::SearchOutcome::Results(hits) => hits,
+            crate::websearch::SearchOutcome::NoResults => {
+                return Ok(crate::websearch::no_results_note("research", query));
+            }
+            crate::websearch::SearchOutcome::Unrecognized { bytes } => {
+                return Ok(crate::websearch::unrecognized_note("research", query, bytes));
+            }
+        };
 
         let question = params
             .question

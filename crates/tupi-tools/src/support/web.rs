@@ -9,7 +9,7 @@ pub struct Block {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub title: String,
     pub url: String,
@@ -465,7 +465,24 @@ fn unredirect(url: &str) -> String {
     percent_decode(&rest[..end])
 }
 
-pub fn parse_duckduckgo(html: &str) -> Vec<SearchHit> {
+/// Desfecho do parse de uma página de resultados do DuckDuckGo.
+///
+/// `Vec` vazio confundia dois casos distintos: o provedor dizer que a consulta
+/// não tem resultado e o provedor devolver página de bloqueio/anti-bot sem
+/// nenhum `result__a`. Os dois terminavam na mesma mensagem, e o modelo
+/// concluía que a consulta não existe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuckDuckGoPage {
+    /// A página trouxe pelo menos um resultado reconhecido.
+    Results(Vec<SearchHit>),
+    /// A busca foi aceita e o índice do provedor não tem nada para ela.
+    NoResults,
+    /// Nenhum bloco de resultado e nenhum marcador de página vazia: bloqueio,
+    /// anti-bot ou markup novo. Isto não é ausência de resultado.
+    Unrecognized,
+}
+
+pub fn parse_duckduckgo(html: &str) -> DuckDuckGoPage {
     let mut hits = Vec::new();
     let mut rest = html;
 
@@ -511,7 +528,21 @@ pub fn parse_duckduckgo(html: &str) -> Vec<SearchHit> {
         rest = &rest[text_end + 4..];
     }
 
-    hits
+    if !hits.is_empty() {
+        return DuckDuckGoPage::Results(hits);
+    }
+    if duckduckgo_says_no_results(html) {
+        return DuckDuckGoPage::NoResults;
+    }
+    DuckDuckGoPage::Unrecognized
+}
+
+/// Marcadores de "a busca foi aceita e o índice não tem nada". Sem um deles,
+/// página sem bloco de resultado é bloqueio/anti-bot ou markup novo: dizer
+/// "nenhum resultado" nesse caso é mentira que o modelo não tem como detectar.
+fn duckduckgo_says_no_results(html: &str) -> bool {
+    const MARKERS: &[&str] = &["no-results", "No results", "no results found"];
+    MARKERS.iter().any(|marker| html.contains(marker))
 }
 
 #[cfg(test)]
@@ -547,11 +578,21 @@ mod tests {
     #[test]
     fn a_duckduckgo_result_is_parsed() {
         let html = "<a rel=\"nofollow\" class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=1\">Titulo A</a><a class=\"result__snippet\">Trecho <b>a</b>.</a>";
-        let hits = parse_duckduckgo(html);
+        let DuckDuckGoPage::Results(hits) = parse_duckduckgo(html) else {
+            panic!("esperava resultado reconhecido na página de busca");
+        };
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Titulo A");
         assert_eq!(hits[0].url, "https://example.com/a");
         assert_eq!(hits[0].snippet, "Trecho a .");
+    }
+
+    #[test]
+    fn a_blocked_page_is_not_reported_as_absence_of_results() {
+        let blocked = "<html><body><div id=\"anomaly-modal\">unusual traffic</div></body></html>";
+        assert_eq!(parse_duckduckgo(blocked), DuckDuckGoPage::Unrecognized);
+        let empty = "<html><body><div class=\"no-results\">No results.</div></body></html>";
+        assert_eq!(parse_duckduckgo(empty), DuckDuckGoPage::NoResults);
     }
 
     #[test]

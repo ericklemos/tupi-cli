@@ -164,7 +164,7 @@ impl Tool for FeedbackTool {
                 } else {
                     let feedback = memory::Feedback {
                         id: id.clone(),
-                        ts_ms: memory::now(),
+                        ts_ms: memory::now_ms(),
                         session,
                         mode: String::new(),
                         model: String::new(),

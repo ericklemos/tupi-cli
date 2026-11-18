@@ -85,6 +85,104 @@ piso dessa diferença é o schema: 4.468 tokens no núcleo, 10.613 com
 `expose_all`. Não somar `tool_tokens` com `estimate_tokens` para "prever"
 `prompt_tokens` — há também o template, que não é medido localmente.
 
+## Turno de referência: `prompt_tokens` × `estimate_scaled` por passo (T1.2)
+
+O turno medido é o de 12 passos citado acima: run `1794848745295-332087`,
+requisição 1, `deepseek-flash`, `max_tool_steps` 200 na época, `tool_count` 31
+(`expose_all`), `max_tokens` 6000, arquivo
+`.agents/tupi/debug/telemetry.jsonl`. Comando reproduzível (a sonda
+`crates/tupi/tests/turn_baseline.rs` dá o split, o `jq` dá o passo a passo):
+
+```text
+cargo test -p tupi --test turn_baseline -- --nocapture   # split + top tools do run
+jq -r 'select(.event=="provider_response" and .run=="1794848745295-332087" and .request==1)
+  | "\(.step)\t\(.prompt_tokens)\t\(.estimate_scaled)\t\(.prompt_tokens-.estimate_scaled)\t\(.cached_tokens)\t\(.scale_ppm)"' \
+  .agents/tupi/debug/telemetry.jsonl
+```
+
+Linha do turno (as colunas de `tupi telemetry`, `render`,
+`crates/tupi/src/telemetry_report.rs:169-281`): passos **12** · `re-read`
+**7** · `provider_us` 64.786.859 (~5,4 s por passo, 48% da parede) ·
+`tool_us` 61.777.028 (46%) · `parede_us` 135.566.153 · `prompt` 293.108 ·
+`cached` 261.504 · `completion` 9.095.
+
+| passo | `prompt_tokens` | `estimate_scaled` | conta | `cached` | `scale_ppm` |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 6.328 | 8.550 | −2.222 | 4.480 | 100.000 |
+| 2 | 10.239 | 11.097 | −858 | 6.400 | 87.000 |
+| 3 | 11.753 | 12.101 | −348 | 10.624 | 83.000 |
+| 4 | 15.257 | 15.062 | 195 | 12.288 | 82.000 |
+| 5 | 18.955 | 18.615 | 340 | 15.744 | 82.000 |
+| 6 | 25.241 | 25.545 | −304 | 19.328 | 83.000 |
+| 7 | 27.722 | 27.699 | 23 | 25.728 | 83.000 |
+| 8 | 30.012 | 29.814 | 198 | 27.904 | 83.000 |
+| 9 | 32.285 | 32.129 | 156 | 30.464 | 83.000 |
+| 10 | 35.291 | 35.067 | 224 | 32.512 | 83.000 |
+| 11 | 38.776 | 38.687 | 89 | 36.736 | 84.000 |
+| 12 | 41.249 | 41.413 | −164 | 39.296 | 84.000 |
+| soma | 293.108 | 295.779 | −2.671 | 261.504 | — |
+
+Leitura: a conta `prompt_tokens − estimate_scaled` **não** é o schema neste run.
+Ela fica entre −2.222 e +340 e soma −2.671 no turno: com `scale_ppm` em
+0,82–0,84 o estimador local já erra para cima mais que o payload de tools, então
+o schema (10.613 com `expose_all`) **não** é o piso dessa diferença — o piso é o
+que sobra depois da correção de escala, e ela é aplicada passo a passo. Atribuir
+o schema pela diferença bruta superestima o custo fixo; o custo que de fato
+viaja é `prompt_tokens`, e ele cresce ~3,2 k por passo neste turno
+(6.328 → 41.249), dos quais ~22 k são prefixo cacheado na última requisição.
+O `re-read` de 7 em 12 passos é o denominador de p(recall) para as podas
+posteriores ([re-leituras](#re-leituras-por-turno-t62)).
+
+## Escala e `cached_tokens` por passo (T4.2)
+
+`tupi telemetry` passou a imprimir, para cada turno exibido, uma seção `passos`
+com `escala` (o `provider_response.scale_ppm` **em vigor no envio**, em partes
+por milhão) e `cached` (a fatia cacheada do `prompt_tokens` daquele passo), mais
+`cache` = cached/prompt (`StepRow`, `render`,
+`crates/tupi/src/telemetry_report.rs:41-59`). Antes isso só saía por conta
+própria com `jq`; agora é coluna do relatório e o `--limit` recorta o turno que
+se quer comparar.
+
+Turno de referência (`1794848745295-332087`, turno 1, 12 passos) reimpresso com
+as colunas novas — mesmos números da tabela de T1.2, nenhuma requisição nova:
+
+```text
+cargo run -p tupi -- telemetry --limit 1
+```
+
+| passo | escala | prompt | cached | cache |
+| --- | --- | --- | --- | --- |
+| 1 | 1,0000 | 6.328 | 4.480 | 71% |
+| 2 | 0,8700 | 10.239 | 6.400 | 63% |
+| 3 | 0,8300 | 11.753 | 10.624 | 90% |
+| 4 | 0,8200 | 15.257 | 12.288 | 81% |
+| 5 | 0,8200 | 18.955 | 15.744 | 83% |
+| 6 | 0,8300 | 25.241 | 19.328 | 77% |
+| 7 | 0,8300 | 27.722 | 25.728 | 93% |
+| 8 | 0,8300 | 30.012 | 27.904 | 93% |
+| 9 | 0,8300 | 32.285 | 30.464 | 94% |
+| 10 | 0,8300 | 35.291 | 32.512 | 92% |
+| 11 | 0,8400 | 38.776 | 36.736 | 95% |
+| 12 | 0,8400 | 41.249 | 39.296 | 95% |
+| soma | — | 293.108 | 261.504 | 89% |
+
+Leitura antes × depois: **antes** o total do turno só dizia `cached` 261.504
+(89%); a oscilação da escala — 0,8200 → 0,8300 no passo 6 e 0,8300 → 0,8400 no
+passo 11 — ficava invisível, junto com a pergunta que ela responde: quantas
+vezes o request mudou dentro do turno. **Depois** a coluna `escala` mostra a
+subida em dois passos, que é exatamente o que a política assimétrica de T4.1
+remove (dentro do turno a escala só desce, `next_scale_in_turn`,
+`crates/tupi-app/src/app.rs:162-167`), e a coluna `cache` mostra que neste turno
+o prefixo sobreviveu — 89% do prompt cacheado apesar da oscilação de 1%.
+
+O critério de aceitação de T4.1 é, nesta tela, uma série **não crescente** de
+`escala` dentro do turno, com `cache` acompanhando. A coluna é medida; a série
+pós-T4.1 exige um turno novo (API) e não foi medida nesta subtarefa — a tabela
+acima é o turno gravado, reimpresso com as colunas novas. O que fica travado
+por teste é o formato: `each_step_prints_its_scale_and_cached_tokens`
+(`crates/tupi/src/telemetry_report.rs`) falha se a escala, o cache ou a razão
+por passo saírem da saída.
+
 ## Re-leituras por turno (T6.2)
 
 `tupi telemetry` conta, por turno, as chamadas de leitura — `read`,
@@ -112,6 +210,55 @@ de configurações diferentes.
 Regra sem verificação é pedido (`../rules/model-control.md`): o número só
 serve porque o handle que o manifesto imprime é o mesmo que `peek` aceita.
 Contrato do manifesto em [prefixo do turno](../features/turn-prefix.md).
+
+## Ganho do dedup por turno (T3.3)
+
+Dedup por `(path, blake3)` (`dedup_identical_results`,
+`crates/tupi-domain/src/context.rs:485-527`) é a única poda com **p(recall) = 0
+por construção**: o corpo do resultado repetido continua no contexto e o
+segundo vira ponteiro para o primeiro, sem depender do `ResponseStore`. O
+break-even da regra de poda (`tokens_poupados >= p_recall × prompt_tokens`) vale
+para qualquer token poupado justamente porque `p_recall` não é estimado: nada
+precisa ser relido, então o campo `re-read` de `tupi telemetry` não entra nesta
+conta.
+
+Sonda `crates/tupi-app/tests/dedup_gain.rs`, sem instrumentação nova: lê
+`tool_finished.result` do JSONL já gravado, reconstrói o histórico de cada passo
+e roda o dedup real.
+
+```text
+cargo test -p tupi-app --test dedup_gain -- --nocapture
+# outro arquivo:
+TUPI_TELEMETRY_PATH=/caminho/telemetry.jsonl \
+  cargo test -p tupi-app --test dedup_gain -- --nocapture
+```
+
+Arquivo `.agents/tupi/debug/telemetry.jsonl`: **132 turnos** com resultado de
+tool, **5 com duplicata**, 133 duplicatas somadas — **todas de `read`**. `exec`,
+`patch`, `write`, `write_many` e `relocate` nunca entram: repetição ali é efeito
+colateral, não economia.
+
+| run · turno | orçamento | duplicatas | `tokens_poupados_por_passo` | duplicatas por tool |
+| --- | --- | --- | --- | --- |
+| 1794712224896-376076 · 2 | 200.000 | 6 | 9.960 | read 6 |
+| 1794760400983-9825 · 1 | 200.000 | 19 | 1.007 | read 19 |
+| 1794839753761-90692 · 1 | 200.000 | 50 | 98.000 | read 50 |
+| 1794840261706-110773 · 3 | 200.000 | 6 | 1.128 | read 6 |
+| 1794842285268-175772 · 2 | 200.000 | 52 | 26.052 | read 52 |
+
+O turno de referência (`1794848745295-332087`, turno 1, 12 passos) **não tem
+duplicata**: 0 tokens deduplicados por turno ali, e o mesmo vale para 127 dos
+132 turnos. Nas 5 sessões que repetem leitura o ganho é real mas pontual: até
+98.000 tokens/passo num turno de 50 re-leituras do mesmo arquivo.
+
+**Ressalva medida, não estimada:** os 5 turnos com duplicata rodaram com
+`context_budget` 200.000 e nenhum passou do orçamento, então `plan_with` nem
+chegou ao dedup — o caminho rápido devolve o histórico intacto enquanto a
+estimativa local couber no orçamento (`crates/tupi-domain/src/context.rs:114-116`).
+A coluna da tabela é o ganho **disponível** no histórico daquele passo; ele só
+vira token não cobrado quando o turno cruza o orçamento, que é a condição de
+qualquer poda. Comparar com `context_budget` antes de somar dedup a uma
+economia por turno.
 
 ## Histograma por tool (T1.3)
 

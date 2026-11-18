@@ -91,6 +91,36 @@ pub(crate) fn summarize(text: &str) -> String {
 
 /// Soma tokens reportados pelo provedor preservando `None` como "não
 /// reportado": o primeiro valor visto abre o total, os seguintes acumulam.
+/// Mensagem de falha que o usuário vê. Erro de cota carrega o horário de
+/// reset junto (`reset` é relativo, em segundos): sem isso o turno morre com
+/// um "quota esgotada" e o usuário retenta às cegas.
+pub(crate) fn failure_text(error: &tupi_kernel::ProviderError) -> String {
+    let text = error.to_string();
+    match error {
+        tupi_kernel::ProviderError::QuotaExhausted {
+            reset: Some(seconds),
+            ..
+        } => format!(
+            "{text} — reset em {seconds}s ({}); nada é reenviado automaticamente",
+            reset_clock(*seconds)
+        ),
+        tupi_kernel::ProviderError::QuotaExhausted { reset: None, .. } => {
+            format!("{text} — reset sem horário informado; nada é reenviado automaticamente")
+        }
+        _ => text,
+    }
+}
+
+/// Relógio (UTC) em que a cota volta, a partir do reset relativo.
+fn reset_clock(seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let at = now.saturating_add(seconds) % 86_400;
+    format!("às {:02}:{:02} UTC", at / 3_600, (at % 3_600) / 60)
+}
+
 fn add_tokens(total: Option<u64>, value: Option<u64>) -> Option<u64> {
     match (total, value) {
         (Some(total), Some(value)) => Some(total + value),
@@ -122,11 +152,30 @@ fn observed_scale(estimated: usize, charged: u64) -> Option<u64> {
     Some(scale.clamp(SCALE_MIN, SCALE_MAX))
 }
 
-fn next_scale(current: u64, observed: Option<u64>) -> u64 {
+/// Escala em vigor dentro do turno: só desce.
+///
+/// Corrigir subestimativa é urgente — se o provider cobrou mais do que o app
+/// estimou, o próximo passo planeja com o número medido, sem esperar média. O
+/// caminho de subida é o caro: planejar com orçamento maior reabre a poda no
+/// meio do turno e troca o request a cada passo, então subir fica reservado
+/// para a virada de turno (`next_scale_at_turn_boundary`).
+fn next_scale_in_turn(current: u64, observed: Option<u64>) -> u64 {
     match observed {
-        Some(observed) => (current + observed) / 2,
-        None => current,
+        Some(observed) if observed < current => observed.clamp(SCALE_MIN, SCALE_MAX),
+        _ => current.clamp(SCALE_MIN, SCALE_MAX),
     }
+}
+
+/// Escala na virada de turno: a única janela em que ela pode subir.
+///
+/// A observação do turno anterior já foi aplicada para baixo passo a passo e
+/// não é guardada; sem ela, a subida é relaxar meio caminho de volta ao neutro
+/// (`SCALE_ONE`, estimativa exata) em vez de saltar de uma vez. Um turno novo
+/// absorve a correção devagar e o orçamento não troca a cada passo.
+fn next_scale_at_turn_boundary(current: u64) -> u64 {
+    let current = current.clamp(SCALE_MIN, SCALE_MAX);
+    let step = (SCALE_ONE as i128 - current as i128) / 2;
+    (current as i128 + step).clamp(SCALE_MIN as i128, SCALE_MAX as i128) as u64
 }
 
 fn scaled_budget(budget: usize, scale: u64) -> usize {
@@ -139,18 +188,108 @@ fn scaled_estimate(estimate: usize, scale: u64) -> usize {
     ((estimate as u128 * scale as u128) / SCALE_ONE as u128) as usize
 }
 
+/// Piso fixo de um passo: o que sai no request mesmo quando o histórico cabe
+/// inteiro. A poda não toca em nenhuma destas partes, então elas competem com
+/// o histórico pelo mesmo teto.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StepFixedTokens {
+    /// Schema JSON das tools do passo (0 no passo final, que vai sem tools).
+    tool_schema: usize,
+    /// Bloco de memória do turno (`begin_turn`).
+    memory: usize,
+    /// Manifesto do que já veio antes deste turno.
+    manifest: usize,
+    /// Prefixo: sistema + workflows + `AGENTS.md`.
+    prefix: usize,
+    /// Aviso de freio de passos, quando presente.
+    warning: usize,
+}
+
+impl StepFixedTokens {
+    /// Único ponto que soma o piso fixo; `plan_context` recebe este total.
+    /// O schema é ~1/3 dele — chamar o total de `tool_tokens` é o que faz a
+    /// subtração do prefixo desaparecer na próxima refatoração.
+    fn total(&self) -> usize {
+        self.tool_schema
+            .saturating_add(self.memory)
+            .saturating_add(self.manifest)
+            .saturating_add(self.prefix)
+            .saturating_add(self.warning)
+    }
+
+    /// Soma das quatro partes que têm teto declarado. O aviso de freio fica de
+    /// fora: ele é transitório (só aparece no fim do turno) e não é piso.
+    fn declared_total(&self) -> usize {
+        self.tool_schema
+            .saturating_add(self.memory)
+            .saturating_add(self.manifest)
+            .saturating_add(self.prefix)
+    }
+}
+
+/// Aviso de piso fixo: no máximo um por turno.
+///
+/// O declarado é o teto combinado das quatro partes não podáveis de um passo
+/// (schema de tools, prefixo, memória e manifesto). O medido muda de passo para
+/// passo, então comparar a cada passo repetiria o mesmo aviso vinte vezes no
+/// mesmo turno — daí a guarda. Declarado zero significa nada declarado.
+///
+/// A guarda é criada no começo do turno e consumida em cada passo; enquanto o
+/// piso declarado não entrar em `configs/context.ron`, ela não é chamada pelo
+/// laço e por isso o `dead_code` fica silenciado aqui.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default)]
+struct FixedFloorWatch {
+    declared: usize,
+    warned: bool,
+}
+
+impl FixedFloorWatch {
+    fn new(declared: usize) -> Self {
+        Self {
+            declared,
+            warned: false,
+        }
+    }
+
+    /// Texto do aviso na primeira vez que o piso medido passa do declarado;
+    /// `None` nas repetições do turno e quando o passo cabe no teto.
+    fn observe(&mut self, fixed: &StepFixedTokens) -> Option<String> {
+        if self.warned || self.declared == 0 {
+            return None;
+        }
+        let measured = fixed.declared_total();
+        if measured <= self.declared {
+            return None;
+        }
+        self.warned = true;
+        Some(format!(
+            "piso fixo do passo em {measured} tokens acima do teto declarado de {}: schema {}, prefixo {}, memória {}, manifesto {} — a diferença sai do histórico podável",
+            self.declared, fixed.tool_schema, fixed.prefix, fixed.memory, fixed.manifest
+        ))
+    }
+}
+
+/// Plano do passo: quanto do histórico cabe, dado o piso fixo do passo.
+///
+/// `fixed_tokens` é todo o custo do passo que não é histórico podável — schema
+/// de tools, bloco de memória do turno, manifesto do turno anterior, prefixo
+/// (sistema + workflows + `AGENTS.md`) e aviso de freio — somado num ponto só
+/// (`StepFixedTokens::total`). Ele é subtraído do teto *antes* de derivar o
+/// alvo de mensagens: com piso grande, um alvo não escalado colapsa o runway
+/// de amortização e a poda passa a agir em quase todo passo.
 fn plan_context(
     messages: &[Message],
     context_budget: usize,
     context_target: usize,
     recent_results: usize,
-    tool_tokens: usize,
+    fixed_tokens: usize,
 ) -> tupi_domain::context::Plan {
     if context_budget == 0 {
         return tupi_domain::context::plan_amortized_with(messages, 0, 0, recent_results);
     }
 
-    let message_budget = context_budget.saturating_sub(tool_tokens).max(1);
+    let message_budget = context_budget.saturating_sub(fixed_tokens).max(1);
     let message_target = match context_target {
         0 => message_budget.saturating_mul(2) / 5,
         target => {
@@ -1016,6 +1155,13 @@ impl App {
         let context_target = self.context_target.load(Ordering::SeqCst);
         let context_recent_results = self.context_recent_results.load(Ordering::SeqCst);
         let token_scale = Arc::clone(&self.token_scale);
+        // Virada de turno: a única janela em que a escala pode subir. Dentro do
+        // laço de passos ela só desce, então o relaxamento acontece aqui, antes
+        // do primeiro request do turno.
+        token_scale.store(
+            next_scale_at_turn_boundary(token_scale.load(Ordering::SeqCst)),
+            Ordering::SeqCst,
+        );
         let telemetry = self.telemetry.clone();
         let turn_started_at = std::time::Instant::now();
 
@@ -1157,11 +1303,14 @@ impl App {
                 // O orçamento é encolhido pela escala observada: se o provider
                 // cobrou mais do que estimamos, planejamos com menos espaço.
                 let request_tool_tokens = if final_step { 0 } else { tool_tokens };
-                let fixed_tokens = request_tool_tokens
-                    .saturating_add(memory_tokens)
-                    .saturating_add(manifest_tokens)
-                    .saturating_add(prefix_tokens)
-                    .saturating_add(warning_tokens);
+                let fixed_tokens = StepFixedTokens {
+                    tool_schema: request_tool_tokens,
+                    memory: memory_tokens,
+                    manifest: manifest_tokens,
+                    prefix: prefix_tokens,
+                    warning: warning_tokens,
+                }
+                .total();
                 let scale = token_scale.load(Ordering::SeqCst);
                 let planned = plan_context(
                     &session.messages(),
@@ -1171,6 +1320,10 @@ impl App {
                     fixed_tokens,
                 );
                 let trimmed = planned.trimmed();
+                // Dedup também reescreve o histórico, mas não é corte: o corpo
+                // do resultado idêntico continua no contexto. Só corte publica
+                // evento, senão a UI anuncia uma poda que não houve.
+                let cut = planned.cut();
                 let omitted_units = planned.omitted_units;
                 let shrunk_results = planned.shrunk_results;
                 if trimmed {
@@ -1199,7 +1352,7 @@ impl App {
                     .map(tupi_domain::tokens::estimate_message)
                     .sum::<usize>()
                     .saturating_add(request_tool_tokens);
-                if trimmed {
+                if cut {
                     events.publish(Event::ContextTrimmed {
                         request_id,
                         estimate: prompt_estimate,
@@ -1353,7 +1506,9 @@ impl App {
                 if let Some(charged) = step_prompt_tokens {
                     let observed = observed_scale(prompt_estimate, charged);
                     let current = token_scale.load(Ordering::SeqCst);
-                    token_scale.store(next_scale(current, observed), Ordering::SeqCst);
+                    // Dentro do turno a escala só desce; subir daqui invalidaria
+                    // o prefixo cacheado a cada passo.
+                    token_scale.store(next_scale_in_turn(current, observed), Ordering::SeqCst);
                     events.publish(Event::ContextUpdated {
                         request_id,
                         tokens: charged.saturating_add(step_completion_tokens.unwrap_or(0)),
@@ -1573,7 +1728,8 @@ impl App {
                         .get(&call.name)
                         .is_some_and(|t| !t.mode_mask().contains(current_mode));
                     let prefetched_call = prefetched.remove(&call.id);
-                    let (mut content, ok) = if let Some((content, ok, _)) = prefetched_call.clone() {
+                    let (mut content, ok) = if let Some((content, ok, _)) = prefetched_call.clone()
+                    {
                         (content, ok)
                     } else if blocked {
                         (format!("tool '{}' bloqueada neste modo", call.name), false)
@@ -1960,6 +2116,58 @@ impl App {
         store.save_provider_credentials("antigravity", &json)
     }
 
+    /// Credenciais do `openai-plan` vivem em `provider_credentials("openai-plan")`.
+    pub fn load_openai_plan_credentials(
+        store: &Store,
+    ) -> Option<tupi_providers::openai_plan::OpenAiPlanCredentials> {
+        match store.provider_credentials(tupi_providers::openai_plan::PROVIDER_ID) {
+            Ok(Some(raw)) => {
+                if let Some(creds) =
+                    tupi_providers::openai_plan::OpenAiPlanCredentials::from_json_str(&raw)
+                {
+                    return Some(creds);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "falha ao ler credenciais do openai-plan no redb");
+            }
+        }
+
+        None
+    }
+
+    /// Grava a credencial inteira: login e refresh passam por aqui, então o
+    /// token renovado substitui o vencido no mesmo registro.
+    pub fn save_openai_plan_credentials(
+        store: &Store,
+        creds: &tupi_providers::openai_plan::OpenAiPlanCredentials,
+    ) -> Result<(), tupi_store::StoreError> {
+        let json = serde_json::to_string(creds)
+            .map_err(|error| tupi_store::StoreError::Corrupt(error.to_string()))?;
+        store.save_provider_credentials(tupi_providers::openai_plan::PROVIDER_ID, &json)
+    }
+
+    pub fn register_openai_plan_credentials(
+        registry: &ProviderRegistry,
+        creds: tupi_providers::openai_plan::OpenAiPlanCredentials,
+        store: Option<Arc<Store>>,
+    ) {
+        let mut provider = tupi_providers::openai_plan::OpenAiPlanProvider::new(creds);
+        if let Some(store) = store {
+            let hook: tupi_providers::openai_plan::RefreshHook = Arc::new(move |updated| {
+                if let Err(error) = Self::save_openai_plan_credentials(&store, updated) {
+                    tracing::warn!(
+                        %error,
+                        "falha ao persistir credenciais renovadas do openai-plan no redb"
+                    );
+                }
+            });
+            provider = provider.with_on_refresh(hook);
+        }
+        registry.register(Arc::new(provider));
+    }
+
     pub fn load_selected_model(store: &Store) -> Option<(String, String)> {
         let prov = match store.setting("selected_provider") {
             Ok(Some(value)) if !value.trim().is_empty() => value,
@@ -2004,6 +2212,52 @@ impl App {
                 .any(|model| model == "antigravity-gemini-3.8-flash")
     }
 
+    /// Ids que o `/connect` sabe conectar sem credencial no redb. Ficam aqui,
+    /// no app, e não na TUI: a lista de ids é contrato de quem tem ramo de login.
+    pub const CONNECTABLE_PROVIDER_IDS: &[&str] =
+        &["antigravity", tupi_providers::openai_plan::PROVIDER_ID];
+
+    /// Provedores conhecidos para o autocomplete de `/connect `: os já
+    /// registrados mais os conectoráveis ainda sem credencial. Sem essa união um
+    /// provedor recém-adicionado só entraria na lista depois do primeiro login,
+    /// deixando o id indescobrível — foi o que aconteceu com `openai-plan`.
+    pub fn connectable_providers(registry: &ProviderRegistry) -> Vec<String> {
+        let mut ids = registry.ids();
+        for id in Self::CONNECTABLE_PROVIDER_IDS {
+            let id = (*id).to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Resolve o alvo do `/connect` para um id conectorável. Id exato vence; na
+    /// falta dele, prefixo único serve de atalho (`/connect openai` →
+    /// `openai-plan`). Prefixo ambíguo ou desconhecido devolve `None`, para o
+    /// comando falhar com a mensagem de sempre.
+    pub fn resolve_connect_provider(requested: &str) -> Option<&'static str> {
+        let want = requested.trim().to_ascii_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        if let Some(exact) = Self::CONNECTABLE_PROVIDER_IDS
+            .iter()
+            .find(|id| **id == want)
+        {
+            return Some(*exact);
+        }
+        let mut matches = Self::CONNECTABLE_PROVIDER_IDS
+            .iter()
+            .filter(|id| id.starts_with(&want));
+        let first = *matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     pub fn sync_connected_providers(registry: &ProviderRegistry, store: Option<&Arc<Store>>) {
         let Some(store) = store else { return };
         let Ok(connected) = store.connected_providers() else {
@@ -2018,6 +2272,14 @@ impl App {
                         Some(Arc::clone(store)),
                     );
                 }
+            }
+            if id == tupi_providers::openai_plan::PROVIDER_ID
+                && registry
+                    .get(tupi_providers::openai_plan::PROVIDER_ID)
+                    .is_none()
+                && let Some(creds) = Self::load_openai_plan_credentials(store)
+            {
+                Self::register_openai_plan_credentials(registry, creds, Some(Arc::clone(store)));
             }
         }
     }
@@ -2186,6 +2448,11 @@ impl CommandHandler for App {
                     Ok(CommandOutcome::Noop)
                 }
                 Command::Connect { provider } => {
+                let Some(provider) = Self::resolve_connect_provider(&provider) else {
+                    return Err(CommandError::Internal(format!(
+                        "provedor '{provider}' não suporta /connect"
+                    )));
+                };
                     if provider == "antigravity" {
                         let events = self.events.clone();
                         let registry = self.registry.clone();
@@ -2277,6 +2544,115 @@ impl CommandHandler for App {
                         });
 
                         Ok(CommandOutcome::Started { request_id: 0 })
+                    } else if provider == tupi_providers::openai_plan::PROVIDER_ID {
+                        let events = self.events.clone();
+                        let registry = self.registry.clone();
+                        let store = self.store.clone();
+
+                        tokio::spawn(async move {
+                            events.publish(Event::Notice {
+                                message: "Abrindo navegador para autenticação na conta ChatGPT..."
+                                    .to_string(),
+                            });
+
+                            let notify_events = events.clone();
+                            let flow_res =
+                                tupi_providers::openai_plan::run_login_flow(true, move |url| {
+                                    notify_events.publish(Event::Notice {
+                                        message: format!("Acesse para login: {url}"),
+                                    });
+                                })
+                                .await;
+
+                            match flow_res {
+                                Ok(creds) => {
+                                    let mut save_error: Option<String> = None;
+                                    if let Some(store_ref) = store.as_ref() {
+                                        let store_clone = Arc::clone(store_ref);
+                                        let creds_clone = creds.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            Self::save_openai_plan_credentials(
+                                                &store_clone,
+                                                &creds_clone,
+                                            )?;
+                                            if Self::load_selected_model(&store_clone).is_none()
+                                                && let Some(model) =
+                                                    tupi_providers::openai_plan::models()
+                                                        .into_iter()
+                                                        .next()
+                                            {
+                                                Self::save_selected_model(
+                                                    &store_clone,
+                                                    tupi_providers::openai_plan::PROVIDER_ID,
+                                                    &model,
+                                                )?;
+                                            }
+                                            Ok::<(), tupi_store::StoreError>(())
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(error)) => {
+                                                tracing::warn!(%error, "falha ao salvar credenciais do openai-plan no redb");
+                                                save_error = Some(error.to_string());
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, "falha na tarefa de salvamento do openai-plan");
+                                                save_error = Some(error.to_string());
+                                            }
+                                        }
+                                    } else {
+                                        save_error =
+                                            Some("banco local redb indisponível".to_string());
+                                    }
+
+                                    Self::register_openai_plan_credentials(
+                                        &registry,
+                                        creds,
+                                        store.clone(),
+                                    );
+
+                                    if let (Some(store_ref), Some(prov)) = (
+                                        store.as_ref(),
+                                        registry.get(tupi_providers::openai_plan::PROVIDER_ID),
+                                    ) && let Ok(models) = prov.list_models().await
+                                    {
+                                        let now_unix = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .map(|elapsed| elapsed.as_secs())
+                                            .unwrap_or(0);
+                                        let store_clone = Arc::clone(store_ref);
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            store_clone.save_models(
+                                                tupi_providers::openai_plan::PROVIDER_ID,
+                                                &models,
+                                                now_unix,
+                                            )
+                                        })
+                                        .await;
+                                    }
+
+                                    let message = if let Some(err) = save_error {
+                                        format!(
+                                            "OpenAI (plano ChatGPT) conectado, mas falhou ao salvar no redb: {err}"
+                                        )
+                                    } else {
+                                        "OpenAI (plano ChatGPT) conectado e salvo! Digite /models para selecionar o modelo.".to_string()
+                                    };
+
+                                    events.publish(Event::Notice { message });
+                                }
+                                Err(err) => {
+                                    events.publish(Event::Notice {
+                                        message: format!(
+                                            "Falha na autenticação OpenAI (plano ChatGPT): {err}"
+                                        ),
+                                    });
+                                }
+                            }
+                        });
+
+                        Ok(CommandOutcome::Started { request_id: 0 })
                     } else {
                         Err(CommandError::Internal(format!("provedor '{provider}' não suporta /connect")))
                     }
@@ -2309,7 +2685,9 @@ impl QueryHandler for App {
         let result = async {
             match query {
                 Query::History => Ok(QueryResult::History(self.session.messages())),
-                Query::ListProviders => Ok(QueryResult::Providers(self.registry.ids())),
+                Query::ListProviders => Ok(QueryResult::Providers(Self::connectable_providers(
+                    &self.registry,
+                ))),
                 Query::ListModels => {
                     let id = self.provider_id.lock().unwrap().clone();
                     let provider = self.registry.get(&id).ok_or_else(|| {
@@ -2689,9 +3067,83 @@ mod budget_tests {
     }
 
     #[test]
-    fn the_scale_moves_toward_the_observation() {
-        assert_eq!(next_scale(SCALE_ONE, Some(SCALE_ONE * 3)), SCALE_ONE * 2);
-        assert_eq!(next_scale(SCALE_ONE * 2, None), SCALE_ONE * 2);
+    fn the_scale_never_rises_inside_the_turn() {
+        // Provider cobrando cada vez mais: nada disso pode inflar a escala no
+        // meio do turno, senão a poda reabre e o prefixo cacheado morre.
+        let mut scale = SCALE_ONE / 2 * 3;
+        for observed in [SCALE_ONE * 2, SCALE_ONE * 3, SCALE_MAX] {
+            let next = next_scale_in_turn(scale, Some(observed));
+            assert_eq!(next, scale, "subiu no meio do turno: {scale} -> {next}");
+            scale = next;
+        }
+        // Subestimativa cai no mesmo passo, sem média.
+        assert_eq!(next_scale_in_turn(scale, Some(SCALE_ONE)), SCALE_ONE);
+        assert_eq!(next_scale_in_turn(SCALE_ONE, Some(SCALE_MIN)), SCALE_MIN);
+        assert_eq!(next_scale_in_turn(SCALE_ONE, None), SCALE_ONE);
+    }
+
+    #[test]
+    fn the_scale_can_fall_on_every_step_of_the_turn() {
+        let start = next_scale_at_turn_boundary(SCALE_MAX);
+        let mut scale = start;
+        for observed in [
+            SCALE_MAX,
+            SCALE_ONE * 3,
+            SCALE_ONE * 2,
+            SCALE_ONE,
+            SCALE_MIN,
+        ] {
+            let next = next_scale_in_turn(scale, Some(observed));
+            assert!(next <= scale, "passo subiu: {scale} -> {next}");
+            scale = next;
+        }
+        assert_eq!(scale, SCALE_MIN);
+        assert!(scale < start, "o turno não encolheu o orçamento");
+    }
+
+    #[test]
+    fn the_scale_rises_only_at_the_turn_boundary() {
+        let mut scale = SCALE_MIN;
+        // Observações altas dentro do turno não sobem nada...
+        for observed in [SCALE_MAX, SCALE_ONE * 2] {
+            scale = next_scale_in_turn(scale, Some(observed));
+            assert_eq!(scale, SCALE_MIN);
+        }
+        // ...e a virada é a única janela que sobe, meio caminho por turno.
+        for _ in 0..4 {
+            let next = next_scale_at_turn_boundary(scale);
+            assert!(next > scale, "virada não subiu: {scale} -> {next}");
+            assert!(next <= SCALE_ONE, "subiu além do neutro: {next}");
+            scale = next;
+        }
+    }
+
+    #[test]
+    fn the_scale_stays_within_bounds_on_both_paths() {
+        let currents = [0, 1, SCALE_MIN, SCALE_ONE, SCALE_MAX, u64::MAX];
+        let observations = [
+            None,
+            Some(0),
+            Some(1),
+            Some(SCALE_MIN),
+            Some(SCALE_ONE),
+            Some(SCALE_MAX),
+            Some(u64::MAX),
+        ];
+        for current in currents {
+            for observed in observations {
+                let next = next_scale_in_turn(current, observed);
+                assert!(
+                    (SCALE_MIN..=SCALE_MAX).contains(&next),
+                    "no turno: {current} {observed:?} -> {next}"
+                );
+            }
+            let boundary = next_scale_at_turn_boundary(current);
+            assert!(
+                (SCALE_MIN..=SCALE_MAX).contains(&boundary),
+                "virada: {current} -> {boundary}"
+            );
+        }
     }
 
     #[test]
@@ -4168,7 +4620,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_are_subtracted_from_the_message_budget() {
+    fn fixed_tokens_are_subtracted_from_the_message_budget() {
         let messages = history_with_user_turns(6, 2_000);
         let plan = plan_context(&messages, 5_000, 5_000, 3, 2_000);
 
@@ -4178,6 +4630,20 @@ mod tests {
             "estimativa {} passou do teto de mensagens",
             plan.estimate
         );
+    }
+
+    #[test]
+    fn the_fixed_tokens_total_adds_every_non_prunable_part() {
+        let fixed = StepFixedTokens {
+            tool_schema: 10_613,
+            memory: 900,
+            manifest: 400,
+            prefix: 6_500,
+            warning: 120,
+        };
+
+        assert_eq!(fixed.total(), 10_613 + 900 + 400 + 6_500 + 120);
+        assert_eq!(StepFixedTokens::default().total(), 0);
     }
 
     #[test]
@@ -4205,6 +4671,40 @@ mod tests {
         let plan = plan_context(&messages, 500, 0, 0, 0);
 
         assert_eq!(plan.shrunk_results, 1);
+    }
+
+    /// Duas leituras idênticas (mesmo `(path, blake3)`) viram um ponteiro
+    /// interno: o corpo continua no contexto, então não há corte a anunciar.
+    /// Replanejar o histórico já deduplicado não reporta nada de novo — o mesmo
+    /// contrato de `replanning_already_shrunk_history_...` no domínio.
+    #[test]
+    fn a_deduplicated_history_does_not_emit_a_false_cut_event() {
+        let body = "let x = 1;\n".repeat(2_000);
+        let read = |id: &str| {
+            Message::tool(
+                id,
+                format!("### `src/a.rs` — 12 linhas · blake3 `aaaa1111`\n\n```\n{body}```\n"),
+            )
+        };
+        let messages = vec![
+            Message::new(Role::User, "leia o mesmo arquivo duas vezes"),
+            Message::assistant("lendo"),
+            read("c1"),
+            Message::assistant("de novo"),
+            read("c2"),
+        ];
+
+        let first = plan_context(&messages, 8_000, 4_000, 3, 0);
+        assert_eq!(first.deduped_results, 1);
+        assert_eq!(first.shrunk_results, 0);
+        assert_eq!(first.omitted_units, 0);
+        assert!(first.trimmed(), "o histórico mudou: precisa ser regravado");
+        assert!(!first.cut(), "dedup não é corte: nada saiu do contexto");
+
+        let second = plan_context(&first.messages, 8_000, 4_000, 3, 0);
+        assert_eq!(second.deduped_results, 0);
+        assert!(!second.trimmed());
+        assert!(!second.cut(), "histórico já deduplicado não gera evento");
     }
 
     #[test]
@@ -4407,5 +4907,31 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("last-prompt-message.md")).unwrap();
         assert!(text.contains("# Última mensagem do usuário\n\noi"));
         assert!(text.contains("\"model\": \"teste\""));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connect_provider_keeps_the_current_message() {
+        let bus = EventBus::new(4);
+        let app = App::with_store(
+            registry(Arc::new(FakeProvider { tokens: Vec::new() })),
+            "fake",
+            "teste".to_string(),
+            bus,
+            None,
+        );
+
+        let error = app
+            .handle(Command::Connect {
+                provider: "desconhecido".into(),
+            })
+            .await
+            .expect_err("id desconhecido não abre fluxo de login");
+
+        match error {
+            CommandError::Internal(message) => {
+                assert_eq!(message, "provedor 'desconhecido' não suporta /connect");
+            }
+            _ => panic!("esperava CommandError::Internal"),
+        }
     }
 }

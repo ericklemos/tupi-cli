@@ -1,6 +1,8 @@
 pub use tupi_domain::WORKFLOWS_PREFIX;
 
 use crate::sdd::SDD_COMMAND;
+/// Comando cujo argumento é um id de provedor; o namespace abre depois do espaço.
+pub const CONNECT_COMMAND: &str = "/connect";
 pub const COMMANDS: &[&str] = &[
     "/dashboard",
     "/models",
@@ -103,6 +105,10 @@ pub struct ChatState {
     pub workflows: Vec<String>,
     /// Slugs dos planos SDD retomáveis, usados depois de `/sdd `.
     pub sdd_specs: Vec<String>,
+    /// Ids dos provedores registrados no registry, usados depois de
+    /// `/connect `. Vem do app no boot: lista fixa aqui inventaria provedor
+    /// sem credencial nem modelo.
+    pub providers: Vec<String>,
     /// Sessão marcada para apagar com o segundo `d`, se houver.
     pub pending_delete: Option<String>,
     /// Índices de `ChatEntry::Tool` com o detalhe aberto. Só estado de UI:
@@ -611,6 +617,19 @@ impl ChatState {
                 .map(|slug| format!("{SDD_COMMAND} {slug}"))
                 .filter(|command| command.as_str() != input)
                 .collect()
+        } else if let Some(prefix) = input
+            .strip_prefix(CONNECT_COMMAND)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            // `/connect ` abre o catálogo de provedores conhecidos. O item
+            // completo não ganha espaço final: com espaço depois do id o
+            // prefixo não casa mais nada e a lista fecha em vez de reabrir.
+            self.providers
+                .iter()
+                .filter(|id| id.starts_with(prefix))
+                .map(|id| format!("{CONNECT_COMMAND} {id}"))
+                .filter(|command| command.as_str() != input)
+                .collect()
         } else if eligible {
             COMMANDS
                 .iter()
@@ -703,6 +722,7 @@ impl ChatState {
     pub fn reset_for_new_session(&mut self) {
         let workflows = std::mem::take(&mut self.workflows);
         let sdd_specs = std::mem::take(&mut self.sdd_specs);
+        let providers = std::mem::take(&mut self.providers);
         let mode = self.mode;
         *self = ChatState::default();
         // O transcript que guardava os blocos abertos foi descartado: sessão
@@ -710,6 +730,7 @@ impl ChatState {
         self.expanded.clear();
         self.workflows = workflows;
         self.sdd_specs = sdd_specs;
+        self.providers = providers;
         self.mode = mode;
     }
 }
@@ -1090,11 +1111,64 @@ mod tests {
     }
 
     #[test]
+    fn connect_ids_appear_only_after_the_space() {
+        let mut state = ChatState {
+            providers: vec!["deepseek".into(), "antigravity".into(), "openai-plan".into()],
+            input: "/connect ".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+        assert_eq!(
+            state.suggestions,
+            Some(vec![
+                "/connect deepseek".into(),
+                "/connect antigravity".into(),
+                "/connect openai-plan".into(),
+            ])
+        );
+
+        // O prefixo do id filtra a lista; um id completo não se repete.
+        state.input = "/connect anti".into();
+        state.refresh_suggestions();
+        assert_eq!(state.suggestion_selected(), Some("/connect antigravity"));
+
+        state.input = "/connect zzz".into();
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+
+        // Sem o espaço não há namespace de ids: vale só o comando.
+        state.input = "/connect".into();
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
+    fn tab_completes_a_provider_id_and_the_space_does_not_reopen_it() {
+        let mut state = ChatState {
+            providers: vec!["openai-plan".into()],
+            input: "/connect op".into(),
+            ..ChatState::default()
+        };
+        state.refresh_suggestions();
+
+        state.accept_suggestion();
+
+        assert_eq!(state.input, "/connect openai-plan");
+        assert!(!state.suggestions_visible());
+
+        // Espaço depois do id não reabre a lista.
+        state.input.push(' ');
+        state.refresh_suggestions();
+        assert!(!state.suggestions_visible());
+    }
+
+    #[test]
     fn new_session_preserves_the_command_catalogs() {
         let mut state = ChatState {
             input: "/sdd auth".into(),
             workflows: vec!["feature".into()],
             sdd_specs: vec!["auth".into()],
+            providers: vec!["deepseek".into()],
             mode: tupi_kernel::AgentMode::Sdd,
             ..ChatState::default()
         };
@@ -1106,6 +1180,7 @@ mod tests {
         assert!(state.input.is_empty());
         assert_eq!(state.workflows, vec!["feature"]);
         assert_eq!(state.sdd_specs, vec!["auth"]);
+        assert_eq!(state.providers, vec!["deepseek"]);
         assert_eq!(state.mode, tupi_kernel::AgentMode::Sdd);
     }
     #[test]

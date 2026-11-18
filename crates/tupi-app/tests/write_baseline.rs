@@ -44,10 +44,7 @@ fn changed_lines(before: &str, after: &str) -> (usize, bool) {
     let a: Vec<&str> = before.lines().collect();
     let b: Vec<&str> = after.lines().collect();
     if a.len() > CAP || b.len() > CAP {
-        return (
-            a.len().max(b.len()),
-            true,
-        );
+        return (a.len().max(b.len()), true);
     }
     let mut previous = vec![0usize; b.len() + 1];
     let mut current = vec![0usize; b.len() + 1];
@@ -220,7 +217,10 @@ fn write_baseline() {
                     } else {
                         row.failed += 1;
                         *errors
-                            .entry(format!("{name}: {}", error.chars().take(110).collect::<String>()))
+                            .entry(format!(
+                                "{name}: {}",
+                                error.chars().take(110).collect::<String>()
+                            ))
                             .or_default() += 1;
                         let class = refusal_class(&error);
                         match name.as_str() {
@@ -283,7 +283,9 @@ fn write_baseline() {
     report.push_str(
         "| extensão | chamadas | write | write_many | edit | patch | ok | falhas | write stale | edit hash | edit língua | edit símbolo | edit ambíguo | write cirúrgico |\n",
     );
-    report.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    report.push_str(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+    );
     for (ext, row) in &sorted {
         report.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",

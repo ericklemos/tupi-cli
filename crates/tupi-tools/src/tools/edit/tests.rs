@@ -40,6 +40,9 @@ fn params(dir: &TempDir, symbol: &str, body: &str) -> EditParams {
         new_body: Some(body.into()),
         signature: None,
         budget_tokens: None,
+        start: None,
+        end: None,
+        expect: None,
     }
 }
 
@@ -183,6 +186,9 @@ fn a_struct_body_is_editable() {
         new_body: Some("{\n    x: u8,\n    y: u8,\n}".into()),
         signature: None,
         budget_tokens: None,
+        start: None,
+        end: None,
+        expect: None,
     })
     .unwrap();
 
@@ -213,6 +219,9 @@ fn a_non_utf8_file_is_rejected() {
             new_body: Some("{}".into()),
             signature: None,
             budget_tokens: None,
+            start: None,
+            end: None,
+            expect: None,
         })
         .unwrap_err();
     assert!(matches!(error, ToolError::Other(_)), "{error:?}");
@@ -267,6 +276,9 @@ fn a_body_that_smuggles_a_second_item_is_refused() {
             new_body: Some("{\n    text: String,\n}\n\npub struct Cache {\n    width: usize,\n}".into()),
             signature: None,
             budget_tokens: None,
+            start: None,
+            end: None,
+            expect: None,
         })
         .unwrap_err();
 
@@ -288,6 +300,9 @@ fn a_request_without_symbol_or_old_is_refused_naming_both_routes() {
             new_body: None,
             signature: None,
             budget_tokens: None,
+            start: None,
+            end: None,
+            expect: None,
         })
         .unwrap_err();
 
@@ -319,6 +334,9 @@ fn symbol_and_old_together_are_refused_as_alternatives() {
             new_body: None,
             signature: None,
             budget_tokens: None,
+            start: None,
+            end: None,
+            expect: None,
         })
         .unwrap_err();
 
@@ -331,4 +349,16 @@ fn symbol_and_old_together_are_refused_as_alternatives() {
         message.contains("`symbol`") && message.contains("`old`"),
         "{message}"
     );
+}
+
+#[test]
+fn a_signature_can_rename_the_symbol() {
+    let dir = fixture();
+    let mut request = params(&dir, "verify", "{\n    1\n}");
+    request.signature = Some("fn check".into());
+
+    tool_for(dir.path()).edit(request).unwrap();
+
+    let after = fs::read_to_string(dir.path().join("auth.rs")).unwrap();
+    assert!(after.contains("fn check"), "{after}");
 }

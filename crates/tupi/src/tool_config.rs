@@ -10,6 +10,14 @@ use crate::token::{CONFIG_DIR, FileConfigError};
 /// Limite de passos de tool call usado quando `configs/tools.ron` está ausente.
 pub const DEFAULT_MAX_TOOL_STEPS: usize = 30;
 
+/// Seção `shell`: quais binários a tool `shell` aceita rodar.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShellConfig {
+    /// Binários liberados, por basename. Vazio é ausência: vale o projeto.
+    pub allow: Vec<String>,
+}
+
 /// Conteúdo de `configs/tools.ron`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -22,6 +30,9 @@ pub struct ToolConfig {
     /// Expõe todas as tools registradas, ignorando `expose`.
     #[serde(default)]
     pub expose_all: bool,
+    /// Allowlist da tool `shell`. Ausente deixa `ai.project.json` mandar.
+    #[serde(default)]
+    pub shell: Option<ShellConfig>,
 }
 
 impl ToolConfig {
@@ -35,6 +46,18 @@ impl ToolConfig {
             tupi_tools::Exposure::Only(&self.expose)
         }
     }
+
+    /// Allowlist do `shell` declarada aqui, pronta para o `ShellTool`.
+    ///
+    /// `None` mantém o caminho antigo (`ai.project.json` e, sem ele, o padrão
+    /// do código): lista vazia é ausência, como em `expose`.
+    pub fn shell_allow(&self) -> Option<Vec<String>> {
+        let shell = self.shell.as_ref()?;
+        if shell.allow.is_empty() {
+            return None;
+        }
+        Some(shell.allow.clone())
+    }
 }
 
 impl Default for ToolConfig {
@@ -43,6 +66,7 @@ impl Default for ToolConfig {
             max_tool_steps: DEFAULT_MAX_TOOL_STEPS,
             expose: Vec::new(),
             expose_all: false,
+            shell: None,
         }
     }
 }
@@ -134,6 +158,26 @@ mod tests {
     fn an_unknown_field_is_refused() {
         let path = Path::new("tools.ron");
         assert!(parse_tools("(max_tool_steps: 1, passos: 2)", path).is_err());
+    }
+
+    #[test]
+    fn the_shell_section_lists_the_allowed_binaries() {
+        let path = Path::new("tools.ron");
+        let config = parse_tools(r#"(shell: (allow: ["jq", "git"]))"#, path).unwrap();
+        assert_eq!(config.shell_allow().unwrap(), vec!["jq", "git"]);
+    }
+
+    #[test]
+    fn an_empty_shell_section_leaves_the_project_in_charge() {
+        let path = Path::new("tools.ron");
+        let config = parse_tools("(shell: (allow: []))", path).unwrap();
+        assert!(config.shell_allow().is_none());
+    }
+
+    #[test]
+    fn an_unknown_shell_field_is_refused() {
+        let path = Path::new("tools.ron");
+        assert!(parse_tools(r#"(shell: (allows: ["jq"]))"#, path).is_err());
     }
 
     #[test]

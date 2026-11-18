@@ -33,6 +33,9 @@ fn literal(dir: &TempDir, path: &str, old: &str, new: &str) -> EditParams {
         new_body: None,
         signature: None,
         budget_tokens: None,
+        start: None,
+        end: None,
+        expect: None,
     }
 }
 

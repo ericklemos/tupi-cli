@@ -44,6 +44,9 @@ pub struct ShellTool {
     root_dir: PathBuf,
     store: Arc<ResponseStore>,
     default_budget_tokens: usize,
+    /// Allowlist resolvida em `configs/tools.ron`. `None` mantém a leitura de
+    /// `ai.project.json` a cada chamada.
+    allow: Option<Vec<String>>,
 }
 
 impl ShellTool {
@@ -52,6 +55,35 @@ impl ShellTool {
             root_dir,
             store,
             default_budget_tokens,
+            allow: None,
+        }
+    }
+
+    /// Fixa a allowlist vinda de `configs/tools.ron` (seção `shell`).
+    ///
+    /// Lista vazia é ausência: cai no `ai.project.json` como antes.
+    pub fn with_allow(mut self, allow: Option<Vec<String>>) -> Self {
+        self.allow = allow.filter(|names| !names.is_empty());
+        self
+    }
+}
+
+/// De onde saiu a allowlist: só o texto da recusa muda, que precisa mandar
+/// editar o arquivo certo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllowOrigin {
+    /// Seção `shell` de `configs/tools.ron`.
+    ToolsRon,
+    /// Bloco `shell` de `ai.project.json`, ou o padrão do código.
+    Project,
+}
+
+impl AllowOrigin {
+    /// Onde liberar o binário, dito na recusa.
+    fn release_path(self) -> &'static str {
+        match self {
+            Self::ToolsRon => "a chave `allow` da secao `shell` de `configs/tools.ron`",
+            Self::Project => "a chave `shell.allow` de `ai.project.json`",
         }
     }
 }
@@ -185,7 +217,7 @@ impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell".to_string(),
-            description: "Roda um comando no root e devolve a saida. Por padrao a saida bruta volta inteira; terms so filtra com filter: true, e entao o cabecalho declara quantas linhas o filtro omitiu. O binario precisa estar na allowlist do projeto (ai.project.json, chave shell.allow); composicao de comandos nao e permitida. Comando que tem tool equivalente (grep/rg, cat/head/tail, ls/find/tree, sed, rm/mv/cp, curl/wget, sha256sum) e recusado sempre, mesmo listado em shell.allow: a recusa ensina a tool que faz o mesmo. Fora `cargo fmt`, cargo pertence ao tool exec; git so roda subcomando de leitura (status, diff, log, show).".to_string(),
+            description: "Roda um comando no root e devolve a saida. Por padrao a saida bruta volta inteira; terms so filtra com filter: true, e entao o cabecalho declara quantas linhas o filtro omitiu. O binario precisa estar na allowlist do projeto (configs/tools.ron, secao `shell`; ou ai.project.json, chave shell.allow); composicao de comandos nao e permitida. Comando que tem tool equivalente (grep/rg, cat/head/tail, ls/find/tree, sed, rm/mv/cp, curl/wget, sha256sum) e recusado sempre, mesmo listado em shell.allow: a recusa ensina a tool que faz o mesmo. Fora `cargo fmt`, cargo pertence ao tool exec; git so roda subcomando de leitura (status, diff, log, show).".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -414,7 +446,7 @@ impl Tool for ShellTool {
         /// Motivo da recusa e, principalmente, a alternativa equivalente:
         /// recusar sem dizer o caminho custa um retry as cegas. Nada aqui
         /// pede mais poder do que a regra ja permite.
-        fn refusal(command: &str, allow: &[String]) -> String {
+        fn refusal(command: &str, allow: &[String], origin: AllowOrigin) -> String {
             let command = command.trim();
             let invitation = " Se nenhuma alternativa serve, registre o atrito com a tool `feedback` (action: \"record\", kind: \"refusal\").";
             if composes(command) || command.contains("--manifest-path") {
@@ -448,7 +480,8 @@ o mesmo com `keywords: [\"A\", \"B\"]`.{invitation}"
                 );
             }
             format!(
-                "comando recusado: {command}. O binario `{basename}` nao esta liberado: inclua \"{basename}\" na chave shell.allow de ai.project.json.{invitation}"
+                "comando recusado: {command}. O binario `{basename}` nao esta liberado: inclua \"{basename}\" em {}.{invitation}",
+                origin.release_path()
             )
         }
 
@@ -482,10 +515,24 @@ o mesmo com `keywords: [\"A\", \"B\"]`.{invitation}"
             root.shell?.allow
         };
 
-        let allow: Vec<String> = project_allow()
-            .unwrap_or_else(|| DEFAULT_ALLOW.iter().map(|name| name.to_string()).collect());
+        // Precedencia: `configs/tools.ron` > `ai.project.json` > padrao. A
+        // origem viaja para a recusa, que precisa mandar editar o arquivo certo.
+        let (allow, origin) = match self.allow.as_ref() {
+            Some(names) => (names.clone(), AllowOrigin::ToolsRon),
+            None => match project_allow() {
+                Some(names) => (names, AllowOrigin::Project),
+                None => (
+                    DEFAULT_ALLOW.iter().map(|name| name.to_string()).collect(),
+                    AllowOrigin::Project,
+                ),
+            },
+        };
         if !allowed(&params.command, &allow) {
-            return Err(ToolError::InvalidArguments(refusal(&params.command, &allow)));
+            return Err(ToolError::InvalidArguments(refusal(
+                &params.command,
+                &allow,
+                origin,
+            )));
         }
 
         // Binario ausente nao derruba o turno: nada roda, e a resposta diz o

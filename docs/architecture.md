@@ -1,3 +1,4 @@
+## docs/architecture.md
 # Arquitetura
 
 ## Camadas
@@ -30,6 +31,10 @@ crates:
 - Poder de execução só encolhe: o `shell` recusa antes de rodar o que está fora
   da allowlist e nenhuma correção dele amplia o que pode ser executado (ver
   [`features/shell-tool.md`](features/shell-tool.md)).
+- Orçamento de contexto é decidido em `tupi-app` e a poda em `tupi-domain`: o
+  piso fixo do passo é somado num ponto só e subtraído **antes** de derivar o
+  alvo de mensagens (ver
+  [`features/context-budget.md`](features/context-budget.md)).
 
 ## Componentes
 
@@ -41,6 +46,10 @@ crates:
   inspeção crua: allowlist restrita, recusa que ensina a alternativa e nenhuma
   memória de projeto no resultado (ver
   [`features/shell-tool.md`](features/shell-tool.md)).
+- **Janela de contexto** (`tupi-domain::context` + `plan_context` em
+  `tupi-app`): piso fixo nomeado (`StepFixedTokens`), dedup por
+  `(path, blake3)` antes do shrink e escala de correção que só desce dentro do
+  turno (ver [`features/context-budget.md`](features/context-budget.md)).
 - **Cliente MCP** (`tupi-tools::mcp`): a seção `mcp` do `ai.project.json` vira
   uma tool só (`servers`/`tools`/`call`), JSON-RPC 2.0 por stdio com timeout por
   leitura, spawn lazy e filho ceifado no drop; `type: "remote"` é recusado até a

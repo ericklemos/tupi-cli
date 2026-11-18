@@ -41,6 +41,17 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Instante em milissegundos, a mesma unidade do campo `Feedback::ts_ms`.
+///
+/// `now` é em segundos: registros de feedback gravados com ele ficaram com
+/// `ts_ms` mil vezes menor. Leia qualquer valor abaixo de 10^11 como segundos.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Fact {
     #[serde(default)]

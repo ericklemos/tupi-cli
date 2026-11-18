@@ -7,6 +7,10 @@ const TUPI_MODEL: &str = "TUPI_MODEL";
 const LOG: &str = "TUPI_LOG";
 const DEFAULT_MODEL: &str = "deepseek-flash";
 const DEFAULT_ANTIGRAVITY_MODEL: &str = "antigravity-gemini-3.8-flash";
+/// Cabeça do catálogo fixo de `openai_plan::models()`, mantida aqui como literal
+/// pelo mesmo motivo do modelo Antigravity: a config não lê a rede nem o env do
+/// provedor para decidir o padrão.
+const DEFAULT_OPENAI_PLAN_MODEL: &str = "gpt-5.2-codex";
 const DEFAULT_LOG: &str = "info";
 const DEFAULT_PROVIDER: &str = "deepseek";
 
@@ -24,6 +28,16 @@ pub enum ConfigError {
     Missing(&'static str),
 }
 
+/// Provedores que autenticam por assinatura (OAuth) e por isso não exigem
+/// `DEEPSEEK_API_KEY`; cada um tem o próprio modelo padrão.
+fn subscription_default_model(provider: &str) -> Option<&'static str> {
+    match provider {
+        tupi_providers::openai_plan::PROVIDER_ID => Some(DEFAULT_OPENAI_PLAN_MODEL),
+        "antigravity" => Some(DEFAULT_ANTIGRAVITY_MODEL),
+        _ => None,
+    }
+}
+
 pub fn from_env<F>(get: F) -> Result<Config, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -32,13 +46,14 @@ where
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
 
-    let (api_key, default_model) = if provider == "antigravity" {
-        (get(KEY).unwrap_or_default(), DEFAULT_ANTIGRAVITY_MODEL)
-    } else {
-        let key = get(KEY)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ConfigError::Missing(KEY))?;
-        (key, DEFAULT_MODEL)
+    let (api_key, default_model) = match subscription_default_model(&provider) {
+        Some(default_model) => (get(KEY).unwrap_or_default(), default_model),
+        None => {
+            let key = get(KEY)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(ConfigError::Missing(KEY))?;
+            (key, DEFAULT_MODEL)
+        }
     };
 
     let model = get(TUPI_MODEL)
@@ -95,6 +110,38 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, "antigravity");
         assert_eq!(config.model, "antigravity-gemini-3.8-flash");
+    }
+
+    #[test]
+    fn openai_plan_boots_without_deepseek_key() {
+        let config = from_env(|key| match key {
+            PROVIDER => Some("openai-plan".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.provider, "openai-plan");
+        assert_eq!(config.model, "gpt-5.2-codex");
+        assert!(config.api_key.is_empty());
+    }
+
+    #[test]
+    fn openai_plan_model_can_be_overridden() {
+        let config = from_env(|key| match key {
+            PROVIDER => Some("openai-plan".to_string()),
+            TUPI_MODEL => Some("gpt-5.1-codex-mini".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.model, "gpt-5.1-codex-mini");
+    }
+
+    #[test]
+    fn deepseek_still_requires_the_key() {
+        for provider in ["deepseek", "outro"] {
+            let error = from_env(|key| (key == PROVIDER).then(|| provider.to_string()))
+                .expect_err("provedor sem assinatura exige chave");
+            assert!(error.to_string().contains(KEY));
+        }
     }
 
     #[test]

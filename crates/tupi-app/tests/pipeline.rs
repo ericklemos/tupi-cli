@@ -122,7 +122,11 @@ impl Tool for FakeTool {
         }
     }
     fn effect(&self, _arguments: &Value) -> tupi_kernel::Effect {
-        if self.mutating { tupi_kernel::Effect::Opaque } else { tupi_kernel::Effect::ReadOnly }
+        if self.mutating {
+            tupi_kernel::Effect::Opaque
+        } else {
+            tupi_kernel::Effect::ReadOnly
+        }
     }
 }
 

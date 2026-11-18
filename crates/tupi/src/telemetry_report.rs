@@ -35,6 +35,24 @@ pub struct TurnRow {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
+    /// O passo a passo do turno, na ordem em que os passos foram gravados.
+    pub step_rows: Vec<StepRow>,
+}
+
+/// Um passo do turno: a escala de correção **em vigor no envio**
+/// (`provider_response.scale_ppm`) e a fatia cacheada do prompt cobrado.
+///
+/// O total do turno esconde as duas coisas que decidem custo: uma escala que
+/// oscila dentro do turno troca o request a cada passo e derruba
+/// `cached_tokens`; uma escala monotônica preserva o prefixo. Por isso os dois
+/// números aparecem por passo, não somados.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StepRow {
+    pub step: u64,
+    /// `None` quando a linha não trazia `scale_ppm` (arquivo de schema antigo).
+    pub scale_ppm: Option<u64>,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -99,6 +117,32 @@ where
                 row.prompt_tokens += value["prompt_tokens"].as_u64().unwrap_or_default();
                 row.cached_tokens += value["cached_tokens"].as_u64().unwrap_or_default();
                 row.completion_tokens += value["completion_tokens"].as_u64().unwrap_or_default();
+                // Passo a passo: reemissão por truncagem repete o `step`, então o
+                // mesmo passo acumula tokens — e a escala em vigor é a última
+                // gravada, a que o app usou no envio seguinte.
+                let step = value["step"].as_u64().unwrap_or_default();
+                let prompt = value["prompt_tokens"].as_u64().unwrap_or_default();
+                let cached = value["cached_tokens"].as_u64().unwrap_or_default();
+                let scale = value["scale_ppm"].as_u64();
+                match row
+                    .step_rows
+                    .iter_mut()
+                    .find(|step_row| step_row.step == step)
+                {
+                    Some(step_row) => {
+                        step_row.prompt_tokens += prompt;
+                        step_row.cached_tokens += cached;
+                        if scale.is_some() {
+                            step_row.scale_ppm = scale;
+                        }
+                    }
+                    None => row.step_rows.push(StepRow {
+                        step,
+                        scale_ppm: scale,
+                        prompt_tokens: prompt,
+                        cached_tokens: cached,
+                    }),
+                }
             }
             "tool_finished" => {
                 row.tool_calls += 1;
@@ -154,6 +198,12 @@ pub struct ToolRow {
 
 fn short(run: &str) -> String {
     run.chars().take(8).collect()
+}
+
+/// Escala em partes por milhão no formato do relatório: `1.0000` = estimativa
+/// exata, abaixo disso o app planeja com menos orçamento do que estimou.
+fn scale_label(ppm: u64) -> String {
+    format!("{:.4}", ppm as f64 / 1_000_000.0)
 }
 
 fn share(part: u64, total: u64) -> String {
@@ -246,6 +296,43 @@ pub fn render(report: &Report, path: &Path, limit: usize) -> String {
         rereads,
         rereads as f64 / turns.len() as f64
     ));
+
+    // Escala e `cached_tokens` por passo: o total do turno não distingue um
+    // prefixo cacheado preservado (escala parada) de um request trocado a cada
+    // passo (escala oscilando). Antes/depois de qualquer mudança de política se
+    // compara aqui, passo a passo, no mesmo turno.
+    out.push('\n');
+    let per_step: Vec<&TurnRow> = shown
+        .iter()
+        .filter(|row| !row.step_rows.is_empty())
+        .collect();
+    if per_step.is_empty() {
+        out.push_str("passos: nenhum `provider_response` com `step` nos turnos exibidos\n");
+    } else {
+        out.push_str(
+            "passos dos turnos exibidos (escala em vigor no envio · cache = cached/prompt):\n",
+        );
+        out.push_str(&format!(
+            "{:<8} {:>6} {:>6} {:>8} {:>10} {:>10} {:>7}\n",
+            "run", "turno", "passo", "escala", "prompt", "cached", "cache"
+        ));
+        for row in &per_step {
+            for step in &row.step_rows {
+                out.push_str(&format!(
+                    "{:<8} {:>6} {:>6} {:>8} {:>10} {:>10} {:>7}\n",
+                    short(&row.run),
+                    row.request,
+                    step.step,
+                    step.scale_ppm
+                        .map(scale_label)
+                        .unwrap_or_else(|| "-".to_string()),
+                    step.prompt_tokens,
+                    step.cached_tokens,
+                    share(step.cached_tokens, step.prompt_tokens)
+                ));
+            }
+        }
+    }
 
     // Histograma por tool: chamadas desc e, no empate, o nome asc que o
     // `BTreeMap` já entrega (o sort é estável). `ok`/`falhas` dizem onde a tool
@@ -554,6 +641,51 @@ mod tests {
             .find(|row| row.starts_with("t0 "))
             .expect("linha da t0");
         assert!(t0_line.ends_with('0'), "{t0_line}");
+    }
+
+    #[test]
+    fn each_step_prints_its_scale_and_cached_tokens() {
+        // Turno de referência (T1.2) reduzido a três linhas: o que o relatório
+        // passa a mostrar é a escala em vigor e o cache de cada passo, não o
+        // total do turno.
+        let report = report(&[
+            line(
+                "provider_response",
+                r#""request":1,"step":1,"prompt_tokens":6328,"cached_tokens":4480,"scale_ppm":1000000"#,
+            ),
+            line(
+                "provider_response",
+                r#""request":1,"step":2,"prompt_tokens":10239,"cached_tokens":6400,"scale_ppm":870000"#,
+            ),
+            // Reemissão por truncagem repete o passo: os tokens somam e a escala
+            // em vigor é a última gravada.
+            line(
+                "provider_response",
+                r#""request":1,"step":2,"prompt_tokens":1000,"cached_tokens":600,"scale_ppm":830000"#,
+            ),
+            line("turn_finished", r#""request":1,"steps":2"#),
+        ]);
+
+        let out = render(&report, Path::new("telemetry.jsonl"), 0);
+        for column in ["passo", "escala", "cached", "cache"] {
+            assert!(out.contains(column), "coluna {column} ausente: {out}");
+        }
+
+        let row = |scale: &str| {
+            out.lines()
+                .find(|row| row.contains(scale))
+                .unwrap_or_else(|| panic!("passo com escala {scale} ausente: {out}"))
+                .to_string()
+        };
+        let first = row("1.0000");
+        assert!(first.contains("6328"), "{first}");
+        assert!(first.contains("4480"), "{first}");
+        assert!(first.ends_with("71%"), "{first}");
+
+        let second = row("0.8300");
+        assert!(second.contains("11239"), "cache/prompt somam o passo: {second}");
+        assert!(second.contains("7000"), "cache/prompt somam o passo: {second}");
+        assert!(second.ends_with("62%"), "{second}");
     }
 
     #[test]

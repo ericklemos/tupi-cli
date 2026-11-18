@@ -40,7 +40,9 @@ pub fn format_subtask_brief(
         &[
             (
                 "subtask_id",
-                subtask.map(|sub| sub.id.as_str()).unwrap_or(task.id.as_str()),
+                subtask
+                    .map(|sub| sub.id.as_str())
+                    .unwrap_or(task.id.as_str()),
             ),
             ("plan_title", plan.title.as_str()),
             ("plan_goal", plan.goal.as_str()),
@@ -280,7 +282,10 @@ mod tests {
     fn sdd_prefix_composes_the_project_prompt_with_the_configured_posture() {
         let posture = tupi_kernel::sdd_config().planning.posture;
         assert_eq!(compose_prefix("", AgentMode::Sdd), posture);
-        assert_eq!(compose_prefix("BASE", AgentMode::Sdd), format!("BASE\n\n{posture}"));
+        assert_eq!(
+            compose_prefix("BASE", AgentMode::Sdd),
+            format!("BASE\n\n{posture}")
+        );
         assert_eq!(compose_prefix("BASE", AgentMode::Execution), "BASE");
     }
 }

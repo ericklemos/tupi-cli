@@ -184,7 +184,9 @@ impl Telemetry {
 
     /// Caminho do arquivo bifurcado das execuções da tool `shell`, quando ligado.
     pub fn shell_path(&self) -> Option<&Path> {
-        self.shell.as_deref().and_then(|shell| shell.path.as_deref())
+        self.shell
+            .as_deref()
+            .and_then(|shell| shell.path.as_deref())
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -878,12 +880,18 @@ pub fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::Network(_) => "network",
         ProviderError::Http { .. } => "http",
         ProviderError::Protocol(_) => "protocol",
+        ProviderError::RateLimited { .. } => "rate_limited",
+        ProviderError::QuotaExhausted { .. } => "quota_exhausted",
+        ProviderError::InvalidArgument { .. } => "invalid_argument",
     }
 }
 
 pub fn provider_http_status(error: &ProviderError) -> Option<u16> {
     match error {
-        ProviderError::Http { status, .. } => Some(*status),
+        ProviderError::Http { status, .. }
+        | ProviderError::RateLimited { status, .. }
+        | ProviderError::QuotaExhausted { status, .. }
+        | ProviderError::InvalidArgument { status, .. } => Some(*status),
         _ => None,
     }
 }

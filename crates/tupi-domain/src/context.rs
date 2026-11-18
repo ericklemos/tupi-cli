@@ -25,6 +25,15 @@ pub const RECENT_RESULTS_KEPT: usize = 3;
 
 const POINTER_PREFIX: &str = "[resultado de tool omitido do contexto";
 
+/// Prefixo do ponteiro que aponta para um resultado idêntico ainda presente no
+/// histórico. Diferente de [`POINTER_PREFIX`], o corpo continua no contexto: é a
+/// única poda com p(recall) = 0 por construção, porque nada precisa ser relido.
+pub const DEDUP_PREFIX: &str = "[resultado de tool idêntico ao de";
+
+/// Marcador de identidade `(path, blake3)` impresso pelo cabeçalho do `read`.
+/// Só resultado com identidade verificável pode ser deduplicado.
+const IDENTITY_MARKER: &str = "· blake3 `";
+
 /// O que sobrou do histórico depois da poda.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -33,12 +42,22 @@ pub struct Plan {
     pub budget: usize,
     pub omitted_units: usize,
     pub shrunk_results: usize,
+    /// Resultados idênticos trocados por ponteiro para o primeiro ainda
+    /// presente no contexto. Não é corte: o corpo continua no histórico.
+    pub deduped_results: usize,
     /// A última unidade sozinha já estoura o orçamento. Nada seguro a cortar.
     pub over_budget: bool,
 }
 
 impl Plan {
     pub fn trimmed(&self) -> bool {
+        self.omitted_units > 0 || self.shrunk_results > 0 || self.deduped_results > 0
+    }
+
+    /// Houve corte de fato: uma unidade saiu do contexto ou um resultado virou
+    /// ponteiro para o `ResponseStore`. Dedup sozinho não é corte — o corpo
+    /// continua no histórico —, então só isto justifica o evento de poda.
+    pub fn cut(&self) -> bool {
         self.omitted_units > 0 || self.shrunk_results > 0
     }
 
@@ -55,6 +74,12 @@ impl Plan {
             text.push_str(&format!(
                 " · {} resultado(s) encurtado(s)",
                 self.shrunk_results
+            ));
+        }
+        if self.deduped_results > 0 {
+            text.push_str(&format!(
+                " · {} resultado(s) idêntico(s) apontado(s)",
+                self.deduped_results
             ));
         }
         if self.over_budget {
@@ -78,6 +103,7 @@ pub fn plan_with(messages: &[Message], budget: usize, recent_results: usize) -> 
         budget,
         omitted_units: 0,
         shrunk_results: 0,
+        deduped_results: 0,
         over_budget: false,
     };
 
@@ -89,7 +115,10 @@ pub fn plan_with(messages: &[Message], budget: usize, recent_results: usize) -> 
         return untouched(messages);
     }
 
-    let (mut kept, shrunk_results) = shrink_old_results(messages, recent_results);
+    // Dedup vem antes do shrink: é a única poda com p(recall) = 0, porque o
+    // corpo do resultado idêntico continua no mesmo contexto.
+    let (deduped_messages, deduped_results) = dedup_identical_results(messages);
+    let (mut kept, shrunk_results) = shrink_old_results(&deduped_messages, recent_results);
 
     let mut omitted_units = 0;
     let mut summary_lines: Vec<String> = Vec::new();
@@ -113,6 +142,7 @@ pub fn plan_with(messages: &[Message], budget: usize, recent_results: usize) -> 
         budget,
         omitted_units,
         shrunk_results,
+        deduped_results,
         over_budget: estimate > budget,
     }
 }
@@ -143,6 +173,10 @@ fn total(messages: &[Message]) -> usize {
 
 fn is_pointer(content: &str) -> bool {
     content.starts_with(POINTER_PREFIX)
+}
+
+fn is_dedup_pointer(content: &str) -> bool {
+    content.starts_with(DEDUP_PREFIX)
 }
 
 /// Substitui o conteúdo de resultados antigos por um ponteiro barato.
@@ -385,7 +419,7 @@ fn shrink_old_results(messages: &[Message], recent_results: usize) -> (Vec<Messa
 
     for &index in tool_indices.iter().take(shrinkable) {
         let message = &mut kept[index];
-        if is_pointer(&message.content) {
+        if is_pointer(&message.content) || is_dedup_pointer(&message.content) {
             continue;
         }
         let tokens = estimate_tokens(&message.content);
@@ -421,7 +455,77 @@ fn shrink_old_results(messages: &[Message], recent_results: usize) -> (Vec<Messa
     (kept, shrunk_count)
 }
 
-/// Quantas unidades (turnos do usuário) o histórico tem.
+/// Identidade verificável de um resultado de tool: o `(path, blake3)` que o
+/// cabeçalho do `read` imprime. Resultado sem esse cabeçalho fica de fora — a
+/// repetição de `exec`/`patch`/`write` é efeito colateral, não economia.
+fn verified_identity(content: &str) -> Option<(String, String)> {
+    let line = content
+        .lines()
+        .find(|line| line.starts_with("### ") && line.contains(IDENTITY_MARKER))?;
+    let path_start = line.find('`')? + 1;
+    let path_rest = &line[path_start..];
+    let path = &path_rest[..path_rest.find('`')?];
+    let hash_rest = &line[line.find(IDENTITY_MARKER)? + IDENTITY_MARKER.len()..];
+    let hash = &hash_rest[..hash_rest.find('`')?];
+    if path.is_empty() || hash.is_empty() {
+        return None;
+    }
+    Some((path.to_string(), hash.to_string()))
+}
+
+/// Deduplica resultados de tool com o mesmo `(path, blake3)`: o primeiro fica
+/// inteiro e os seguintes viram um ponteiro para o `tool_call_id` dele.
+///
+/// Só age sobre corpo idêntico byte a byte e identidade verificável no próprio
+/// conteúdo, então o texto apontado está no contexto e p(recall) = 0: nenhuma
+/// releitura é necessária, nada depende do `ResponseStore`. A varredura é uma
+/// passada na ordem do histórico, sem `HashMap`, então a saída é determinística.
+///
+/// Devolve as mensagens e quantos resultados **realmente** mudaram.
+pub fn dedup_identical_results(messages: &[Message]) -> (Vec<Message>, usize) {
+    let mut kept = messages.to_vec();
+    let mut first_seen: Vec<((String, String), usize)> = Vec::new();
+    let mut deduped = 0usize;
+
+    for index in 0..kept.len() {
+        if kept[index].role != Role::Tool || is_dedup_pointer(&kept[index].content) {
+            continue;
+        }
+        if is_pointer(&kept[index].content) {
+            continue;
+        }
+        let Some(identity) = verified_identity(&kept[index].content) else {
+            continue;
+        };
+        let first = first_seen
+            .iter()
+            .find(|(seen, _)| *seen == identity)
+            .map(|(_, first)| *first);
+        let Some(first) = first else {
+            first_seen.push((identity, index));
+            continue;
+        };
+        if kept[first].content != kept[index].content {
+            continue;
+        }
+        let target = kept[first]
+            .tool_call_id
+            .clone()
+            .unwrap_or_else(|| format!("#{first}"));
+        let (path, hash) = &identity;
+        let pointer = format!(
+            "{DEDUP_PREFIX} `{target}` (path `{path}` · blake3 `{hash}`): o corpo já está no contexto, nada a reler.]"
+        );
+        if estimate_tokens(&pointer) >= estimate_tokens(&kept[index].content) {
+            continue;
+        }
+        kept[index].content = pointer;
+        deduped += 1;
+    }
+
+    (kept, deduped)
+}
+
 fn units(messages: &[Message]) -> usize {
     let starts = messages
         .iter()
@@ -757,6 +861,78 @@ mod tests {
         let second = plan_with(&first.messages, 1_000, 1);
         assert_eq!(second.shrunk_results, 0);
         assert!(!second.trimmed());
+    }
+
+    fn read_result(id: &str, path: &str, hash: &str, body: &str) -> Message {
+        Message::tool(
+            id,
+            &format!("### `{path}` — 12 linhas · blake3 `{hash}`\n\n```\n{body}```\n"),
+        )
+    }
+
+    fn exec_tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "exec".into(),
+            arguments: "{\"command\":\"ls\"}".into(),
+        }
+    }
+
+    #[test]
+    fn identical_verified_reads_are_deduplicated_to_the_first_result() {
+        let body = "let x = 1;\n".repeat(400);
+        let messages = vec![
+            user("leia o mesmo arquivo duas vezes"),
+            Message::assistant_with_calls("", vec![call("c1")]),
+            read_result("c1", "src/a.rs", "aaaa1111", &body),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            read_result("c2", "src/a.rs", "aaaa1111", &body),
+            Message::assistant_with_calls("", vec![exec_tool_call("c3")]),
+            Message::tool("c3", "ok\nok\n"),
+            Message::assistant_with_calls("", vec![exec_tool_call("c4")]),
+            Message::tool("c4", "ok\nok\n"),
+        ];
+
+        let (first, shrunk_results) = dedup_identical_results(&messages);
+        let (second, shrunk_again) = dedup_identical_results(&messages);
+
+        assert_eq!(first, second, "dedup precisa ser determinístico");
+        assert_eq!(shrunk_results, 1);
+        assert_eq!(shrunk_again, 1);
+        assert_eq!(first[2], messages[2], "o primeiro resultado fica inteiro");
+        assert_eq!(first[4].tool_call_id.as_deref(), Some("c2"));
+        assert!(first[4].content.starts_with(DEDUP_PREFIX));
+        assert!(first[4].content.contains("`c1`"));
+        assert!(first[4].content.contains("src/a.rs"));
+        assert!(first[4].content.contains("aaaa1111"));
+        assert_eq!(first[6].content, messages[6].content, "exec não é dedupado");
+        assert_eq!(first[8].content, messages[8].content, "exec não é dedupado");
+
+        let (again, changed) = dedup_identical_results(&first);
+        assert_eq!(again, first, "dedup é idempotente");
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn the_plan_counts_only_the_results_dedup_really_changed() {
+        let body = "let x = 1;\n".repeat(400);
+        let messages = vec![
+            user("leia o mesmo arquivo duas vezes"),
+            Message::assistant_with_calls("", vec![call("c1")]),
+            read_result("c1", "src/a.rs", "aaaa1111", &body),
+            Message::assistant_with_calls("", vec![call("c2")]),
+            read_result("c2", "src/a.rs", "aaaa1111", &body),
+        ];
+
+        let planned = plan_with(&messages, 2_000, 5);
+
+        assert_eq!(planned.deduped_results, 1);
+        assert_eq!(planned.shrunk_results, 0);
+        assert_eq!(planned.omitted_units, 0);
+        assert!(planned.trimmed());
+        assert!(!planned.cut(), "dedup não é corte: nada saiu do contexto");
+        assert!(planned.estimate < total(&messages));
+        assert!(is_dedup_pointer(&planned.messages[4].content));
     }
 
     #[test]

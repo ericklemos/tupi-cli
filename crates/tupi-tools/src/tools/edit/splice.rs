@@ -30,18 +30,36 @@ pub(super) fn splice(
                 "'signature' vazia; nada foi escrito".to_string(),
             ));
         }
-        // O cabeçalho novo tem que descrever o mesmo item: trocar o tipo do
-        // símbolo (struct -> impl) produz um arquivo que parseia mas deixa de
-        // conter o alvo, e o erro só apareceria depois da escrita.
-        let probe = format!("{} {{}}\n", signature.trim_end_matches('{').trim_end());
+        // O cabeçalho novo tem que descrever o mesmo item, no mesmo lugar:
+        // trocar o tipo do símbolo (struct -> impl) produz um arquivo que
+        // parseia mas deixa de conter o alvo, e o erro só apareceria depois da
+        // escrita. O nome pode mudar — renomear pelo `signature` é justamente
+        // o que o parâmetro existe para cobrir; o container não pode, senão o
+        // alvo sai do dono em que foi encontrado.
+        let head = format!("{} {{}}\n", signature.trim_end_matches('{').trim_end());
+        // A cabeça de um membro não expressa o dono: um `fn check` solto parseia
+        // como função de topo, com outro `container` e às vezes outro `kind`, e o
+        // rename legítimo seria recusado. Com container, o probe é montado dentro
+        // de um `impl` de mesmo nome, para comparar maçã com maçã.
+        let probe = match span.container.as_deref() {
+            Some(container) => format!("impl {container} {{\n{head}}}\n"),
+            None => head,
+        };
         let probe_table = resolver.table(Path::new("signature.rs"), &probe)?;
-        let identity = probe_table
+        // O tipo e o dono têm que ser os mesmos: `struct` -> `impl` produz um
+        // arquivo que parseia mas deixa de conter o alvo, e o erro só apareceria
+        // depois da escrita. O nome pode mudar — renomear pelo `signature` é
+        // justamente o que o parâmetro cobre.
+        // `impl Auth { fn check {} }` gera dois spans: o `impl` vem primeiro e
+        // não é o item. O alvo do probe é o span com o mesmo container do alvo.
+        let same_item = probe_table
             .spans
-            .first()
-            .map(|probe| (probe.kind.clone(), probe.name.clone()));
-        if identity.as_ref() != Some(&(span.kind.clone(), span.name.clone())) {
+            .iter()
+            .find(|probe| probe.container == span.container)
+            .is_some_and(|probe| probe.kind == span.kind);
+        if !same_item {
             return Err(ToolError::InvalidArguments(format!(
-                "'signature' mudaria o item; o alvo é '{}'. Nada foi escrito.",
+                "'signature' mudaria o tipo ou o dono do item; o alvo é '{}'. Para renomear, mantenha tipo e container e troque só o nome. Nada foi escrito.",
                 render_candidate(span)
             )));
         }

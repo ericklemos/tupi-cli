@@ -13,5 +13,31 @@
 // pior caso medido, não margem imaginada.
 (
     max_tool_steps: 30,
-    expose_all: true
+    expose_all: true,
+    // Binários liberados na tool `shell`. Presente e não vazia, esta lista
+    // vence `ai.project.json` → `shell.allow`; ausente ou vazia, vale a do
+    // projeto e, sem ela, o padrão do código (`git` e `jq`,
+    // crates/tupi-tools/src/tools/shell/mod.rs).
+    //
+    // Fica no mínimo de propósito: nada aqui tem tool equivalente nem executa
+    // outro comando. Listar grep, ls, cat, sed, find ou curl não reabre nada —
+    // o bloqueio é do binário, não da lista — e wrappers (sh, bash, env,
+    // xargs, make) e `cargo` recusam sempre; `cargo fmt` sai pela regra fixa
+    // do formatador, sem precisar de lista.
+    shell: (
+        allow: [
+            // Histórico e diff: só subcomando de leitura.
+            "git",
+            // Inspeção de JSON (ai.project.json, configs).
+            "jq",
+            // Formatação Rust direta, fora do `cargo fmt`.
+            "rustfmt",
+            // Bytes de arquivo e diretório: nem `map` nem `read` dão tamanho.
+            "stat",
+            "du",
+            // Sistema e arquitetura do ambiente, que a tool `env` não expõe.
+            "uname",
+            "colab"
+        ],
+    ),
 )

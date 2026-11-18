@@ -64,6 +64,12 @@ pub async fn run_with_dashboard(
     let mut pressed_tool: Option<usize> = None;
     state.workflows = workflow_names(&buses.queries).await;
     state.sdd_specs = sdd_spec_names(&buses.queries).await;
+    // Ids do registry para o autocomplete de `/connect `: sem isso a lista
+    // abriria vazia numa sessão recém-aberta.
+    state.providers = match buses.queries.dispatch(tupi_kernel::Query::ListProviders).await {
+        Ok(tupi_kernel::QueryResult::Providers(ids)) => ids,
+        _ => Vec::new(),
+    };
 
     loop {
         terminal.draw(|frame| draw(frame, &state, &model, &provider))?;

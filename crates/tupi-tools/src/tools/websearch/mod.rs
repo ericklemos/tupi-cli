@@ -42,11 +42,36 @@ impl WebSearchTool {
     }
 }
 
+/// Desfecho de uma busca, já com o tamanho da resposta do provedor: é esse
+/// número que separa "o provedor não tem nada" de "o provedor devolveu uma
+/// página que não é de resultados".
+pub(crate) enum SearchOutcome {
+    Results(Vec<SearchHit>),
+    NoResults,
+    Unrecognized { bytes: usize },
+}
+
+/// Texto para quando a busca foi aceita e realmente não há resultado.
+pub(crate) fn no_results_note(tool: &str, query: &str) -> String {
+    format!(
+        "### {tool} — {query}\n\n0 resultados — o provedor respondeu que não há nada para esta consulta.\n"
+    )
+}
+
+/// Texto para quando o provedor devolveu uma página que não é de resultados.
+/// Existe porque "NÃO — nenhum resultado" fazia o modelo concluir que a
+/// consulta está vazia quando o caso era bloqueio/anti-bot.
+pub(crate) fn unrecognized_note(tool: &str, query: &str, bytes: usize) -> String {
+    format!(
+        "### {tool} — {query}\n\nNÃO CONFERE — o provedor respondeu {bytes} bytes sem nenhum bloco de resultado reconhecível (página de bloqueio/anti-bot ou markup novo). Isto não é \"sem resultado\": não conclua que a consulta está vazia. Repita com `fetch` numa URL concreta ou em outra fonte.\n"
+    )
+}
+
 pub(crate) fn search_hits(
     query: &str,
     locale: Option<&str>,
     root: &Path,
-) -> Result<Vec<SearchHit>, ToolError> {
+) -> Result<SearchOutcome, ToolError> {
     let mut url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         web::url_encode(query)
@@ -56,7 +81,11 @@ pub(crate) fn search_hits(
         url.push_str(&web::url_encode(locale));
     }
     let html = web::curl(&url, root)?;
-    Ok(web::parse_duckduckgo(&html))
+    Ok(match web::parse_duckduckgo(&html) {
+        web::DuckDuckGoPage::Results(hits) => SearchOutcome::Results(hits),
+        web::DuckDuckGoPage::NoResults => SearchOutcome::NoResults,
+        web::DuckDuckGoPage::Unrecognized => SearchOutcome::Unrecognized { bytes: html.len() },
+    })
 }
 
 impl Tool for WebSearchTool {
@@ -108,16 +137,18 @@ impl Tool for WebSearchTool {
             .root_dir
             .canonicalize()
             .unwrap_or_else(|_| self.root_dir.clone());
-        let hits = search_hits(query, params.locale.as_deref(), &root)?;
+        let hits = match search_hits(query, params.locale.as_deref(), &root)? {
+            SearchOutcome::Results(hits) => hits,
+            SearchOutcome::NoResults => return Ok(no_results_note("websearch", query)),
+            SearchOutcome::Unrecognized { bytes } => {
+                return Ok(unrecognized_note("websearch", query, bytes));
+            }
+        };
         let limit = params.max_results.clamp(1, 20);
 
         let mut sections = vec![Section {
             heading: format!("### websearch — {query}"),
-            body: if hits.is_empty() {
-                "\nNÃO — nenhum resultado.\n".to_string()
-            } else {
-                format!("\n{} resultado(s).\n", hits.len().min(limit))
-            },
+            body: format!("\n{} resultado(s).\n", hits.len().min(limit)),
             priority: 255,
         }];
 

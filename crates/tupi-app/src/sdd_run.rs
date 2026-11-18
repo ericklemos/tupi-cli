@@ -1487,11 +1487,7 @@ mod tests {
             }));
             let cancel = Arc::new(AtomicBool::new(false));
 
-            let outcome = run_agent(
-                fixture(&provider, &tools, configured, cancel),
-                "brief",
-            )
-            .await;
+            let outcome = run_agent(fixture(&provider, &tools, configured, cancel), "brief").await;
 
             assert!(!outcome.ok);
             assert_eq!(

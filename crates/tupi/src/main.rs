@@ -290,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
     let mut tool_options = tupi_tools::ToolsOptions::default();
     tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
+    tool_options.shell_allow = tool_limits.shell_allow();
     tool_options.docs_folders = docs_folders.clone();
     tool_options.lang = Some(project.lang().as_str().to_string());
     // Vazio = feature desligada: nenhuma tool `mcp` e nenhuma latência de
@@ -678,6 +679,55 @@ mod tests {
         });
 
         assert_eq!(dir, PathBuf::from("C:\\Users\\ana\\.tupi"));
+    }
+
+    /// Piso de prefixo do passo (T1.3): o mesmo caminho de `main` compõe o
+    /// prefixo e mede cada pedaço com o estimador do planejador
+    /// (`tupi_domain::tokens::estimate_message`, igual a
+    /// `crates/tupi-app/src/app.rs:1156-1163`). Só mede, não mexe em orçamento.
+    ///
+    /// `cargo test -p tupi --bins prefix_floor -- --nocapture`
+    #[test]
+    fn prefix_floor_components() {
+        let root = tool_root().expect("root");
+        let project = startup::load_project_with_docs(&root);
+        let docs_folders = project.docs_folders(&root);
+        let system = tupi_app::prompt::compose(&prompt_config::load_prompt(&root).system);
+        let available = tupi_tools::catalog(&root);
+        let workflows_section = tupi_tools::prompt_section(&available, &docs_folders, &root);
+        let agents_section = agents_config::load_agents_section(&root);
+        let prefix = compose_startup_prefix(&system, &workflows_section, agents_section.as_deref());
+
+        let tokens = |text: &str| {
+            if text.is_empty() {
+                0
+            } else {
+                tupi_domain::tokens::estimate_message(&tupi_domain::Message::new(
+                    tupi_domain::Role::System,
+                    text.to_string(),
+                ))
+            }
+        };
+        let (system_tokens, workflow_tokens, agents_tokens, prefix_tokens) = (
+            tokens(&system),
+            tokens(&workflows_section),
+            tokens(agents_section.as_deref().unwrap_or_default()),
+            tokens(&prefix),
+        );
+        let report = format!(
+            "sistema {system_tokens} · workflows {workflow_tokens} · agents {agents_tokens} · composto {prefix_tokens} · workflows {} · chars sistema/agents {}/{}\n",
+            available.len(),
+            system.chars().count(),
+            agents_section.as_deref().unwrap_or_default().chars().count()
+        );
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/prefix-floor.txt");
+        let _ = std::fs::write(&out, &report);
+        panic!("prefixo: {report}");
+        assert_eq!(
+            prefix_tokens > 0,
+            !prefix.is_empty(),
+            "prefixo vazio não paga cota; prefixo não vazio precisa aparecer na conta"
+        );
     }
 
     #[test]

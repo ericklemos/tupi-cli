@@ -1,3 +1,4 @@
+## docs/index.md
 # Documentação do projeto
 
 ## Filosofia
@@ -8,6 +9,18 @@
 ## Arquitetura
 
 - [Arquitetura](architecture.md) — camadas, fronteiras e componentes do workspace.
+- [Janela de contexto](features/context-budget.md) — piso fixo do passo nomeado
+  (`StepFixedTokens`: schema, prefixo, memória, manifesto, aviso) subtraído antes
+  do alvo de mensagens, dedup por `(path, blake3)` antes do shrink com
+  p(recall) = 0 e escala que só desce dentro do turno.
+
+## Provedores
+
+- [Provedor `openai-plan`](features/openai-plan.md) — assinatura ChatGPT via
+  OAuth PKCE público na Responses API, credenciais no redb com refresh
+  automático, catálogo fixo com `gpt-5.2-codex` e todas as constantes de rede
+  sobrescrevíveis por `TUPI_OPENAI_*` porque os valores do cliente oficial não
+  são documentados para terceiros.
 
 ## Ferramentas
 

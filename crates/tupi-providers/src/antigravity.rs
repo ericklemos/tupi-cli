@@ -10,10 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::antigravity_signature::{
+    SignatureStore, build_body_with_signatures, collect_signatures, scope_of_envelope,
+};
 use crate::sse::SseParser;
 use tupi_domain::{Role, ToolCall};
 use tupi_kernel::{
     ChatRequest, Provider, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
+    ToolSpec,
 };
 
 const ANTIGRAVITY_CLIENT_ID: &str =
@@ -27,6 +31,36 @@ const ANTIGRAVITY_USER_AGENT: &str =
 const ANTIGRAVITY_ONBOARD_USER_AGENT: &str = "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682) google-api-nodejs-client/10.3.0";
 const ANTIGRAVITY_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// System instruction que o cliente Hub manda em todo request de estilo
+/// antigravity (referencia: `ANTIGRAVITY_SYSTEM_INSTRUCTION` em src/constants.ts
+/// do plugin opencode-antigravity-auth). Vai como primeira parte do
+/// `systemInstruction` com role=user; as system messages do tupi entram
+/// depois, na ordem original.
+const ANTIGRAVITY_SYSTEM_INSTRUCTION: &str = concat!(
+    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.",
+    "You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.",
+    "The USER will send you requests, which you must always prioritize addressing.",
+    "Always maintain a helpful and respectful tone in your responses, and avoid being overly verbose.",
+    "\n",
+    "**Absolute paths only**",
+    "When using tools, always use absolute file paths.",
+    "\n",
+    "**Proactiveness**",
+    "You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved.",
+    "If you are not sure about file content or codebase structure pertaining to the user's request, use your tools to read files and gather the relevant information: do NOT guess or make up an answer.",
+    "Your goal is to accomplish the user's task, NOT engage in a back and forth conversation.",
+    "You MUST complete the task, and only then yield control back to the user and end your turn without text.",
+);
+
+/// Folga de renovacao do access token: renova 5 min antes do vencimento.
+const REFRESH_SKEW_SECS: u64 = 300;
+
+/// Jitter maximo somado a folga, derivado do proprio token, para espalhar a
+/// renovacao entre contas sem decidir "renova / nao renova" ao acaso.
+const REFRESH_JITTER_SECS: u64 = 30;
+
+const ANTIGRAVITY_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 pub const DEFAULT_MODEL: &str = "gemini-3.8-flash-high";
 
@@ -55,6 +89,11 @@ const SUPPORTED_MODELS: &[&str] = &[
     "claude-opus-5-5-low",
     "gpt-oss-120b-medium",
 ];
+
+/// TTL do catalogo descoberto por `fetchAvailableModels`. A referencia
+/// (opencode-antigravity-auth) refaz a consulta a cada ~1h; dentro da janela
+/// `list_models` responde do cache sem gerar request nenhum.
+const MODELS_CACHE_TTL_SECS: u64 = 3_600;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -135,74 +174,148 @@ fn clean_gemini_schema(schema: &Value) -> Value {
         "examples",
     ];
 
-    match schema {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            let prop_names: BTreeSet<String> = map
-                .get("properties")
-                .and_then(Value::as_object)
-                .map(|props| props.keys().cloned().collect())
-                .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    let Value::Object(map) = schema else {
+        return match schema {
+            Value::Array(arr) => Value::Array(arr.iter().map(clean_gemini_schema).collect()),
+            other => other.clone(),
+        };
+    };
+    let prop_names: BTreeSet<String> = map
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default();
 
-            for (key, value) in map {
-                if UNSUPPORTED.contains(&key.as_str()) {
-                    continue;
-                }
-                match key.as_str() {
-                    "properties" => {
-                        if let Some(props) = value.as_object() {
-                            let mut cleaned_props = serde_json::Map::new();
-                            for (prop_key, prop_val) in props {
-                                cleaned_props
-                                    .insert(prop_key.clone(), clean_gemini_schema(prop_val));
-                            }
-                            out.insert("properties".to_string(), Value::Object(cleaned_props));
-                        }
-                    }
-                    "items" => {
-                        out.insert("items".to_string(), clean_gemini_schema(value));
-                    }
-                    "anyOf" | "oneOf" | "allOf" => {
-                        if let Some(arr) = value.as_array() {
-                            out.insert(
-                                key.clone(),
-                                Value::Array(arr.iter().map(clean_gemini_schema).collect()),
-                            );
-                        }
-                    }
-                    "required" if !prop_names.is_empty() => {
-                        if let Some(arr) = value.as_array() {
-                            let valid: Vec<Value> = arr
-                                .iter()
-                                .filter(|v| v.as_str().is_some_and(|s| prop_names.contains(s)))
-                                .cloned()
-                                .collect();
-                            if !valid.is_empty() {
-                                out.insert("required".to_string(), Value::Array(valid));
-                            }
-                        }
-                    }
-                    _ => {
-                        out.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-
-            if out.get("type").and_then(Value::as_str) == Some("array")
-                && !out.contains_key("items")
-            {
-                out.insert("items".to_string(), json!({ "type": "string" }));
-            }
-
-            Value::Object(out)
+    for (key, value) in map {
+        if UNSUPPORTED.contains(&key.as_str()) {
+            continue;
         }
-        Value::Array(arr) => Value::Array(arr.iter().map(clean_gemini_schema).collect()),
-        other => other.clone(),
+        match key.as_str() {
+            "properties" => {
+                if let Some(props) = value.as_object() {
+                    let mut cleaned_props = serde_json::Map::new();
+                    for (prop_key, prop_val) in props {
+                        cleaned_props.insert(prop_key.clone(), clean_gemini_schema(prop_val));
+                    }
+                    out.insert("properties".to_string(), Value::Object(cleaned_props));
+                }
+            }
+            "items" => {
+                out.insert("items".to_string(), clean_gemini_schema(value));
+            }
+            "anyOf" | "oneOf" | "allOf" => {
+                if let Some(arr) = value.as_array() {
+                    out.insert(
+                        key.clone(),
+                        Value::Array(arr.iter().map(clean_gemini_schema).collect()),
+                    );
+                }
+            }
+            "required" if !prop_names.is_empty() => {
+                if let Some(arr) = value.as_array() {
+                    let valid: Vec<Value> = arr
+                        .iter()
+                        .filter(|v| v.as_str().is_some_and(|s| prop_names.contains(s)))
+                        .cloned()
+                        .collect();
+                    if !valid.is_empty() {
+                        out.insert("required".to_string(), Value::Array(valid));
+                    }
+                }
+            }
+            _ => {
+                out.insert(key.clone(), value.clone());
+            }
+        }
     }
+
+    // Array sem `items` (ou com `items` vazio) e INVALID_ARGUMENT no Gemini; o
+    // fallback da referencia e uma lista de strings.
+    if out.get("type").and_then(Value::as_str) == Some("array") {
+        let items_ok = out
+            .get("items")
+            .and_then(Value::as_object)
+            .is_some_and(|items| !items.is_empty());
+        if !items_ok {
+            out.insert("items".to_string(), json!({ "type": "string" }));
+        }
+    }
+
+    Value::Object(out)
+}
+
+/// Campo sentinela que abre `properties` quando a ferramenta nao declara
+/// nenhum. O Google recusa (`INVALID_ARGUMENT`) `parameters` OBJECT sem
+/// `properties`, e um schema vazio derruba o turno inteiro antes de qualquer
+/// chamada; a referencia (plugin Hub) resolve com um campo ignoravel.
+const EMPTY_SCHEMA_PLACEHOLDER_NAME: &str = "_placeholder";
+const EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION: &str =
+    "Ignored placeholder field required by the API; do not set it.";
+
+fn empty_schema_properties() -> serde_json::Map<String, Value> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        EMPTY_SCHEMA_PLACEHOLDER_NAME.to_string(),
+        json!({
+            "type": "boolean",
+            "description": EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
+        }),
+    );
+    properties
+}
+
+fn empty_object_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": Value::Object(empty_schema_properties()),
+    })
+}
+
+/// Normaliza o `parameters` de uma functionDeclaration. Schema vazio (`{}`) ou
+/// objeto sem `properties` vira OBJECT com o campo sentinela; tipo fora de
+/// OBJECT nao existe como `parameters` no protocolo e cai no mesmo placeholder.
+fn normalize_tool_parameters(schema: &Value) -> Value {
+    let cleaned = clean_gemini_schema(schema);
+    let Value::Object(mut map) = cleaned else {
+        return empty_object_parameters();
+    };
+    match map.get("type").and_then(Value::as_str) {
+        Some("object") | None => {}
+        Some(_) => return empty_object_parameters(),
+    }
+    let has_properties = map
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    if has_properties {
+        if !map.contains_key("type") {
+            map.insert("type".to_string(), Value::String("object".to_string()));
+        }
+    } else {
+        map.insert("type".to_string(), Value::String("object".to_string()));
+        map.insert(
+            "properties".to_string(),
+            Value::Object(empty_schema_properties()),
+        );
+        // `required` so apontaria para propriedades inexistentes: sai.
+        map.remove("required");
+    }
+    Value::Object(map)
+}
+
+fn normalize_function_declaration(tool: &ToolSpec) -> Value {
+    json!({
+        "name": tool.name.trim(),
+        "description": tool.description,
+        "parameters": normalize_tool_parameters(&tool.schema),
+    })
 }
 
 pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
-    let mut system_parts: Vec<Value> = Vec::new();
+    // A instrucao fixa do Antigravity abre o systemInstruction (role=user),
+    // como no cliente Hub; as system messages do tupi vem depois, na ordem.
+    let mut system_parts: Vec<Value> = vec![json!({ "text": ANTIGRAVITY_SYSTEM_INSTRUCTION })];
     let mut contents: Vec<Value> = Vec::new();
     let mut call_names_by_id: HashMap<String, String> = HashMap::new();
 
@@ -214,6 +327,10 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
             }
         }
     }
+    // functionCall ja emitidos e ainda sem functionResponse, na ordem do
+    // dialogo: e dessa fila que sai o par de um functionResponse cujo id nao
+    // casa com nenhuma chamada (id vazio, trocado ou repetido).
+    let mut open_calls: VecDeque<String> = VecDeque::new();
 
     for msg in &request.messages {
         match msg.role {
@@ -248,6 +365,7 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
                             Value::String(SKIP_THOUGHT_SIGNATURE.to_string());
                     }
                     parts.push(part);
+                    open_calls.push_back(call.id.clone());
                 }
                 contents.push(json!({
                     "role": "model",
@@ -255,11 +373,56 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
                 }));
             }
             Role::Tool => {
-                let call_id = msg.tool_call_id.clone().unwrap_or_default();
-                let name = call_names_by_id
-                    .get(&call_id)
-                    .cloned()
-                    .unwrap_or_else(|| call_id.clone());
+                let requested_id = msg
+                    .tool_call_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                // Id divergente nao pode subir como esta: functionResponse sem
+                // functionCall correspondente vira INVALID_ARGUMENT em serie.
+                // O Hub repara o par pela ordem dos functionCall abertos
+                // (fixToolResponseGrouping/validateAndFixClaudeToolPairing) em
+                // vez de propagar o id quebrado.
+                let matched = (!requested_id.is_empty())
+                    .then(|| {
+                        open_calls
+                            .iter()
+                            .position(|id| id.trim() == requested_id)
+                    })
+                    .flatten();
+                let call_id = match matched {
+                    Some(idx) => match open_calls.remove(idx) {
+                        Some(id) => id,
+                        None => continue,
+                    },
+                    None => {
+                        // Sem candidato aberto nao ha par possivel: o resultado
+                        // solto e descartado, nunca enviado com id invalido.
+                        let Some(repaired) = open_calls.pop_front() else {
+                            tracing::debug!(
+                                call_id = %requested_id,
+                                "tool result sem functionCall correspondente descartado no antigravity"
+                            );
+                            continue;
+                        };
+                        if !requested_id.is_empty() {
+                            tracing::debug!(
+                                requested = %requested_id,
+                                repaired = %repaired,
+                                "functionResponse com id divergente reparado no antigravity"
+                            );
+                        }
+                        repaired
+                    }
+                };
+                let Some(name) = call_names_by_id.get(&call_id).cloned() else {
+                    tracing::debug!(
+                        call_id = %call_id,
+                        "functionCall reparado sem nome conhecido: resultado descartado"
+                    );
+                    continue;
+                };
                 let part = json!({
                     "functionResponse": {
                         "id": call_id,
@@ -294,24 +457,17 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
         "contents": contents,
     });
 
-    if !system_parts.is_empty() {
-        request_payload["systemInstruction"] = json!({
-            "role": "user",
-            "parts": system_parts
-        });
-    }
+    // system_parts nunca esta vazio: a instrucao do Antigravity e a primeira.
+    request_payload["systemInstruction"] = json!({
+        "role": "user",
+        "parts": system_parts
+    });
 
     if !request.tools.is_empty() {
         let decls: Vec<Value> = request
             .tools
             .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": clean_gemini_schema(&tool.schema)
-                })
-            })
+            .map(normalize_function_declaration)
             .collect();
 
         request_payload["tools"] = json!([{
@@ -319,9 +475,61 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
         }]);
     }
 
-    if let Some(max_tokens) = request.max_tokens {
-        request_payload["generationConfig"] = json!({ "maxOutputTokens": max_tokens });
+    let mut generation_config = serde_json::Map::new();
+    // Claude: o piso de saida cobre o orcamento de thinking mesmo quando o
+    // chamador pede um `max_tokens` menor (ou nao pede nada).
+    let requested_max_tokens = request.max_tokens.and_then(|tokens| u64::try_from(tokens).ok());
+    if let Some(max_tokens) =
+        crate::antigravity_thinking::claude_output_tokens(&request.model, requested_max_tokens)
+    {
+        generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
+    if let Some(tier) = crate::antigravity_thinking::resolve_thinking_tier(&request.model) {
+        generation_config.insert(
+            "thinkingConfig".to_string(),
+            json!({
+                "includeThoughts": true,
+                "thinkingBudget": tier.budget_tokens(),
+            }),
+        );
+    }
+    if !generation_config.is_empty() {
+        request_payload["generationConfig"] = Value::Object(generation_config);
+    }
+
+    // Identidade da conversa: semente ancorada no inicio da sessao do tupi
+    // (primeira mensagem do usuario) e no projeto, que nao mudam entre turnos.
+    // Turnos seguintes so acrescentam mensagens ao fim, entao o `conversationId`
+    // se mantem e uma sessao nova com outro pedido gera outro id.
+    let first_user = request
+        .messages
+        .iter()
+        .find(|msg| msg.role == Role::User)
+        .map(|msg| msg.content.as_str());
+    let session = match first_user {
+        Some(first_user) => {
+            let hex = blake3::hash(format!("{project_id}\u{1f}{first_user}").as_bytes())
+                .to_hex()
+                .to_string();
+            format!("session-{}", &hex[..32])
+        }
+        // Sem turno do usuario nao ha sessao a preservar: id descartavel.
+        None => generate_request_id(),
+    };
+    // O `requestId` muda de turno em turno (cada mensagem do usuario abre um) e
+    // fica estavel dentro do turno, para o retry reenviar o mesmo id.
+    let turn = request
+        .messages
+        .iter()
+        .filter(|msg| msg.role == Role::User)
+        .count()
+        .max(1);
+    let request_id = {
+        let hex = blake3::hash(format!("{session}:{turn}").as_bytes())
+            .to_hex()
+            .to_string();
+        format!("agent-{}", &hex[..32])
+    };
 
     json!({
         "project": project_id,
@@ -329,7 +537,8 @@ pub fn build_body(request: &ChatRequest, project_id: &str) -> Value {
         "request": request_payload,
         "requestType": "agent",
         "userAgent": "antigravity",
-        "requestId": generate_request_id(),
+        "conversationId": session,
+        "requestId": request_id,
     })
 }
 
@@ -340,11 +549,147 @@ pub struct AntigravityChunk {
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// Amostra truncada do payload não-JSON (keepalive/linha parcial) descartado.
+    pub junk: Option<String>,
 }
 
 pub fn extract_chunk(payload: &str) -> Result<AntigravityChunk, ProviderError> {
-    let root: Value = serde_json::from_str(payload)
-        .map_err(|e| ProviderError::Protocol(format!("json invalido: {e}")))?;
+    fn error_payload(root: &Value) -> Option<&Value> {
+        root.get("error")
+            .or_else(|| root.get("response").and_then(|response| response.get("error")))
+    }
+
+    fn error_status(error: &Value) -> u16 {
+        if let Some(code) = error.get("code").and_then(Value::as_u64) {
+            return u16::try_from(code).unwrap_or(500);
+        }
+        match error.get("status").and_then(Value::as_str).unwrap_or_default() {
+            "RESOURCE_EXHAUSTED" => 429,
+            "INVALID_ARGUMENT" | "FAILED_PRECONDITION" | "OUT_OF_RANGE" => 400,
+            "UNAUTHENTICATED" => 401,
+            "PERMISSION_DENIED" => 403,
+            "NOT_FOUND" => 404,
+            "UNAVAILABLE" => 503,
+            _ => 500,
+        }
+    }
+
+    fn error_message(error: &Value) -> String {
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("status").and_then(Value::as_str))
+            .unwrap_or("erro sem mensagem do provedor")
+            .to_string()
+    }
+
+    fn parse_retry_seconds(raw: &str) -> Option<u64> {
+        let trimmed = raw.trim();
+        let trimmed = trimmed.strip_suffix('s').unwrap_or(trimmed);
+        integer_part(trimmed).parse::<u64>().ok()
+    }
+
+    fn integer_part(raw: &str) -> &str {
+        raw.split('.').next().unwrap_or(raw)
+    }
+
+    fn is_retry_info(detail: &Value) -> bool {
+        detail
+            .get("@type")
+            .and_then(Value::as_str)
+            .map_or(false, |kind| kind.ends_with("RetryInfo"))
+    }
+
+    fn retry_hint_seconds(error: &Value) -> Option<u64> {
+        if let Some(details) = error.get("details").and_then(Value::as_array) {
+            let mut candidates: Vec<&Value> =
+                details.iter().filter(|detail| is_retry_info(detail)).collect();
+            candidates.extend(details.iter());
+            for detail in candidates {
+                for field in ["retryDelay", "retry_delay"] {
+                    if let Some(seconds) = detail
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .and_then(parse_retry_seconds)
+                    {
+                        return Some(seconds);
+                    }
+                }
+            }
+        }
+        ["retryDelay", "retry_delay"]
+            .iter()
+            .find_map(|field| error.get(*field).and_then(Value::as_str))
+            .and_then(parse_retry_seconds)
+    }
+
+    /// Quota esgotada: só quando o corpo fala de cota/licença, não de throughput.
+    /// `"Resource has been exhausted (e.g. check quota)."` é rate limit por minuto.
+    fn looks_like_quota(error: &Value, message: &str) -> bool {
+        let text = message.to_ascii_lowercase();
+        if text.contains("exceeded your current quota")
+            || text.contains("quota exceeded")
+            || text.contains("quota metric")
+            || text.contains("daily limit")
+            || text.contains("requests per day")
+        {
+            return true;
+        }
+        error
+            .get("details")
+            .map(|details| details.to_string().to_ascii_lowercase())
+            .map_or(false, |details| {
+                details.contains("quota_exceeded")
+                    || details.contains("daily_limit")
+                    || details.contains("per_day")
+                    || details.contains("perday")
+            })
+    }
+
+    fn map_error_payload(error: &Value, raw: &str) -> ProviderError {
+        let status = error_status(error);
+        let message = error_message(error);
+        let body = raw.to_string();
+        match status {
+            429 if looks_like_quota(error, &message) => ProviderError::QuotaExhausted {
+                status,
+                reset: retry_hint_seconds(error),
+                message,
+                body,
+            },
+            429 => ProviderError::RateLimited {
+                status,
+                retry_after: retry_hint_seconds(error),
+                message,
+                body,
+            },
+            400 => ProviderError::InvalidArgument {
+                status,
+                message,
+                body,
+            },
+            _ => ProviderError::Http { status, body },
+        }
+    }
+
+    let root: Value = match serde_json::from_str(payload) {
+        Ok(root) => root,
+        // Keepalive/linha parcial do Hub não pode derrubar o turno: vira chunk
+        // marcado como lixo, contado e descartado pelo stream.
+        Err(err) => {
+            let mut sample: String = payload.chars().take(120).collect();
+            if payload.chars().count() > 120 {
+                sample.push('…');
+            }
+            return Ok(AntigravityChunk {
+                junk: Some(format!("json invalido: {err}; amostra: {sample}")),
+                ..AntigravityChunk::default()
+            });
+        }
+    };
+    if let Some(error) = error_payload(&root) {
+        return Err(map_error_payload(error, payload));
+    }
     let response = root.get("response").unwrap_or(&root);
 
     let mut chunk = AntigravityChunk::default();
@@ -404,6 +749,33 @@ pub fn extract_chunk(payload: &str) -> Result<AntigravityChunk, ProviderError> {
     Ok(chunk)
 }
 
+/// Relogio do provider, sobrescrito nos testes.
+fn system_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Jitter deterministico (0..=REFRESH_JITTER_SECS) derivado do proprio token:
+/// duas contas renovam em instantes diferentes, mas a mesma conta nao oscila
+/// entre "renova" e "nao renova" a cada chamada.
+fn refresh_jitter_secs(creds: &AntigravityCredentials) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(creds.refresh_token.as_bytes());
+    hasher.update(&creds.expires_at.to_le_bytes());
+    hasher.update(creds.email.as_deref().unwrap_or_default().as_bytes());
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(raw) % (REFRESH_JITTER_SECS + 1)
+}
+
+/// Janela efetiva de renovacao: skew de 5 min + jitter do token.
+fn refresh_margin_secs(creds: &AntigravityCredentials) -> u64 {
+    REFRESH_SKEW_SECS + refresh_jitter_secs(creds)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntigravityCredentials {
     pub access_token: String,
@@ -415,7 +787,7 @@ pub struct AntigravityCredentials {
 
 impl AntigravityCredentials {
     pub fn is_expired(&self, now_secs: u64) -> bool {
-        now_secs + 60 >= self.expires_at
+        now_secs.saturating_add(refresh_margin_secs(self)) >= self.expires_at
     }
 
     pub fn from_json_str(text: &str) -> Option<Self> {
@@ -423,36 +795,11 @@ impl AntigravityCredentials {
     }
 
     pub fn from_opencode_json_str(text: &str) -> Option<Self> {
-        let val: Value = serde_json::from_str(text).ok()?;
-        let accounts = val.get("accounts")?.as_array()?;
-        let active_idx = val.get("activeIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let account = accounts.get(active_idx).or_else(|| accounts.first())?;
-
-        let refresh_token = account.get("refreshToken")?.as_str()?.to_string();
-        let project_id = account
-            .get("managedProjectId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                account
-                    .get("projectId")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or(ANTIGRAVITY_DEFAULT_PROJECT_ID)
-            .to_string();
-        let email = account
-            .get("email")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-
-        Some(Self {
-            access_token: String::new(),
-            refresh_token,
-            expires_at: 0,
-            project_id,
-            email,
-        })
+        let (accounts, active_index) = crate::antigravity_accounts::parse_opencode_accounts(
+            text,
+            ANTIGRAVITY_DEFAULT_PROJECT_ID,
+        );
+        accounts.get(active_index).or_else(|| accounts.first()).cloned()
     }
 
     pub fn parse_token_response(
@@ -503,25 +850,50 @@ impl AntigravityCredentials {
             }
         }
 
+        // Store proprio: as contas do arquivo do plugin entram por copia e o
+        // provider segue com a conta ativa local, nao com um emprestimo do
+        // arquivo alheio (que nunca e aberto para escrita).
+        let store_path = crate::antigravity_accounts::AntigravityAccountStore::path(tupi_dir);
+        let mut local = crate::antigravity_accounts::AntigravityAccountStore::load(&store_path);
+        let mut changed = false;
         if let Some(op_dir) = opencode_dir {
-            let op_path = op_dir.join("antigravity-accounts.json");
-            if let Ok(content) = std::fs::read_to_string(&op_path) {
-                if let Some(creds) = Self::from_opencode_json_str(&content) {
-                    return Some(creds);
+            let op_path = op_dir.join(crate::antigravity_accounts::AntigravityAccountStore::FILE_NAME);
+            // Mesmo caminho nos dois lados: nao se escreve no arquivo alheio.
+            if op_path != store_path {
+                match local.import_from_opencode_file(&op_path, ANTIGRAVITY_DEFAULT_PROJECT_ID) {
+                    Ok(added) => changed = added > 0,
+                    Err(_) => {}
                 }
             }
         }
+        if changed
+            && let Err(error) = local.save(&store_path)
+        {
+            tracing::warn!(
+                %error,
+                path = %store_path.display(),
+                "falha ao gravar contas Antigravity importadas"
+            );
+        }
 
-        None
+        local.active().cloned()
     }
 
     pub async fn refresh_if_expired(
         &mut self,
         client: &reqwest::Client,
+        token_endpoint: &str,
         now_secs: u64,
+        force: bool,
     ) -> Result<(), ProviderError> {
-        if !self.is_expired(now_secs) && !self.access_token.is_empty() {
+        if !force && !self.is_expired(now_secs) && !self.access_token.is_empty() {
             return Ok(());
+        }
+
+        if self.refresh_token.trim().is_empty() {
+            return Err(ProviderError::Protocol(
+                "refresh token ausente: refaca o login do antigravity".to_string(),
+            ));
         }
 
         let body = format!(
@@ -532,7 +904,7 @@ impl AntigravityCredentials {
         );
 
         let response = client
-            .post("https://oauth2.googleapis.com/token")
+            .post(token_endpoint)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
             .send()
@@ -561,9 +933,16 @@ pub struct AntigravityProvider {
     credentials: Arc<Mutex<AntigravityCredentials>>,
     client: reqwest::Client,
     base_url: String,
+    token_endpoint: String,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     save_path: Option<std::path::PathBuf>,
     on_refresh: Option<RefreshHook>,
-    last_payload: std::sync::Mutex<Option<Value>>,
+    last_payload: Arc<std::sync::Mutex<Option<Value>>>,
+    /// Assinaturas de pensamento vistas nesta execucao, por sessao/modelo.
+    signatures: Arc<std::sync::Mutex<SignatureStore>>,
+    /// Ultimo catalogo de `fetchAvailableModels`, com TTL; vencido continua
+    /// valendo como filtro de entitlement da conta.
+    models_cache: Arc<std::sync::Mutex<Option<ModelsCache>>>,
 }
 
 impl AntigravityProvider {
@@ -576,15 +955,29 @@ impl AntigravityProvider {
             credentials: Arc::new(Mutex::new(credentials)),
             client,
             base_url: ANTIGRAVITY_ENDPOINT.to_string(),
+            token_endpoint: ANTIGRAVITY_TOKEN_ENDPOINT.to_string(),
+            clock: Arc::new(system_now_secs),
             save_path: None,
             on_refresh: None,
-            last_payload: std::sync::Mutex::new(None),
+            last_payload: Arc::new(std::sync::Mutex::new(None)),
+            signatures: Arc::new(std::sync::Mutex::new(SignatureStore::new())),
+            models_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Sobrescreve o endpoint de token (testes e ambientes isolados).
+    pub fn with_token_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.token_endpoint = endpoint.into();
+        self
+    }
+
+    fn now_secs(&self) -> u64 {
+        (self.clock)()
     }
 
     pub fn with_save_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
@@ -609,17 +1002,37 @@ impl AntigravityProvider {
         }
     }
 
-    async fn ensure_auth(&self) -> Result<(String, String), ProviderError> {
-        let now_secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    async fn ensure_auth(&self, force: bool) -> Result<(String, String), ProviderError> {
+        // `force` (retry pos-401 de quem nao guarda o token): renova a nao ser
+        // que outra task ja tenha trocado o token desde a leitura.
+        let stale = if force {
+            Some(self.credentials.lock().await.access_token.clone())
+        } else {
+            None
+        };
+        self.ensure_auth_after(stale).await
+    }
 
+    /// Resolve o token da conta selecionada segurando o lock de auth ate o fim.
+    ///
+    /// `stale_token` e o token que tomou 401: se uma task concorrente ja
+    /// renovou, o token corrente difere do que falhou e este request apenas
+    /// reaproveita o novo, sem segundo refresh com o mesmo refresh token.
+    async fn ensure_auth_after(
+        &self,
+        stale_token: Option<String>,
+    ) -> Result<(String, String), ProviderError> {
+        // O lock e o ponto de serializacao: a primeira task renova e a segunda
+        // acorda aqui com as credenciais ja renovadas.
         let mut creds = self.credentials.lock().await;
+        let now_secs = self.now_secs();
         let mut changed = false;
 
-        if creds.is_expired(now_secs) || creds.access_token.is_empty() {
-            creds.refresh_if_expired(&self.client, now_secs).await?;
+        let retry_after_401 = stale_token.as_deref() == Some(creds.access_token.as_str());
+        if retry_after_401 || creds.is_expired(now_secs) || creds.access_token.is_empty() {
+            creds
+                .refresh_if_expired(&self.client, &self.token_endpoint, now_secs, true)
+                .await?;
             changed = true;
         }
 
@@ -640,6 +1053,20 @@ impl AntigravityProvider {
     }
 }
 
+/// Guarda o envelope do request que falhou junto do corpo cru do erro.
+///
+/// `last_payload` continua sendo o corpo enviado enquanto a chamada nao falha.
+fn record_error_payload(slot: &std::sync::Mutex<Option<Value>>, envelope: &Value, raw: &str) {
+    let payload = json!({
+        "request": envelope,
+        "error": serde_json::from_str::<Value>(raw).ok(),
+        "raw": raw,
+    });
+    if let Ok(mut last) = slot.lock() {
+        *last = Some(payload);
+    }
+}
+
 struct StreamState {
     response: reqwest::Response,
     parser: SseParser,
@@ -649,6 +1076,47 @@ struct StreamState {
     last_usage: Option<(Option<u64>, Option<u64>, Option<u64>)>,
     started: bool,
     done: bool,
+    failed: bool,
+    /// Payloads não-JSON (keepalive/linha parcial) descartados neste turno.
+    junk_payloads: usize,
+}
+
+/// Ultimo catalogo que o Hub devolveu para esta conta, com o instante da
+/// resposta. Vale como fonte de entitlement mesmo depois de vencido: um
+/// `fetchAvailableModels` que falha nao pode ressuscitar modelo bloqueado.
+#[derive(Clone)]
+struct ModelsCache {
+    /// Catalogo na ordem do Hub (`agentModelSorts` / `tieredModelIds`).
+    models: Vec<String>,
+    fetched_at: u64,
+}
+
+/// Catalogo estatico restrito ao que a conta ja provou ter.
+///
+/// `observed` e o catalogo devolvido por `fetchAvailableModels` para esta conta
+/// (mesmo vencido); modelo fora dele nao volta para a lista por fallback, senao
+/// a UI oferece modelo que a conta nao tem entitlement de chamar. Sem nenhuma
+/// resposta do servidor ainda (cold start), o catalogo estatico inteiro serve
+/// de partida.
+fn permitted_models(observed: Option<&[String]>) -> Vec<String> {
+    let Some(observed) = observed else {
+        return SUPPORTED_MODELS.iter().map(|s| s.to_string()).collect();
+    };
+    let seen: BTreeSet<&str> = observed.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = SUPPORTED_MODELS
+        .iter()
+        .copied()
+        .filter(|id| seen.contains(id))
+        .map(str::to_string)
+        .collect();
+    // Modelo novo, que o catalogo estatico ainda nao conhece, nao pode sumir.
+    out.extend(
+        observed
+            .iter()
+            .filter(|id| !SUPPORTED_MODELS.contains(&id.as_str()))
+            .cloned(),
+    );
+    out
 }
 
 fn is_selectable_chat_model(id: &str) -> bool {
@@ -748,93 +1216,149 @@ impl Provider for AntigravityProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
-        let fallback = || SUPPORTED_MODELS.iter().map(|s| s.to_string()).collect();
+        let now_secs = self.now_secs();
+        let cached = self.models_cache.lock().ok().and_then(|slot| slot.clone());
 
-        let Ok((access_token, project_id)) = self.ensure_auth().await else {
-            return Ok(fallback());
-        };
+        // Dentro do TTL a resposta sai do cache: `list_models` deixa de virar um
+        // request por chamada (a referencia refaz a consulta a cada ~1h).
+        if let Some(cache) = cached.as_ref() {
+            if now_secs.saturating_sub(cache.fetched_at) < MODELS_CACHE_TTL_SECS {
+                return Ok(cache.models.clone());
+            }
+        }
 
+        // Fallback: catalogo estatico restrito ao que a conta ja devolveu, para
+        // modelo sem entitlement nao reaparecer na lista.
+        let fallback = || permitted_models(cached.as_ref().map(|cache| cache.models.as_slice()));
         let url = format!(
             "{}/v1internal:fetchAvailableModels",
             self.base_url.trim_end_matches('/')
         );
-        let body = if project_id.is_empty() {
-            json!({})
-        } else {
-            json!({ "project": project_id })
-        };
 
-        let Ok(response) = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {access_token}"))
-            .header(USER_AGENT, ANTIGRAVITY_USER_AGENT)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-        else {
-            return Ok(fallback());
-        };
+        // 401 com token que parecia valido: refaz o auth uma unica vez. Se a segunda
+        // tentativa tambem falhar, a listagem cai no fallback como antes.
+        let mut reauthenticated = false;
+        loop {
+            let Ok((access_token, project_id)) = self.ensure_auth(reauthenticated).await else {
+                return Ok(fallback());
+            };
 
-        if !response.status().is_success() {
-            return Ok(fallback());
-        }
+            let body = if project_id.is_empty() {
+                json!({})
+            } else {
+                json!({ "project": project_id })
+            };
 
-        let Ok(text) = response.text().await else {
-            return Ok(fallback());
-        };
-        let models = parse_available_models(&text);
-        if models.is_empty() {
-            Ok(fallback())
-        } else {
-            Ok(models)
+            let Ok(response) = self
+                .client
+                .post(url.clone())
+                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(USER_AGENT, ANTIGRAVITY_USER_AGENT)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .await
+            else {
+                return Ok(fallback());
+            };
+
+            if response.status().as_u16() == 401 && !reauthenticated {
+                reauthenticated = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                return Ok(fallback());
+            }
+
+            let Ok(text) = response.text().await else {
+                return Ok(fallback());
+            };
+            let models = parse_available_models(&text);
+            if models.is_empty() {
+                return Ok(fallback());
+            }
+            if let Ok(mut slot) = self.models_cache.lock() {
+                *slot = Some(ModelsCache {
+                    models: models.clone(),
+                    fetched_at: now_secs,
+                });
+            }
+            return Ok(models);
         }
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> Result<ProviderStream, ProviderError> {
-        let (access_token, project_id) = self.ensure_auth().await?;
-
-        let effective_project_id = if project_id.is_empty() {
-            ANTIGRAVITY_DEFAULT_PROJECT_ID
-        } else {
-            &project_id
-        };
-
-        let body = build_body(&request, effective_project_id);
-        if let Ok(mut last) = self.last_payload.lock() {
-            *last = Some(body.clone());
-        }
         let url = format!(
             "{}/v1internal:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/')
         );
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", access_token))
-                .map_err(|e| ProviderError::Network(e.to_string()))?,
-        );
-        headers.insert(USER_AGENT, HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        // 401 com token que parecia valido (revogado, skew do relogio do Google):
+        // refaz o auth uma unica vez e repete a chamada. Nenhum evento foi emitido
+        // ainda, entao o consumidor ve uma resposta so.
+        let mut reauthenticated = false;
+        let (response, body) = loop {
+            let (access_token, project_id) = self.ensure_auth(reauthenticated).await?;
 
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+            let effective_project_id = if project_id.is_empty() {
+                ANTIGRAVITY_DEFAULT_PROJECT_ID
+            } else {
+                &project_id
+            };
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
+            let body = match self.signatures.lock() {
+                Ok(signatures) => {
+                    build_body_with_signatures(&request, effective_project_id, &signatures)
+                }
+                Err(_) => build_body(&request, effective_project_id),
+            };
+            if let Ok(mut last) = self.last_payload.lock() {
+                *last = Some(body.clone());
+            }
 
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", access_token))
+                    .map_err(|e| ProviderError::Network(e.to_string()))?,
+            );
+            headers.insert(USER_AGENT, HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+
+            let response = self
+                .client
+                .post(url.clone())
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+            if response.status().as_u16() == 401 && !reauthenticated {
+                reauthenticated = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let raw = response.text().await.unwrap_or_default();
+                // Envelope do request que falhou + corpo cru do erro: e o que sobrevive
+                // para diagnosticar um 429 sem engolir o motivo do Google.
+                record_error_payload(&self.last_payload, &body, &raw);
+                return Err(ProviderError::Http { status, body: raw });
+            }
+
+            break (response, body);
+        };
+
+        let error_slot = Arc::clone(&self.last_payload);
+        // Escopo/store das assinaturas desta sessao/modelo: as que vierem no
+        // stream ficam guardadas para o proximo turno reenviar a real.
+        let signature_scope = scope_of_envelope(&body);
+        let signature_store = Arc::clone(&self.signatures);
+        let envelope = body;
         let state = StreamState {
             response,
             parser: SseParser::new(),
@@ -844,10 +1368,21 @@ impl Provider for AntigravityProvider {
             last_usage: None,
             started: false,
             done: false,
+            failed: false,
+            junk_payloads: 0,
         };
 
-        let stream = unfold(state, |mut state| async move {
+        let stream = unfold(state, move |mut state| {
+            let error_slot = Arc::clone(&error_slot);
+            let envelope = envelope.clone();
+            let signature_scope = signature_scope.clone();
+            let signature_store = Arc::clone(&signature_store);
+            async move {
             loop {
+                if state.failed {
+                    return None;
+                }
+
                 if let Some(event) = state.ready_events.pop_front() {
                     return Some((Ok(event), state));
                 }
@@ -859,6 +1394,22 @@ impl Provider for AntigravityProvider {
                     }
                     match extract_chunk(&payload) {
                         Ok(chunk) => {
+                            if let Some(junk) = chunk.junk {
+                                state.junk_payloads += 1;
+                                tracing::debug!(
+                                    junk_payloads = state.junk_payloads,
+                                    amostra = %junk,
+                                    "payload nao-JSON ignorado no stream do antigravity"
+                                );
+                                continue;
+                            }
+                            if let Some(scope) = signature_scope.as_deref()
+                                && let Ok(mut store) = signature_store.lock()
+                            {
+                                // Assinatura real em cache substitui a sentinela
+                                // no proximo turno; o resto vira fallback.
+                                collect_signatures(&payload, scope, &mut store);
+                            }
                             if !chunk.tool_calls.is_empty() {
                                 state.accumulated_calls.extend(chunk.tool_calls);
                             }
@@ -877,7 +1428,17 @@ impl Provider for AntigravityProvider {
                             }
                             continue;
                         }
-                        Err(err) => return Some((Err(err), state)),
+                        Err(err) => {
+                            // Erro do Cloud Code no meio do stream: o consumidor precisa ver
+                            // o ProviderError. Marca o estado como terminal para nao encerrar
+                            // limpo nem emitir Usage/ToolCalls de um turno truncado.
+                            record_error_payload(&error_slot, &envelope, &payload);
+                            state.failed = true;
+                            state.done = true;
+                            state.last_usage = None;
+                            state.accumulated_calls.clear();
+                            return Some((Err(err), state));
+                        }
                     }
                 }
 
@@ -918,6 +1479,7 @@ impl Provider for AntigravityProvider {
                         return Some((Err(ProviderError::Network(err.to_string())), state));
                     }
                 }
+            }
             }
         });
 
@@ -1326,6 +1888,27 @@ mod tests {
         assert!(body["requestId"].as_str().unwrap().starts_with("agent-"));
         assert_eq!(body["request"]["contents"][0]["role"], "user");
         assert_eq!(body["request"]["contents"][0]["parts"][0]["text"], "ola");
+
+        // Sessao: dois turnos da mesma conversa compartilham o conversationId e
+        // trocam de requestId; a sessao nova (outro pedido inicial) gera outro.
+        let session_of = |body: &Value| body["conversationId"].as_str().unwrap().to_string();
+        let request_of = |body: &Value| body["requestId"].as_str().unwrap().to_string();
+        assert_eq!(session_of(&body), session_of(&body));
+
+        let turn_two = ChatRequest::new(
+            "antigravity-gemini-3.8-flash",
+            vec![Message::user("ola"), Message::assistant("oi"), Message::user("e agora?")],
+        );
+        let body_two = build_body(&turn_two, "rising-fact-p41fc");
+        assert_eq!(session_of(&body_two), session_of(&body));
+        assert_ne!(request_of(&body_two), request_of(&body));
+        // Retry do mesmo turno reenvia o mesmo requestId.
+        assert_eq!(request_of(&build_body(&turn_two, "rising-fact-p41fc")), request_of(&body_two));
+
+        let other_session =
+            ChatRequest::new("antigravity-gemini-3.8-flash", vec![Message::user("outro pedido")]);
+        let body_new = build_body(&other_session, "rising-fact-p41fc");
+        assert_ne!(session_of(&body_new), session_of(&body));
     }
 
     #[test]
@@ -1339,12 +1922,105 @@ mod tests {
 
     #[test]
     fn body_omits_max_output_tokens_when_unset() {
+        let budget = |model: &str| {
+            let request = ChatRequest::new(model, vec![Message::user("oi")]);
+            let body = build_body(&request, "proj-1");
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"].as_u64()
+        };
+
+        // Tier embutido no nome vira orcamento de thinking previsivel.
+        assert_eq!(budget("gemini-3.8-flash-low"), Some(1_024));
+        assert_eq!(budget("gemini-3.8-flash-medium"), Some(8_192));
+        assert_eq!(budget("gemini-3.8-flash-high"), Some(24_576));
+        assert_eq!(budget("antigravity-gemini-4-hydrogen-xhigh"), Some(32_768));
+        assert_eq!(budget("claude-sonnet-5-5-thinking"), Some(32_768));
+        // Modelo sem tier nao ganha thinkingConfig.
+        assert_eq!(budget("gemini-2.5-pro"), None);
+
+        // Sem tier e sem max_tokens nao existe generationConfig nenhum.
+        let request = ChatRequest::new("gemini-2.5-pro", vec![Message::user("oi")]);
+        let body = build_body(&request, "proj-1");
+        assert!(body["request"].get("generationConfig").is_none());
+
+        // Sem max_tokens, so o thinkingConfig vai no generationConfig.
         let request = ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("oi")]);
         let body = build_body(&request, "proj-1");
+        assert!(
+            body["request"]["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none()
+        );
+        assert_eq!(
+            body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24_576
+        );
 
-        assert!(body["request"].get("generationConfig").is_none());
+        // Os dois convivem quando max_tokens existe.
+        let request = ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("oi")])
+            .with_max_tokens(900);
+        let body = build_body(&request, "proj-1");
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 900);
+        assert!(
+            body["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 
+    #[tokio::test]
+    async fn stream_chat_sends_interleaved_thinking_beta_and_output_floor_for_claude() {
+        let sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, server) = spawn_http_sequence(vec![(200, "text/event-stream", sse)]).await;
+        let provider =
+            AntigravityProvider::new(creds_expiring_at(u64::MAX)).with_base_url(base_url);
+        let mut stream = provider
+            .stream_chat(
+                ChatRequest::new(
+                    "antigravity-claude-sonnet-5-5-thinking",
+                    vec![Message::user("oi")],
+                )
+                .with_max_tokens(900),
+            )
+            .await
+            .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        let seen = server.await.unwrap();
+        assert!(
+            seen[0]
+                .to_ascii_lowercase()
+                .contains("anthropic-beta: interleaved-thinking-2025-05-14"),
+            "header anthropic-beta ausente no request Claude: {}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("\"maxOutputTokens\":64000"),
+            "maxOutputTokens deveria subir ao piso para Claude: {}",
+            seen[0]
+        );
+
+        // Gemini nao carrega o header nem herda o piso de saida.
+        let (base_url, server) = spawn_http_sequence(vec![(200, "text/event-stream", sse)]).await;
+        let provider =
+            AntigravityProvider::new(creds_expiring_at(u64::MAX)).with_base_url(base_url);
+        let mut stream = provider
+            .stream_chat(
+                ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("oi")])
+                    .with_max_tokens(900),
+            )
+            .await
+            .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        let seen = server.await.unwrap();
+        assert!(!seen[0].to_ascii_lowercase().contains("anthropic-beta"));
+        assert!(seen[0].contains("\"maxOutputTokens\":900"));
+    }
     #[test]
     fn resolve_api_model_strips_prefix_and_keeps_valid_ids() {
         assert_eq!(
@@ -1377,8 +2053,13 @@ mod tests {
         let body = build_body(&request, "rising-fact-p41fc");
 
         assert_eq!(body["request"]["systemInstruction"]["role"], "user");
+        // A instrucao do Antigravity abre as partes; a system do tupi vem depois.
         assert_eq!(
             body["request"]["systemInstruction"]["parts"][0]["text"],
+            ANTIGRAVITY_SYSTEM_INSTRUCTION
+        );
+        assert_eq!(
+            body["request"]["systemInstruction"]["parts"][1]["text"],
             "voce e um assistente"
         );
         assert_eq!(body["request"]["contents"].as_array().unwrap().len(), 1);
@@ -1405,6 +2086,7 @@ mod tests {
         assert_eq!(
             texts,
             vec![
+                ANTIGRAVITY_SYSTEM_INSTRUCTION,
                 "instrucao principal",
                 "memoria relevante",
                 "freio de passos"
@@ -1449,6 +2131,84 @@ mod tests {
                 .is_none()
         );
         assert_eq!(decls[0]["parameters"]["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn empty_tool_schema_becomes_valid_placeholder_declaration() {
+        // Schema vazio, objeto sem properties e properties vazio: os tres davam
+        // INVALID_ARGUMENT no Google, porque OBJECT sem properties nao existe.
+        let schemas = [
+            json!({}),
+            json!({ "type": "object" }),
+            json!({ "type": "object", "properties": {} }),
+        ];
+        for schema in schemas {
+            let spec = ToolSpec {
+                name: "ping".into(),
+                description: "sem argumentos".into(),
+                schema: schema.clone(),
+            };
+            let request = ChatRequest::new("gemini-3.8-flash-high", vec![Message::user("ping")])
+                .with_tools(vec![spec]);
+            let body = build_body(&request, "rising-fact-p41fc");
+
+            let params = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+            assert_eq!(params["type"], "object", "schema {schema}");
+            let props = params["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("properties ausente no schema {schema}"));
+            let placeholder = props
+                .get(EMPTY_SCHEMA_PLACEHOLDER_NAME)
+                .unwrap_or_else(|| panic!("placeholder ausente no schema {schema}"));
+            assert_eq!(placeholder["type"], "boolean");
+            assert!(placeholder["description"].is_string());
+            // `required` nao pode apontar para propriedades que nao existem.
+            assert!(params.get("required").is_none(), "schema {schema}");
+        }
+    }
+
+    #[test]
+    fn array_schema_without_items_gets_string_items() {
+        let cleaned = clean_gemini_schema(&json!({ "type": "array" }));
+        assert_eq!(cleaned["items"], json!({ "type": "string" }));
+
+        // `items` vazio derruba o array do mesmo jeito.
+        let cleaned = clean_gemini_schema(&json!({ "type": "array", "items": {} }));
+        assert_eq!(cleaned["items"], json!({ "type": "string" }));
+
+        // Aninhado num parametro a regra vale igual; `items` declarado fica.
+        let cleaned = clean_gemini_schema(&json!({
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array" },
+                "ids": { "type": "array", "items": { "type": "integer" } }
+            }
+        }));
+        assert_eq!(
+            cleaned["properties"]["tags"]["items"],
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            cleaned["properties"]["ids"]["items"],
+            json!({ "type": "integer" })
+        );
+    }
+
+    #[test]
+    fn body_keeps_tools_without_generation_config_for_plain_model() {
+        let spec = ToolSpec {
+            name: "read_file".into(),
+            description: "le um arquivo".into(),
+            schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        };
+        // Modelo sem tier de thinking e request sem max_tokens: as tools sobem,
+        // mas nenhum generationConfig inventado vai junto.
+        let request =
+            ChatRequest::new("gemini-2.5-pro", vec![Message::user("leia")]).with_tools(vec![spec]);
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        assert!(body["request"].get("tools").is_some());
+        assert!(body["request"].get("generationConfig").is_none());
     }
 
     #[test]
@@ -1506,6 +2266,147 @@ mod tests {
     }
 
     #[test]
+    fn body_groups_tool_results_and_drops_orphan() {
+        let call1 = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        let call2 = ToolCall {
+            id: "call_2".into(),
+            name: "grep".into(),
+            arguments: r#"{"pattern":"b"}"#.into(),
+        };
+        let request = ChatRequest::new(
+            "claude-sonnet-5-5-high",
+            vec![
+                Message::user("leia e busque"),
+                Message::assistant_with_calls("", vec![call1, call2]),
+                Message::tool("call_1", "conteudo A"),
+                // Orfao no meio do turno: nao pode virar turno proprio nem
+                // quebrar o agrupamento dos vizinhos.
+                Message::tool("call_desconhecido", "resposta sem functionCall"),
+                Message::tool("call_2", "match B"),
+            ],
+        );
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        let contents = body["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        let parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "read_file");
+        assert_eq!(parts[1]["functionResponse"]["id"], "call_2");
+        assert_eq!(parts[1]["functionResponse"]["name"], "grep");
+        // Nenhuma functionResponse referencia o id orfao.
+        assert!(
+            parts
+                .iter()
+                .all(|p| p["functionResponse"]["id"] != json!("call_desconhecido"))
+        );
+    }
+
+    #[test]
+    fn body_drops_tool_result_without_calls_at_all() {
+        let request = ChatRequest::new(
+            "gemini-3.8-flash-high",
+            vec![
+                Message::user("ola"),
+                Message::tool("call_perdido", "resultado solto"),
+            ],
+        );
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        let contents = body["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "ola");
+    }
+
+    #[test]
+    fn body_repairs_divergent_tool_response_id() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        let request = ChatRequest::new(
+            "gemini-3.8-flash-high",
+            vec![
+                Message::user("leia o arquivo"),
+                Message::assistant_with_calls("", vec![call]),
+                // Id que nao casa com nenhum functionCall: o par e reparado com
+                // o id da chamada aberta em vez de subir quebrado.
+                Message::tool("toolu_01desconhecido", "conteudo A"),
+            ],
+        );
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        let contents = body["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        let parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "read_file");
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["output"],
+            "conteudo A"
+        );
+        // Par valido: o functionResponse carrega o id do functionCall.
+        assert_eq!(
+            parts[0]["functionResponse"]["id"],
+            contents[1]["parts"][0]["functionCall"]["id"]
+        );
+        assert!(serde_json::to_string(&body).is_ok());
+    }
+
+    #[test]
+    fn body_repairs_empty_tool_response_id_without_duplicating_pairs() {
+        let call1 = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        let call2 = ToolCall {
+            id: "call_2".into(),
+            name: "grep".into(),
+            arguments: r#"{"pattern":"b"}"#.into(),
+        };
+        let request = ChatRequest::new(
+            "gemini-3.8-flash-high",
+            vec![
+                Message::user("leia e busque"),
+                Message::assistant_with_calls("", vec![call1, call2]),
+                // Id vazio e depois id repetido: ambos caem na chamada aberta
+                // na ordem original, sem duplicar par.
+                Message::tool("", "conteudo A"),
+                Message::tool("call_1", "match B"),
+            ],
+        );
+        let body = build_body(&request, "rising-fact-p41fc");
+
+        let contents = body["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        let parts = contents[2]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "read_file");
+        assert_eq!(parts[1]["functionResponse"]["id"], "call_2");
+        assert_eq!(parts[1]["functionResponse"]["name"], "grep");
+        // Nenhum id repetido: cada functionCall tem exatamente um par.
+        let mut ids: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p["functionResponse"]["id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids, vec!["call_1", "call_2"]);
+        assert!(serde_json::to_string(&body).is_ok());
+    }
+
+    #[test]
     fn chunk_extracts_text_delta_and_skips_thought_parts() {
         let payload = r#"{"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"pensando..."},{"text":"Ola mundo"}]}}]}}"#;
         let chunk = extract_chunk(payload).unwrap();
@@ -1531,6 +2432,73 @@ mod tests {
         assert_eq!(chunk.prompt_tokens, Some(120));
         assert_eq!(chunk.completion_tokens, Some(45));
         assert_eq!(chunk.cached_tokens, Some(30));
+    }
+
+    #[test]
+    fn chunk_treats_non_json_payload_as_ignorable_keepalive() {
+        let chunk = extract_chunk("keepalive").unwrap();
+        assert!(chunk.junk.is_some());
+        assert!(chunk.text.is_none());
+        assert!(chunk.tool_calls.is_empty());
+        assert!(chunk.prompt_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_ignores_keepalive_payloads_and_delivers_valid_events() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: keepalive\n\n",
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ola\"}]}}]}}\n\n",
+                "data: ping\n\n",
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" mundo\"}]}}]}}\n\n",
+                "data: :heartbeat\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let creds = AntigravityCredentials {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: u64::MAX,
+            project_id: "proj-1".into(),
+            email: None,
+        };
+        let provider = AntigravityProvider::new(creds).with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("keepalive nao pode virar erro do provedor"));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Started,
+                ProviderEvent::Text("ola".to_string()),
+                ProviderEvent::Text(" mundo".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1597,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_detects_expiration_within_window() {
+    fn is_expired_uses_five_minute_skew_plus_jitter() {
         let creds = AntigravityCredentials {
             access_token: "tok".into(),
             refresh_token: "ref".into(),
@@ -1606,12 +2574,91 @@ mod tests {
             email: None,
         };
 
-        // 100 seconds before: not expired (buffer is 60s)
-        assert!(!creds.is_expired(900));
-        // 55 seconds before: expired
-        assert!(creds.is_expired(945));
-        // after: expired
+        let margin = refresh_margin_secs(&creds);
+        assert!((REFRESH_SKEW_SECS..=REFRESH_SKEW_SECS + REFRESH_JITTER_SECS).contains(&margin));
+        assert_eq!(margin, refresh_margin_secs(&creds), "jitter deterministico");
+
+        // um segundo antes da janela: ainda vale
+        assert!(!creds.is_expired(1000 - margin - 1));
+        // na borda da janela: renova antes do request
+        assert!(creds.is_expired(1000 - margin));
+        // depois do vencimento: renova
         assert!(creds.is_expired(1050));
+    }
+
+    /// Sobe um servidor de token local; devolve (endpoint, handle com o POST cru).
+    async fn spawn_token_server(token: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = format!("{{\"access_token\":\"{token}\",\"expires_in\":3600}}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            request
+        });
+        (format!("http://{addr}/token"), handle)
+    }
+
+    fn creds_expiring_at(expires_at: u64) -> AntigravityCredentials {
+        AntigravityCredentials {
+            access_token: "old-token".into(),
+            refresh_token: "1//refresh".into(),
+            expires_at,
+            project_id: "proj-1".into(),
+            email: Some("dev@example.com".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_with_four_minutes_left_is_refreshed_before_request() {
+        let now = 1_000_000u64;
+        let (endpoint, server) = spawn_token_server("new-token").await;
+        let mut provider =
+            AntigravityProvider::new(creds_expiring_at(now + 240)).with_token_endpoint(endpoint);
+        provider.clock = Arc::new(move || now);
+
+        let (token, project_id) = provider.ensure_auth(false).await.unwrap();
+        assert_eq!(token, "new-token");
+        assert_eq!(project_id, "proj-1");
+
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /token"));
+        assert!(request.contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn force_auth_refreshes_valid_token() {
+        let now = 2_000_000u64;
+        let (endpoint, server) = spawn_token_server("forced-token").await;
+        let mut provider =
+            AntigravityProvider::new(creds_expiring_at(u64::MAX)).with_token_endpoint(endpoint);
+        provider.clock = Arc::new(move || now);
+
+        let (token, _) = provider.ensure_auth(true).await.unwrap();
+        assert_eq!(token, "forced-token");
+        assert!(server.await.unwrap().contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn ensure_auth_skips_refresh_outside_the_skew_window() {
+        let now = 3_000_000u64;
+        let mut provider = AntigravityProvider::new(creds_expiring_at(now + 3600))
+            .with_token_endpoint("http://127.0.0.1:1/token");
+        provider.clock = Arc::new(move || now);
+
+        let (token, _) = provider.ensure_auth(false).await.unwrap();
+        assert_eq!(token, "old-token");
     }
 
     #[test]
@@ -1896,6 +2943,183 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_chat_surfaces_mid_stream_error_after_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ola\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}}\n\n",
+                "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"Resource has been exhausted (e.g. check quota).\"}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let creds = AntigravityCredentials {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: u64::MAX,
+            project_id: "proj-1".into(),
+            email: None,
+        };
+        let provider = AntigravityProvider::new(creds).with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        // Depois do erro o stream precisa acabar: nenhum Usage/ToolCalls de um turno
+        // truncado pode sair como se a resposta tivesse terminado bem.
+        assert!(
+            stream.next().await.is_none(),
+            "stream continuou depois do erro mid-stream"
+        );
+
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Started, ProviderEvent::Text("ola".to_string())]
+        );
+
+        let described = format!("{error:?}");
+        assert!(
+            matches!(
+                error.as_ref(),
+                Some(ProviderError::RateLimited { status: 429, .. })
+                    | Some(ProviderError::QuotaExhausted { status: 429, .. })
+            ),
+            "erro mid-stream precisa subir como ProviderError visivel, veio {described}"
+        );
+    }
+
+    /// Regressao T2.3: numa unica sessao o Hub intercala keepalive, manda um
+    /// evento com JSON truncado e so entao o erro final. Nada disso pode virar
+    /// `ProviderError::Protocol` no meio do texto, e o erro do Cloud Code tem de
+    /// subir para o consumidor em vez de ser engolido.
+    #[tokio::test]
+    async fn stream_chat_tolerates_keepalive_and_truncated_events_then_surfaces_final_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let sse = concat!(
+                // keepalive: comentario SSE e payload nao-JSON que o Hub manda em ping
+                ": keepalive\n\n",
+                "data: ping\n\n",
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ola\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1}}}\n\n",
+                // evento truncado: JSON cortado no meio, fechado pela linha em branco
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" mun\n\n",
+                // erro final do Cloud Code, depois do lixo todo
+                "data: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"Resource has been exhausted (e.g. check quota).\"}}\n\n",
+                // sobra de linha parcial sem linha em branco: nunca fecha evento
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"nunca"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+
+        let creds = AntigravityCredentials {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: u64::MAX,
+            project_id: "proj-1".into(),
+            email: None,
+        };
+        let provider = AntigravityProvider::new(creds).with_base_url(format!("http://{addr}"));
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        // Keepalive e JSON truncado sao descartados: o texto do turno chega
+        // inteiro e o lixo nao aparece como erro de protocolo.
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Started, ProviderEvent::Text("ola".to_string())],
+            "keepalive/evento truncado nao podem derrubar o turno"
+        );
+
+        // O turno termina no erro final, sem Usage de uma resposta truncada.
+        assert!(
+            stream.next().await.is_none(),
+            "stream continuou depois do erro final"
+        );
+
+        let described = format!("{error:?}");
+        assert!(
+            matches!(
+                error.as_ref(),
+                Some(ProviderError::RateLimited { status: 429, .. })
+                    | Some(ProviderError::QuotaExhausted { status: 429, .. })
+            ),
+            "erro final precisa subir como ProviderError visivel, veio {described}"
+        );
+
+        // O corpo cru do erro fica registrado para diagnostico, como no 429 de HTTP.
+        let payload = provider.last_payload().expect("erro final registrado");
+        let raw = payload
+            .get("raw")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            raw.contains("RESOURCE_EXHAUSTED"),
+            "payload registrado perdeu o erro do Google: {payload}"
+        );
+    }
+
     #[test]
     fn authorization_url_contains_client_id_and_pkce_challenge() {
         let url = build_authorization_url("test_verifier_12345", "test_state");
@@ -1913,4 +3137,251 @@ mod tests {
         assert_eq!(ref_tok, "1//ref");
         assert_eq!(exp, 4600);
     }
+
+    /// Sobe um servidor HTTP que responde uma vez por conexao, na ordem dada, e
+    /// devolve o request cru de cada tentativa para conferir o Bearer usado.
+    async fn spawn_http_sequence(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+            seen
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_chat_reauthenticates_once_on_401_and_delivers_single_response() {
+        let now = 4_000_000u64;
+        let (token_endpoint, token_server) = spawn_token_server("fresh-token").await;
+        let sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, server) = spawn_http_sequence(vec![
+            (
+                401,
+                "application/json",
+                "{\"error\":{\"code\":401,\"message\":\"invalid authentication credentials\"}}",
+            ),
+            (200, "text/event-stream", sse),
+        ])
+        .await;
+
+        let mut provider = AntigravityProvider::new(creds_expiring_at(now + 3600))
+            .with_base_url(base_url)
+            .with_token_endpoint(token_endpoint);
+        provider.clock = Arc::new(move || now);
+
+        let mut stream = provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+            .expect("401 seguido de 200 precisa virar resposta");
+
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("a segunda tentativa nao pode falhar"));
+        }
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Started, ProviderEvent::Text("ok".to_string())],
+            "o retry nao pode duplicar eventos para o consumidor"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2, "401 precisa de exatamente uma nova tentativa");
+        assert!(
+            seen[0].contains("Bearer old-token"),
+            "primeira tentativa usou outro token: {}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("Bearer fresh-token"),
+            "retry precisa sair com o token renovado: {}",
+            seen[1]
+        );
+        assert!(token_server.await.unwrap().contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_surfaces_401_after_a_single_reauth() {
+        let now = 5_000_000u64;
+        let (token_endpoint, token_server) = spawn_token_server("fresh-token").await;
+        let unauthorized =
+            "{\"error\":{\"code\":401,\"message\":\"invalid authentication credentials\"}}";
+        let (base_url, server) = spawn_http_sequence(vec![
+            (401, "application/json", unauthorized),
+            (401, "application/json", unauthorized),
+        ])
+        .await;
+
+        let mut provider = AntigravityProvider::new(creds_expiring_at(now + 3600))
+            .with_base_url(base_url)
+            .with_token_endpoint(token_endpoint);
+        provider.clock = Arc::new(move || now);
+
+        let err = match provider
+            .stream_chat(ChatRequest::new(
+                "gemini-3.8-flash-high",
+                vec![Message::user("oi")],
+            ))
+            .await
+        {
+            Ok(_) => panic!("401 repetido precisa subir como ProviderError"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ProviderError::Http { status: 401, .. }),
+            "erro final precisa ser visivel ao usuario, veio {err:?}"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2, "401 nao pode entrar em retry infinito");
+        assert!(token_server.await.unwrap().contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn list_models_reauthenticates_once_on_401() {
+        let now = 6_000_000u64;
+        let (token_endpoint, token_server) = spawn_token_server("fresh-token").await;
+        let (base_url, server) = spawn_http_sequence(vec![
+            (401, "application/json", "{\"error\":{\"code\":401}}"),
+            (
+                200,
+                "application/json",
+                "{\"models\":{\"gemini-4-hydrogen-high\":{}}}",
+            ),
+        ])
+        .await;
+
+        let mut provider = AntigravityProvider::new(creds_expiring_at(now + 3600))
+            .with_base_url(base_url)
+            .with_token_endpoint(token_endpoint);
+        provider.clock = Arc::new(move || now);
+
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(
+            models,
+            vec!["gemini-4-hydrogen-high".to_string()],
+            "retry do 401 precisa devolver o catalogo real, nao o fallback estatico"
+        );
+
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 2, "401 precisa de exatamente uma nova tentativa");
+        assert!(
+            seen[1].contains("Bearer fresh-token"),
+            "retry precisa sair com o token renovado: {}",
+            seen[1]
+        );
+        assert!(token_server.await.unwrap().contains("grant_type=refresh_token"));
+    }
+
+    #[test]
+    fn permitted_models_keeps_static_order_and_appends_unknown_models() {
+        let statics: Vec<String> = SUPPORTED_MODELS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(permitted_models(None), statics);
+        let observed = vec!["gemini-5-ultra".to_string(), "gemini-3.8-flash-high".to_string()];
+        assert_eq!(
+            permitted_models(Some(&observed)),
+            vec!["gemini-3.8-flash-high".to_string(), "gemini-5-ultra".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_serves_catalog_from_cache_within_ttl() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hits, mut seen) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"models":{"gemini-4-hydrogen-high":{},"gemini-3.8-flash-high":{}}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                if hits.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut provider = AntigravityProvider::new(creds_expiring_at(u64::MAX))
+            .with_base_url(format!("http://{addr}"));
+        let now = 1_000_000u64;
+        provider.clock = Arc::new(move || now);
+
+        let first = provider.list_models().await.unwrap();
+        let expected = vec!["gemini-3.8-flash-high".to_string(), "gemini-4-hydrogen-high".to_string()];
+        assert_eq!(first, expected);
+        assert!(seen.recv().await.is_some(), "primeira chamada consulta o Hub");
+
+        let second = provider.list_models().await.unwrap();
+        assert_eq!(second, first, "dentro do TTL o catalogo vem do cache");
+        let again = tokio::time::timeout(std::time::Duration::from_millis(200), seen.recv()).await;
+        assert!(again.is_err(), "a segunda chamada nao pode gerar request HTTP");
+    }
+
+    #[tokio::test]
+    async fn list_models_filters_static_catalog_by_entitlement_after_failure() {
+        let (base_url, server) = spawn_http_sequence(vec![
+            (200, "application/json", r#"{"models":{"gemini-4-hydrogen-high":{}}}"#),
+            (500, "application/json", r#"{"error":{"code":500}}"#),
+        ])
+        .await;
+
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        let mut provider = AntigravityProvider::new(creds_expiring_at(u64::MAX))
+            .with_base_url(base_url);
+        provider.clock = Arc::new({
+            let now = now.clone();
+            move || now.load(Ordering::Relaxed)
+        });
+
+        let fetched = provider.list_models().await.unwrap();
+        assert_eq!(fetched, vec!["gemini-4-hydrogen-high".to_string()]);
+
+        now.store(1_000_000 + MODELS_CACHE_TTL_SECS + 1, Ordering::Relaxed);
+        let after_failure = provider.list_models().await.unwrap();
+        assert_eq!(
+            after_failure,
+            vec!["gemini-4-hydrogen-high".to_string()],
+            "conta sem entitlement nao ve modelo bloqueado no fallback"
+        );
+        assert_eq!(server.await.unwrap().len(), 2, "TTL vencido refaz a consulta");
+    }
+
+    mod fingerprint_tests;
 }

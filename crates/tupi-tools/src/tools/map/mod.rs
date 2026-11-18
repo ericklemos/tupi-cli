@@ -221,7 +221,14 @@ impl Tool for MapTool {
                 defs.len(),
                 if params.include_tests { 0 } else { tests }
             ),
-            body: String::new(),
+            // "0 arquivo(s)" para diretório cheio é mentira: o mapa indexa
+            // símbolo de código-fonte, então md/jsonl/config ficam de fora e o
+            // cabeçalho precisa dizer isso em vez de sugerir diretório vazio.
+            body: if defs.is_empty() {
+                "\nNada indexável aqui: o mapa só enxerga código-fonte com símbolo. Markdown, jsonl e config (docs/, .agents/) saem com `lookup kind=text`/`kind=lines` ou `read`.\n".to_string()
+            } else {
+                String::new()
+            },
             priority: 255,
         });
         sections.extend(match params.depth {

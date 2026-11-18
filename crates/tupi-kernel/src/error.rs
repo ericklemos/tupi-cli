@@ -6,6 +6,26 @@ pub enum ProviderError {
     Http { status: u16, body: String },
     #[error("resposta fora do formato esperado: {0}")]
     Protocol(String),
+    #[error("limite de requisições (HTTP {status}): {message}")]
+    RateLimited {
+        status: u16,
+        retry_after: Option<u64>,
+        message: String,
+        body: String,
+    },
+    #[error("quota esgotada (HTTP {status}): {message}")]
+    QuotaExhausted {
+        status: u16,
+        reset: Option<u64>,
+        message: String,
+        body: String,
+    },
+    #[error("requisição inválida (HTTP {status}): {message}")]
+    InvalidArgument {
+        status: u16,
+        message: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

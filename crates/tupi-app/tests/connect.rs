@@ -1,5 +1,8 @@
 use tupi_app::App;
-use tupi_kernel::{Command, CommandHandler, EventBus, ProviderRegistry, ToolRegistry};
+use tupi_kernel::{
+    Command, CommandHandler, EventBus, ProviderRegistry, Query, QueryHandler, QueryResult,
+    ToolRegistry,
+};
 
 #[tokio::test]
 async fn connect_unknown_provider_returns_error() {
@@ -112,4 +115,47 @@ async fn new_app_session_loads_connected_antigravity_and_lists_models() {
     }
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// O autocomplete de `/connect ` nasce de `Query::ListProviders`: um provedor
+/// que só entra no registry depois do login precisa aparecer mesmo sem
+/// credencial, senão o id é indescobrível na TUI.
+#[tokio::test]
+async fn list_providers_includes_connectable_ids_before_login() {
+    let app = App::with_tools(
+        ProviderRegistry::new(),
+        "fake",
+        "m".into(),
+        EventBus::new(8),
+        None,
+        ToolRegistry::new(),
+        String::new(),
+    );
+
+    let result = app.query(Query::ListProviders).await.unwrap();
+    let QueryResult::Providers(ids) = result else {
+        panic!("esperava QueryResult::Providers");
+    };
+
+    assert!(ids.contains(&"openai-plan".to_string()), "ids: {ids:?}");
+    assert!(ids.contains(&"antigravity".to_string()), "ids: {ids:?}");
+    // `deepseek` não tem ramo de login: só entra na lista quando registrado.
+    assert!(!ids.contains(&"deepseek".to_string()), "ids: {ids:?}");
+}
+
+/// `/connect openai` cai em `openai-plan` porque o prefixo é único.
+#[test]
+fn connect_accepts_unique_prefix_as_alias() {
+    assert_eq!(App::resolve_connect_provider("openai"), Some("openai-plan"));
+    assert_eq!(
+        App::resolve_connect_provider("openai-plan"),
+        Some("openai-plan")
+    );
+    assert_eq!(App::resolve_connect_provider("anti"), Some("antigravity"));
+    assert_eq!(
+        App::resolve_connect_provider(" Antigravity "),
+        Some("antigravity")
+    );
+    assert_eq!(App::resolve_connect_provider("desconhecido"), None);
+    assert_eq!(App::resolve_connect_provider(""), None);
 }
