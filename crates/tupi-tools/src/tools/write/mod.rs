@@ -55,7 +55,7 @@ impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write".to_string(),
-            description: "Cria ou substitui um arquivo inteiro sob o root. Sobrescrever exige expected_hash ou overwrite=true.".to_string(),
+            description: "Cria ou substitui um arquivo inteiro sob o root. Exceção declarada: para mudar um trecho de arquivo existente use `edit` (`old`+`new` em qualquer texto, `symbol`+`new_body` em Rust). Sobrescrever exige expected_hash ou overwrite=true.".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {

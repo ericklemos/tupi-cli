@@ -33,9 +33,11 @@ fn params(dir: &TempDir, symbol: &str, body: &str) -> EditParams {
     let content = fs::read(dir.path().join("auth.rs")).unwrap();
     EditParams {
         path: "auth.rs".into(),
-        symbol: symbol.into(),
+        symbol: Some(symbol.into()),
+        old: None,
+        new: None,
         expected_hash: hash_prefix(&content),
-        new_body: body.into(),
+        new_body: Some(body.into()),
         signature: None,
         budget_tokens: None,
     }
@@ -174,9 +176,11 @@ fn a_struct_body_is_editable() {
     let tool = tool_for(dir.path());
     tool.edit(EditParams {
         path: "point.rs".into(),
-        symbol: "Point".into(),
+        symbol: Some("Point".into()),
+        old: None,
+        new: None,
         expected_hash: hash_prefix(&content),
-        new_body: "{\n    x: u8,\n    y: u8,\n}".into(),
+        new_body: Some("{\n    x: u8,\n    y: u8,\n}".into()),
         signature: None,
         budget_tokens: None,
     })
@@ -202,9 +206,11 @@ fn a_non_utf8_file_is_rejected() {
     let error = tool_for(dir.path())
         .edit(EditParams {
             path: "bin.rs".into(),
-            symbol: "x".into(),
+            symbol: Some("x".into()),
+            old: None,
+            new: None,
             expected_hash: "deadbeef".into(),
-            new_body: "{}".into(),
+            new_body: Some("{}".into()),
             signature: None,
             budget_tokens: None,
         })
@@ -254,9 +260,11 @@ fn a_body_that_smuggles_a_second_item_is_refused() {
     let error = tool_for(dir.path())
         .edit(EditParams {
             path: "cache.rs".into(),
-            symbol: "Entry".into(),
+            symbol: Some("Entry".into()),
+            old: None,
+            new: None,
             expected_hash: hash_prefix(&content),
-            new_body: "{\n    text: String,\n}\n\npub struct Cache {\n    width: usize,\n}".into(),
+            new_body: Some("{\n    text: String,\n}\n\npub struct Cache {\n    width: usize,\n}".into()),
             signature: None,
             budget_tokens: None,
         })
@@ -264,4 +272,63 @@ fn a_body_that_smuggles_a_second_item_is_refused() {
 
     assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
     assert_eq!(fs::read(dir.path().join("cache.rs")).unwrap(), content);
+}
+
+#[test]
+fn a_request_without_symbol_or_old_is_refused_naming_both_routes() {
+    let dir = fixture();
+    let content = fs::read(dir.path().join("auth.rs")).unwrap();
+    let error = tool_for(dir.path())
+        .edit(EditParams {
+            path: "auth.rs".into(),
+            symbol: None,
+            old: None,
+            new: None,
+            expected_hash: hash_prefix(&content),
+            new_body: None,
+            signature: None,
+            budget_tokens: None,
+        })
+        .unwrap_err();
+
+    let message = match error {
+        ToolError::InvalidArguments(message) => message,
+        other => panic!("esperava InvalidArguments, veio {other:?}"),
+    };
+    assert!(
+        message.contains("`symbol`") && message.contains("`old`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("`new_body`") && message.contains("`new`"),
+        "{message}"
+    );
+    assert_eq!(fs::read(dir.path().join("auth.rs")).unwrap(), content);
+}
+
+#[test]
+fn symbol_and_old_together_are_refused_as_alternatives() {
+    let dir = fixture();
+    let error = tool_for(dir.path())
+        .edit(EditParams {
+            path: "auth.rs".into(),
+            symbol: Some("verify".into()),
+            old: Some("pub fn logout() {\n}".into()),
+            new: Some("pub fn logout() { }".into()),
+            expected_hash: hash_prefix(&fs::read(dir.path().join("auth.rs")).unwrap()),
+            new_body: None,
+            signature: None,
+            budget_tokens: None,
+        })
+        .unwrap_err();
+
+    let message = match error {
+        ToolError::InvalidArguments(message) => message,
+        other => panic!("esperava InvalidArguments, veio {other:?}"),
+    };
+    assert!(message.contains("alternativas"), "{message}");
+    assert!(
+        message.contains("`symbol`") && message.contains("`old`"),
+        "{message}"
+    );
 }

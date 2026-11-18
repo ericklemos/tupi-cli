@@ -213,6 +213,16 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Linha que fixa a língua do projeto no corpo de um workflow: o passo pode
+/// estar em inglês, a resposta não.
+fn lang_directive(lang: Option<&str>) -> Option<String> {
+    let lang = lang.map(str::trim).filter(|lang| !lang.is_empty())?;
+    Some(format!(
+        "> idioma: `{lang}` — conduza os passos e responda nessa língua, mesmo que este \
+         workflow esteja escrito em outra."
+    ))
+}
+
 fn docs_directive(root: &Path, folders: &[PathBuf]) -> Option<String> {
     let first = folders.first()?;
     let display = |folder: &Path| {
@@ -302,6 +312,8 @@ pub struct WorkflowTool {
     store: Arc<ResponseStore>,
     default_budget_tokens: usize,
     docs_folders: Vec<PathBuf>,
+    /// Língua do projeto (`ai.project.json`), como `pt-BR`.
+    lang: Option<String>,
 }
 
 impl WorkflowTool {
@@ -311,11 +323,17 @@ impl WorkflowTool {
             store,
             default_budget_tokens,
             docs_folders: Vec::new(),
+            lang: None,
         }
     }
 
     pub fn with_docs_folders(mut self, docs_folders: Vec<PathBuf>) -> Self {
         self.docs_folders = docs_folders;
+        self
+    }
+
+    pub fn with_lang(mut self, lang: Option<String>) -> Self {
+        self.lang = lang;
         self
     }
 }
@@ -413,6 +431,11 @@ impl Tool for WorkflowTool {
                         }
                         body.push_str(workflow.body.trim());
                         body.push('\n');
+                        if let Some(directive) = lang_directive(self.lang.as_deref()) {
+                            body.push('\n');
+                            body.push_str(&directive);
+                            body.push('\n');
+                        }
                         (
                             format!(
                                 "### workflow — `{}` ({})",
@@ -685,6 +708,70 @@ mod tests {
         assert!(!read.contains("description:"));
     }
 
+    /// T4.2: o `checkmate` viaja no binário. Um arquivo local em
+    /// `.agents/workflows/` venceria o nativo em `merge` e voltaria a
+    /// aparecer como `local (.agents)` em `list`/`read`; este teste é o
+    /// aviso de que o nativo sumiu.
+    #[test]
+    fn checkmate_is_native_in_list_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path());
+
+        let list = call(&tool, serde_json::json!({"action": "list"})).unwrap();
+        let line = list
+            .lines()
+            .find(|line| line.contains("`checkmate`"))
+            .expect("checkmate aparece na lista");
+        assert!(line.contains("`checkmate` (nativo)"), "{line}");
+        assert!(line.contains("— agente: sdd"), "{line}");
+        assert!(
+            !line.contains("**Name:**"),
+            "descrição crua do corpo em vez da curada: {line}"
+        );
+
+        let read = call(
+            &tool,
+            serde_json::json!({"action": "read", "name": "checkmate"}),
+        )
+        .unwrap();
+        assert!(
+            read.contains("### workflow — `checkmate` (nativo)"),
+            "{read}"
+        );
+        assert!(read.contains("> arquivo: embutido no binário"), "{read}");
+        assert!(read.contains("> agente: sdd"), "{read}");
+        assert!(read.contains("# Checkmate"), "{read}");
+        assert!(!read.contains("local (.agents)"), "{read}");
+        assert!(!read.contains(".agents/workflows"), "{read}");
+        assert!(!read.contains("> sombreia:"), "{read}");
+    }
+
+    #[test]
+    fn read_appends_the_project_language_after_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join(".tupi/workflows"),
+            "deploy",
+            "---\ndescription: sobe a versão\n---\n\n# Deploy\n\n1. suba\n",
+        );
+
+        let read = call(
+            &tool(dir.path()).with_lang(Some("pt-BR".to_string())),
+            serde_json::json!({"action": "read", "name": "deploy"}),
+        )
+        .unwrap();
+        assert!(read.contains("1. suba"));
+        assert!(read.contains("> idioma: `pt-BR`"));
+
+        // Sem idioma declarado, o corpo volta como está.
+        let bare = call(
+            &tool(dir.path()),
+            serde_json::json!({"action": "read", "name": "deploy"}),
+        )
+        .unwrap();
+        assert!(!bare.contains("> idioma:"));
+    }
+
     #[test]
     fn read_requires_a_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -816,6 +903,7 @@ mod tests {
                 "artisan",
                 "bolt",
                 "bughunter",
+                "checkmate",
                 "disco",
                 "gatekeeper",
                 "janitor",

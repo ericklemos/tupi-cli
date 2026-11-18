@@ -291,6 +291,12 @@ async fn main() -> anyhow::Result<()> {
     tool_options.sdd_store = Some(sdd_store_for_tools.clone());
     tool_options.mode_cell = Some(std::sync::Arc::clone(&mode_cell));
     tool_options.docs_folders = docs_folders.clone();
+    tool_options.lang = Some(project.lang().as_str().to_string());
+    // Vazio = feature desligada: nenhuma tool `mcp` e nenhuma latência de
+    // startup. Servidor `enabled: false` também não vira spec, logo não é
+    // spawnado.
+    tool_options.mcp = mcp_specs(&project.mcp);
+    tracing::debug!(servers = tool_options.mcp.len(), "servidores mcp do projeto");
     let should_download = config::should_download(
         config::docs_embedding_enabled(
             &docs_folders,
@@ -521,6 +527,36 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mapa `mcp` do `ai.project.json` -> vocabulário neutro de `tupi-tools`.
+///
+/// A conversão mora aqui porque `tupi-tools` não conhece `ProjectConfig`: a
+/// dependência só aponta para baixo. A ordem do `BTreeMap` mantém estável a
+/// saída de `mcp(action="servers")`.
+fn mcp_specs(
+    servers: &std::collections::BTreeMap<String, project_config::McpServerConfig>,
+) -> Vec<tupi_tools::mcp::ServerSpec> {
+    servers
+        .iter()
+        .filter(|(_, server)| server.enabled())
+        .filter_map(|(name, server)| match server {
+            project_config::McpServerConfig::Local {
+                command,
+                env,
+                read_only,
+                ..
+            } => Some(tupi_tools::mcp::ServerSpec {
+                name: name.clone(),
+                command: command.clone(),
+                env: env.clone(),
+                read_only: *read_only,
+            }),
+            // `remote` já é recusado na carga da config; se chegar até aqui,
+            // fica fora do stdio em vez de virar processo inválido.
+            project_config::McpServerConfig::Remote { .. } => None,
+        })
+        .collect()
+}
+
 fn tool_root() -> anyhow::Result<PathBuf> {
     let root = std::env::current_dir().context("não foi possível obter o diretório atual")?;
     root.canonicalize()
@@ -677,6 +713,41 @@ mod tests {
             ),
             "BASE\n\n## Instruções do projeto (AGENTS.md)\n\nRegras."
         );
+    }
+
+    /// Ausente ou `enabled: false` não vira spec: sem spec não há tool `mcp`
+    /// nem processo spawnado no startup.
+    #[test]
+    fn mcp_specs_skips_absent_and_disabled_servers() {
+        let path = std::path::Path::new("ai.project.json");
+
+        let absent = project_config::parse_project(r#"{"name":"p"}"#, path).expect("config válida");
+        assert!(mcp_specs(&absent.mcp).is_empty());
+
+        let disabled = project_config::parse_project(
+            r#"{"name":"p","mcp":{"git":{"type":"local","command":["mcp-git"],"enabled":false}}}"#,
+            path,
+        )
+        .expect("config válida");
+        assert!(mcp_specs(&disabled.mcp).is_empty());
+    }
+
+    /// Servidor ligado atravessa a fronteira como spec neutro, com `env` e
+    /// `read_only` preservados.
+    #[test]
+    fn mcp_specs_carry_an_enabled_local_server() {
+        let config = project_config::parse_project(
+            r#"{"name":"p","mcp":{"filesystem":{"type":"local","command":["mcp-fs","."],"read_only":true,"env":{"TOKEN":"s3cr3t"}}}}"#,
+            std::path::Path::new("ai.project.json"),
+        )
+        .expect("config válida");
+
+        let specs = mcp_specs(&config.mcp);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "filesystem");
+        assert_eq!(specs[0].command, vec!["mcp-fs".to_string(), ".".to_string()]);
+        assert!(specs[0].read_only);
+        assert_eq!(specs[0].env.get("TOKEN").map(String::as_str), Some("s3cr3t"));
     }
 }
 mod token;

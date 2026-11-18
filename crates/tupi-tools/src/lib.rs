@@ -1,5 +1,7 @@
 pub mod archive;
 pub mod space;
+pub mod mcp;
+pub mod verify;
 mod support;
 mod tools;
 
@@ -64,6 +66,9 @@ pub struct ToolsOptions {
         Option<Arc<dyn Fn(&crate::sdd::SddPlan) -> Result<String, String> + Send + Sync>>,
     /// Pastas com documentação declarada no projeto. Vazio desliga o RAG.
     pub docs_folders: Vec<std::path::PathBuf>,
+    /// Língua do projeto (`ai.project.json`), como `pt-BR`. Vazio desliga o
+    /// sufixo de idioma dos workflows.
+    pub lang: Option<String>,
     /// Slot do embedder local; None mantém a busca lexical.
     pub embedder: Option<Arc<tupi_kernel::embed::EmbedderSlot>>,
     /// Dispara o worker de background do índice; testes desligam.
@@ -75,6 +80,8 @@ pub struct ToolsOptions {
     pub generator: Option<Arc<tupi_kernel::generate::GeneratorSlot>>,
     /// Acervo do modo docs; None desliga o modo.
     pub archive: Option<crate::tools::archive::ArchiveOptions>,
+    /// Servidores MCP do projeto. Vazio desliga a tool `mcp`.
+    pub mcp: Vec<crate::mcp::ServerSpec>,
 }
 
 impl Default for ToolsOptions {
@@ -88,10 +95,12 @@ impl Default for ToolsOptions {
             mode_cell: None,
             sdd_executor: None,
             docs_folders: Vec::new(),
+            lang: None,
             embedder: None,
             space: None,
             generator: None,
             archive: None,
+            mcp: Vec::new(),
         }
     }
 }
@@ -107,11 +116,13 @@ impl ToolsOptions {
             mode_cell: None,
             sdd_executor: None,
             docs_folders: Vec::new(),
+            lang: None,
             embedder: None,
             space_worker: false,
             space: None,
             generator: None,
             archive: None,
+            mcp: Vec::new(),
         }
     }
 }
@@ -190,6 +201,9 @@ pub fn register_with(
         )));
     }
     let watcher = options.watcher;
+    if !options.mcp.is_empty() {
+        registry.register(Arc::new(crate::mcp::McpTool::new(options.mcp.clone())));
+    }
     let exec_cache = options.exec_cache;
     let sdd_store = options
         .sdd_store
@@ -251,6 +265,7 @@ pub fn register_with(
     )));
     registry.register(Arc::new(
         WorkflowTool::new(root_dir.clone(), store.clone(), DEFAULT_BUDGET_TOKENS)
+            .with_lang(options.lang.clone())
             .with_docs_folders(options.docs_folders.clone()),
     ));
     registry.register(Arc::new(crate::graph::RepairingTool::new(
@@ -634,5 +649,150 @@ mod tests {
         assert!(sdd.contains(&"docs".to_string()), "{sdd:?}");
         assert!(!exec.contains(&"docs".to_string()), "{exec:?}");
         assert!(Exposure::Core.admits("docs"));
+    }
+
+    /// `mcp` nunca entra em `CORE_TOOLS`: só aparece com `All` ou lista explícita.
+    #[test]
+    fn mcp_is_outside_core_and_admitted_only_when_exposed() {
+        fn exposed(options: &ToolsOptions, exposure: Exposure<'_>) -> Vec<String> {
+            let dir = tempdir().unwrap();
+            let mut registry = ToolRegistry::new();
+            register_exposed_with(
+                dir.path().to_path_buf(),
+                &mut registry,
+                exposure,
+                options.clone(),
+            );
+            registry
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect()
+        }
+
+        assert!(!CORE_TOOLS.contains(&"mcp"));
+        assert!(!Exposure::Core.admits("mcp"));
+
+        let mut options = ToolsOptions::default();
+        options.mcp = vec![crate::mcp::ServerSpec::local("fake", vec!["true".to_string()])];
+
+        let core = exposed(&options, Exposure::Core);
+        assert!(!core.contains(&"mcp".to_string()), "{core:?}");
+
+        let only = ["mcp".to_string()];
+        assert_eq!(
+            exposed(&options, Exposure::Only(&only)),
+            vec!["mcp".to_string()]
+        );
+
+        let all = exposed(&options, Exposure::All);
+        assert!(all.contains(&"mcp".to_string()), "{all:?}");
+    }
+
+    /// `call` de servidor comum é `Opaque`; `read_only` rebaixa para `ReadOnly`.
+    /// A tool só existe em execução: SDD e docs não a herdam.
+    #[test]
+    fn mcp_call_is_opaque_and_execution_only() {
+        use tupi_kernel::{AgentMode, Effect};
+
+        let dir = tempdir().unwrap();
+        let mut reader = crate::mcp::ServerSpec::local("reader", vec!["true".to_string()]);
+        reader.read_only = true;
+        let mut options = ToolsOptions::default();
+        options.mcp = vec![
+            crate::mcp::ServerSpec::local("writer", vec!["true".to_string()]),
+            reader,
+        ];
+
+        let mut registry = ToolRegistry::new();
+        register_with(dir.path().to_path_buf(), &mut registry, options);
+        let mcp = registry.get("mcp").expect("mcp registrada");
+
+        assert_eq!(
+            mcp.effect(&serde_json::json!({ "action": "call", "server": "writer", "tool": "t" })),
+            Effect::Opaque
+        );
+        assert_eq!(
+            mcp.effect(&serde_json::json!({ "action": "call", "server": "reader", "tool": "t" })),
+            Effect::ReadOnly
+        );
+        for read in [
+            serde_json::json!({ "action": "servers" }),
+            serde_json::json!({ "action": "tools", "server": "writer" }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(mcp.effect(&read), Effect::ReadOnly, "{read}");
+        }
+
+        let mask = mcp.mode_mask();
+        assert!(mask.contains(AgentMode::Execution));
+        assert!(!mask.contains(AgentMode::Sdd));
+        assert!(!mask.contains(AgentMode::Docs));
+
+        let names = |mode: AgentMode| -> Vec<String> {
+            registry
+                .specs_for_mode(mode)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect()
+        };
+        assert!(
+            names(AgentMode::Execution).contains(&"mcp".to_string()),
+            "mcp deveria existir em execução"
+        );
+        assert!(!names(AgentMode::Sdd).contains(&"mcp".to_string()));
+        assert!(!names(AgentMode::Docs).contains(&"mcp".to_string()));
+    }
+
+    /// Ausente ou desligado não custa nada: sem spec, nenhuma tool `mcp` entra
+    /// no registry, em nenhum modo.
+    #[test]
+    fn without_servers_no_mcp_tool_is_registered() {
+        let dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        register_with(
+            dir.path().to_path_buf(),
+            &mut registry,
+            ToolsOptions::hermetic(state_dir.path().to_path_buf()),
+        );
+
+        assert!(!registry.has("mcp"));
+        for mode in [
+            tupi_kernel::AgentMode::Execution,
+            tupi_kernel::AgentMode::Sdd,
+            tupi_kernel::AgentMode::Docs,
+        ] {
+            let names: Vec<String> = registry
+                .specs_for_mode(mode)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect();
+            assert!(!names.contains(&"mcp".to_string()), "{names:?}");
+        }
+    }
+
+    /// Mesmo com servidor declarado, registrar não spawna: a conexão nasce no
+    /// primeiro `call`, então o startup nunca espera servidor terceiro.
+    #[cfg(unix)]
+    #[test]
+    fn registering_a_server_spawns_nothing() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let mut options = ToolsOptions::hermetic(dir.path().to_path_buf());
+        options.mcp = vec![crate::mcp::ServerSpec::local(
+            "lazy",
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch '{}'", marker.display()),
+            ],
+        )];
+
+        let mut registry = ToolRegistry::new();
+        register_with(dir.path().to_path_buf(), &mut registry, options);
+
+        assert!(registry.has("mcp"));
+        assert!(!marker.exists(), "startup não pode spawnar servidor mcp");
     }
 }

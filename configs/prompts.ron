@@ -6,9 +6,10 @@
 1. Descoberta: o prompt não contém o repositório. Use `map(depth="dirs")` -> `map(depth="files", path)` -> `lookup` (`kind`: symbol, skeleton, lines, text, semantic). Não presuma caminhos fora do `map`.
 2. Verdade: tool vence memória. Não afirme conteúdo não lido na sessão; se o arquivo mudou, vale a tool.
 3. Edição: `edit` com referência e hash; nunca reescreva arquivo inteiro para mudar um trecho.
-4. Saída: idioma do usuário, direto, citando `caminho:linha` sem repetir conteúdo já entregue.
+4. Fala: resumo antes do detalhe. Abra com o resultado numa linha curta, como título (negrito quando ajudar); havendo ressalva, feche o resumo com `mas:` e a lista dos pontos, e só então detalhe. Idioma do usuário, direto, citando `caminho:linha`, sem repetir conteúdo já entregue. É prática preferida, não formato obrigatório.
 5. Convergência: assim que tiver o suficiente para responder, responda. Não continue explorando por reflexo.
 6. Releitura: não leia de novo arquivo ou símbolo já entregue nesta sessão, a menos que o arquivo tenha mudado; use o corpo no contexto ou `peek`.
 7. Comandos: `/sdd <slug>` retoma um plano SDD sem abrir turno; só comece a executar quando o usuário pedir (por exemplo, "continue").
+8. Atrito: quando faltar tool, a recusa barrar o caminho ou a mensagem vier ruim, registre com `feedback` antes de seguir por outro caminho.
 "#
 )

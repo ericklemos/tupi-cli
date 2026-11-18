@@ -15,6 +15,11 @@
   (`symbol`, `skeleton`, `lines`, `text`, `semantic`, `graph`) com um orçamento,
   cap por item, corte anunciado, erro por item e dedupe por ledger; fundiu
   `read_many` e `search` e cortou o schema para 4.468 tokens no núcleo.
+- [Verificação da escrita](features/verify.md) — comando do verificador do repo
+  declarado por glob em `configs/verify.ron` (primeira regra que casa vence,
+  caminho sem regra é no-op, falha é recusa com comando e saída) e âncora viva
+  `caminho:linha@blake3` em documento; os dois módulos estão testados e ainda
+  sem chamador no caminho de escrita.
 - [Tool `shell`](features/shell-tool.md) — saída bruta por padrão (`terms` só
   filtra com `filter: true`), allowlist restrita (`cargo` fora, `git` só leitura),
   binário ausente vira aviso com equivalente e recusa sempre ensina a alternativa;
@@ -27,6 +32,10 @@
   entram no prefixo, nunca no resultado da tool: um julgamento de memória por
   turno e manifesto compacto (path · símbolo · blake3 · handle, ≤24 entradas, sem
   corpos) que corta re-leitura de 2 para 1 chamada por resultado reaberto.
+- [Cliente MCP](features/mcp.md) — a seção `mcp` do `ai.project.json` vira uma
+  tool só (`servers`/`tools`/`call`) falando JSON-RPC 2.0 por stdio, com spawn
+  lazy, timeout por leitura e filho ceifado no drop; `remote` é recusado com
+  mensagem que ensina.
 
 ## Modelos locais
 
@@ -50,6 +59,9 @@
   ajustes aplicados e lacunas de medição.
 - [Baseline de build (T1.1)](perf/build-baseline.md) — tempos e tamanhos a frio
   antes de qualquer `[profile.*]`, com o script de reprodução.
+- [Escrita por extensão](perf/write-baseline.md) — medição da task 0 sobre a
+  telemetria já gravada: `write` de arquivo inteiro onde caberia edição cirúrgica
+  e o veredito de que o endereço textual paga.
 - [Alocador e linker: medidos e descartados](perf/allocator-and-linker.md) —
   `mimalloc` e `mold` não trouxeram ganho, inclusive no A/B refeito em release
   com concorrência (RSS 2,3× maior); o que ficou como harness.
@@ -69,7 +81,8 @@
 
 ## Convenções
 
-- [Convenções](conventions.md) — onde cada coisa mora, testes e commits.
+- [Convenções](conventions.md) — onde cada coisa mora, escrita (endereço, guarda
+  e verificação), testes e commits.
 
 ## Decisões
 
@@ -94,6 +107,13 @@
 - [ADR 0007](decisions/0007-fusao-lookup.md) — `read_many` e `search` viram
   `lookup(ops)`: um orçamento, erro por item e cap declarado; o schema cai para
   4.468 (núcleo) e 10.613 (`expose_all`).
+- [ADR 0008](decisions/0008-mcp-cliente-com-catalogo.md) — MCP entra como uma
+  tool `mcp` com catálogo (config no repo), não N tools flat: schema grande não
+  viaja no turno e o startup não espera servidor de terceiro.
+- [ADR 0009](decisions/0009-mcp-http-cliente.md) — o transporte remoto do MCP
+  reusa o `reqwest` já pinado (e já linkado via `tupi-providers`), dirigido por
+  um runtime `current_thread` por conexão: nenhum crate novo, nenhuma feature a
+  mais no pin e `Tool::call` continua síncrona.
 
 ## Regras
 

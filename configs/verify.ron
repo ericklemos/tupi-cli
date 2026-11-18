@@ -1,0 +1,20 @@
+// Verificação pós-escrita por glob de caminho (opt-in do projeto).
+//
+// Cada regra aponta o verificador do ecossistema que cobre o glob — o juiz é o
+// verificador do repo, nunca o parser do tupi. O comando é dado, não código:
+// acrescentar uma linguagem é acrescentar uma regra.
+//
+// Formato (crates/tupi-tools/src/verify.rs):
+//   (glob: "**/*.ts", program: "tsc", args: ["--noEmit"], timeout_secs: 120)
+//
+// Resolução: regras casam na ordem declarada e a primeira que casa vence; glob
+// sem `/` casa o nome do arquivo em qualquer profundidade, glob com `/` casa o
+// caminho relativo à raiz. Caminho sem glob correspondente é no-op explícito.
+//
+// `rules: []` (ausente é igual) desliga a verificação: quem não declarou nada
+// não muda de comportamento. Declarar aqui um verificador que não está
+// instalado transforma toda escrita coberta em recusa, então a lista só cresce
+// com o comando conferido no ambiente.
+(
+    rules: []
+)

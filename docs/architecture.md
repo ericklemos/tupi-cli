@@ -41,6 +41,10 @@ crates:
   inspeção crua: allowlist restrita, recusa que ensina a alternativa e nenhuma
   memória de projeto no resultado (ver
   [`features/shell-tool.md`](features/shell-tool.md)).
+- **Cliente MCP** (`tupi-tools::mcp`): a seção `mcp` do `ai.project.json` vira
+  uma tool só (`servers`/`tools`/`call`), JSON-RPC 2.0 por stdio com timeout por
+  leitura, spawn lazy e filho ceifado no drop; `type: "remote"` é recusado até a
+  T6 (ver [`features/mcp.md`](features/mcp.md)).
 - **Transcript da TUI**: `ChatState` guarda o relógio e a duração de cada tool;
   `transcript_layout_at` desenha linha viva, glifo por categoria e indentação de
   sub-chamadas (ver [`features/tui-tool-usage.md`](features/tui-tool-usage.md)).

@@ -27,6 +27,76 @@ pub struct ModelConfig {
     pub context_window: Option<usize>,
 }
 
+/// Valor padrão de `enabled`: servidor declarado está ligado.
+fn default_true() -> bool {
+    true
+}
+
+/// `enabled: true` é o default e não precisa aparecer no arquivo.
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// `read_only: false` é o default e não precisa aparecer no arquivo.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Um servidor MCP declarado em `ai.project.json`, sob a chave `mcp`.
+///
+/// O campo `type` escolhe o transporte: `local` fala JSON-RPC 2.0 por stdio
+/// com um processo filho; `remote` fica reservado para a fase seguinte e é
+/// recusado na carga.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpServerConfig {
+    /// Transporte stdio: `command` é spawnado e conversa JSON-RPC 2.0.
+    Local {
+        /// Programa e argumentos, em ordem. O primeiro item é o executável.
+        command: Vec<String>,
+        /// Variáveis de ambiente extras do processo filho. Nunca vão para log
+        /// nem para mensagem de erro.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        /// `false` desliga o servidor sem apagar a configuração.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        enabled: bool,
+        /// `true` declara que toda tool do servidor é leitura, o que deixa
+        /// `mcp(action="call")` com efeito ReadOnly em vez de Opaque.
+        #[serde(default, skip_serializing_if = "is_false")]
+        read_only: bool,
+    },
+    /// Transporte remoto (SSE/HTTP). Ainda não suportado nesta fase.
+    Remote {
+        /// Endpoint do servidor.
+        url: String,
+        /// Cabeçalhos extras da requisição. Nunca vão para log nem para
+        /// mensagem de erro.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+        /// `false` desliga o servidor sem apagar a configuração.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        enabled: bool,
+    },
+}
+
+impl McpServerConfig {
+    /// Servidor ligado? Ausente no arquivo = ligado.
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Local { enabled, .. } | Self::Remote { enabled, .. } => *enabled,
+        }
+    }
+
+    /// O servidor declara que todas as suas tools são de leitura.
+    pub fn read_only(&self) -> bool {
+        match self {
+            Self::Local { read_only, .. } => *read_only,
+            Self::Remote { .. } => false,
+        }
+    }
+}
+
 /// Configuração do projeto.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -54,6 +124,10 @@ pub struct ProjectConfig {
     /// Acervo persistente do modo docs. Ausente desliga o modo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<archive_config::ArchiveConfig>,
+    /// Servidores MCP por nome. Ausente desliga a feature: nenhuma tool extra
+    /// e nenhuma latência de startup.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerConfig>,
 }
 
 pub use crate::lang::Lang;
@@ -218,6 +292,26 @@ pub enum ProjectConfigError {
     InvalidDocsFolder { path: PathBuf, entry: String },
     #[error("lang inválido em {path}: {value:?} precisa ser `pt-BR` ou `en`")]
     InvalidLang { path: PathBuf, value: String },
+    #[error(
+        "mcp inválido em {path}: o nome do servidor {server:?} precisa casar `[a-z0-9-_]` (minúsculas, sem espaço)"
+    )]
+    InvalidMcpName { path: PathBuf, server: String },
+    #[error(
+        "mcp inválido em {path}: `{server}.command` precisa ser não vazio, começando pelo executável do servidor"
+    )]
+    EmptyMcpCommand { path: PathBuf, server: String },
+    #[error(
+        "mcp inválido em {path}: `{server}.url` {url:?} precisa começar com `http://` ou `https://`"
+    )]
+    InvalidMcpUrl {
+        path: PathBuf,
+        server: String,
+        url: String,
+    },
+    #[error(
+        "mcp inválido em {path}: `{server}` usa `type: \"remote\"`, ainda não suportado; declare `type: \"local\"` com `command` (o cliente remoto chega numa fase seguinte)"
+    )]
+    McpRemoteUnsupported { path: PathBuf, server: String },
 }
 
 pub fn project_path(root: &Path) -> PathBuf {
@@ -297,10 +391,63 @@ pub fn parse_project(text: &str, path: &Path) -> Result<ProjectConfig, ProjectCo
         return Err(ProjectConfigError::EmptyName);
     }
     let docs_folders = normalize_docs_folders(path, &parsed.docs_folders)?;
+    validate_mcp(path, &parsed.mcp)?;
     Ok(ProjectConfig {
         docs_folders,
         ..parsed
     })
+}
+
+/// Valida a seção `mcp` antes de qualquer servidor ser spawnado.
+///
+/// Nome, `command` e transporte são recusados citando o servidor e o caminho
+/// do arquivo; `env` e `headers` nunca entram na mensagem.
+fn validate_mcp(
+    path: &Path,
+    servers: &BTreeMap<String, McpServerConfig>,
+) -> Result<(), ProjectConfigError> {
+    for (server, config) in servers {
+        if server.is_empty()
+            || !server
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            return Err(ProjectConfigError::InvalidMcpName {
+                path: path.to_path_buf(),
+                server: server.clone(),
+            });
+        }
+        match config {
+            McpServerConfig::Local { command, .. } => {
+                if command.is_empty() || command[0].trim().is_empty() {
+                    return Err(ProjectConfigError::EmptyMcpCommand {
+                        path: path.to_path_buf(),
+                        server: server.clone(),
+                    });
+                }
+            }
+            McpServerConfig::Remote { url, .. } => {
+                let remote = url.trim();
+                let rest = remote
+                    .strip_prefix("https://")
+                    .or_else(|| remote.strip_prefix("http://"));
+                // A URL é checada antes do transporte: a entrada quebrada é
+                // recusada pelo defeito real, não pela fase.
+                if rest.map(str::is_empty).unwrap_or(true) {
+                    return Err(ProjectConfigError::InvalidMcpUrl {
+                        path: path.to_path_buf(),
+                        server: server.clone(),
+                        url: url.clone(),
+                    });
+                }
+                return Err(ProjectConfigError::McpRemoteUnsupported {
+                    path: path.to_path_buf(),
+                    server: server.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn read_project(root: &Path) -> Result<ProjectConfig, ProjectConfigError> {
@@ -345,6 +492,7 @@ fn fallback(root: &Path) -> ProjectConfig {
         dashboard_web_port: None,
         space: None,
         archive: None,
+        mcp: BTreeMap::new(),
     }
 }
 
@@ -603,4 +751,204 @@ fn space_can_be_disabled_in_the_project_file() {
 #[cfg(test)]
 fn config(text: &str) -> ProjectConfig {
     parse_project(text, Path::new("ai.project.json")).unwrap()
+}
+
+#[cfg(test)]
+mod mcp_config_tests {
+    use super::*;
+
+    fn project(text: &str) -> ProjectConfig {
+        parse_project(text, Path::new("ai.project.json")).unwrap()
+    }
+
+    #[test]
+    fn an_absent_mcp_section_is_an_empty_map() {
+        assert!(project(r#"{"name":"p"}"#).mcp.is_empty());
+    }
+
+    #[test]
+    fn a_local_server_parses_with_its_defaults() {
+        let config = project(
+            r#"{"name":"p","mcp":{"filesystem":{"type":"local","command":["npx","-y","server-fs","."],"read_only":true}}}"#,
+        );
+        assert_eq!(
+            config.mcp.get("filesystem"),
+            Some(&McpServerConfig::Local {
+                command: vec!["npx".into(), "-y".into(), "server-fs".into(), ".".into()],
+                env: BTreeMap::new(),
+                enabled: true,
+                read_only: true,
+            })
+        );
+        assert!(config.mcp["filesystem"].read_only());
+    }
+
+    #[test]
+    fn a_disabled_server_keeps_its_env() {
+        let config = project(
+            r#"{"name":"p","mcp":{"git":{"type":"local","command":["mcp-git"],"enabled":false,"env":{"TOKEN":"s3cr3t"}}}}"#,
+        );
+        let server = &config.mcp["git"];
+        assert!(!server.enabled());
+        assert_eq!(
+            server,
+            &McpServerConfig::Local {
+                command: vec!["mcp-git".into()],
+                env: BTreeMap::from([("TOKEN".to_string(), "s3cr3t".to_string())]),
+                enabled: false,
+                read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_inside_a_server_is_ignored() {
+        let config = project(
+            r#"{"name":"p","mcp":{"fs":{"type":"local","command":["true"],"future":true}}}"#,
+        );
+        assert_eq!(
+            config.mcp["fs"],
+            McpServerConfig::Local {
+                command: vec!["true".into()],
+                env: BTreeMap::new(),
+                enabled: true,
+                read_only: false,
+            }
+        );
+    }
+
+    fn refusal(text: &str) -> String {
+        parse_project(text, Path::new("ai.project.json"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn a_local_server_without_a_command_is_refused() {
+        let message = refusal(r#"{"name":"p","mcp":{"fs":{"type":"local","command":[]}}}"#);
+        assert!(message.contains("fs"), "{message}");
+        assert!(message.contains("ai.project.json"), "{message}");
+    }
+
+    #[test]
+    fn a_server_name_with_a_space_or_uppercase_is_refused() {
+        for name in ["meu servidor", "Sentry", "sentry/sse"] {
+            let text = format!(
+                r#"{{"name":"p","mcp":{{"{name}":{{"type":"local","command":["true"]}}}}}}"#
+            );
+            let message = refusal(&text);
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains("ai.project.json"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_remote_server_is_refused_with_a_teaching_message() {
+        let message = refusal(
+            r#"{"name":"p","mcp":{"sentry":{"type":"remote","url":"https://mcp.sentry.dev/sse"}}}"#,
+        );
+        assert!(message.contains("sentry"), "{message}");
+        assert!(message.contains("ai.project.json"), "{message}");
+        assert!(message.contains("local"), "{message}");
+        assert!(message.contains("ainda não suportado"), "{message}");
+    }
+
+    #[test]
+    fn a_remote_url_that_is_not_http_is_refused() {
+        for url in ["ftp://example.com/sse", "mcp.sentry.dev/sse", "https://"] {
+            let text = format!(
+                r#"{{"name":"p","mcp":{{"sentry":{{"type":"remote","url":"{url}"}}}}}}"#
+            );
+            let message = refusal(&text);
+            assert!(message.contains("sentry"), "{message}");
+            assert!(message.contains("ai.project.json"), "{message}");
+            assert!(message.contains(url), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_never_echoes_credentials() {
+        let text =
+            r#"{"name":"p","mcp":{"git":{"type":"local","command":[],"env":{"TOKEN":"s3cr3t"}}}}"#;
+        let message = refusal(text);
+        assert!(!message.contains("s3cr3t"), "{message}");
+        assert!(!message.contains("TOKEN"), "{message}");
+    }
+
+    #[test]
+    fn a_recorded_model_window_keeps_the_mcp_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_path(dir.path());
+        std::fs::write(
+            &path,
+            r#"{
+  "name": "projeto",
+  "mcp": {
+    "filesystem": {
+      "type": "local",
+      "command": ["npx", "-y", "server-fs", "."],
+      "env": {"TOKEN": "s3cr3t"},
+      "enabled": false,
+      "read_only": true
+    }
+  },
+  "models": {"openai/gpt": {"context_window": 8192}}
+}"#,
+        )
+        .unwrap();
+
+        assert!(ProjectConfig::record_model_window(dir.path(), "anthropic/claude", 4096).unwrap());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["mcp"],
+            serde_json::json!({
+                "filesystem": {
+                    "type": "local",
+                    "command": ["npx", "-y", "server-fs", "."],
+                    "env": {"TOKEN": "s3cr3t"},
+                    "enabled": false,
+                    "read_only": true
+                }
+            })
+        );
+        assert_eq!(
+            value["models"]["anthropic/claude"]["context_window"],
+            serde_json::json!(4096)
+        );
+
+        let config = read_project(dir.path()).unwrap();
+        assert_eq!(
+            config.mcp["filesystem"],
+            McpServerConfig::Local {
+                command: vec!["npx".into(), "-y".into(), "server-fs".into(), ".".into()],
+                env: BTreeMap::from([("TOKEN".to_string(), "s3cr3t".to_string())]),
+                enabled: false,
+                read_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_written_config_keeps_the_mcp_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = project_path(dir.path());
+        std::fs::write(
+            &path,
+            r#"{"name":"projeto","mcp":{"fs":{"type":"local","command":["true"]}}}"#,
+        )
+        .unwrap();
+
+        let config = read_project(dir.path()).unwrap();
+        write_project(&path, &config).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["mcp"],
+            serde_json::json!({"fs": {"type": "local", "command": ["true"]}})
+        );
+        assert_eq!(read_project(dir.path()).unwrap(), config);
+    }
 }

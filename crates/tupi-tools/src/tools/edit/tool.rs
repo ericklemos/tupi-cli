@@ -5,10 +5,10 @@ impl Tool for EditTool {
         crate::support::effect::writes(arguments)
     }
 
-    fn spec(&self) -> ToolSpec {
+    fn spec(&self) -> ToolSpec     {
         ToolSpec {
             name: "edit".to_string(),
-            description: "Edita o corpo de um símbolo por span de AST, com expected_hash do read. Recusa hash divergente, símbolo ambíguo ou sintaxe inválida.".to_string(),
+            description: "Edita uma região do arquivo por âncora literal única: `old`+`new`, texto exato que precisa casar 1 vez em qualquer arquivo UTF-8 (md/yaml/toml/py/ts/go/sql inclusive). Em Rust, `symbol`+`new_body` endereça o corpo por AST. Exige `expected_hash` do read; recusa hash divergente, 0 ou >1 ocorrências de `old`, símbolo ambíguo e sintaxe inválida, sem escrever.".to_string(),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -16,21 +16,29 @@ impl Tool for EditTool {
                         "type": "string",
                         "description": "Caminho relativo ao diretório raiz do projeto."
                     },
-                    "symbol": {
-                        "type": "string",
-                        "description": "Nome simples (`verify`) ou qualificado (`Auth::verify`, `Default::new`)."
-                    },
                     "expected_hash": {
                         "type": "string",
-                        "description": "blake3 do arquivo inteiro, como `read` imprime no cabeçalho (prefixo de 12 caracteres aceito)."
+                        "description": "blake3 do arquivo inteiro, como `read` imprime no cabeçalho (prefixo de 12 caracteres aceito). Obrigatório."
+                    },
+                    "old": {
+                        "type": "string",
+                        "description": "Rota literal: trecho copiado byte a byte de `read`/`lookup lines`, indentação e quebras de linha incluídas. Precisa casar exatamente 1 vez; 0 ou mais de uma recusa sem escrever."
+                    },
+                    "new": {
+                        "type": "string",
+                        "description": "Rota literal: texto que substitui `old`. Vazio apaga o trecho."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Rota AST (só Rust): nome simples (`verify`) ou qualificado (`Auth::verify`, `Default::new`). Alternativa a `old`+`new`, nunca junto."
                     },
                     "new_body": {
                         "type": "string",
-                        "description": "Novo bloco `{ … }` completo, chaves incluídas. O splice é de bytes crus: sem reindentação e sem formatação."
+                        "description": "Rota AST: novo bloco `{ … }` completo do símbolo `symbol`, chaves incluídas. O splice é de bytes crus: sem reindentação e sem formatação."
                     },
                     "signature": {
                         "type": "string",
-                        "description": "Opcional: substitui tudo o que antecede o `{` (assinatura, genéricos, where). Sem ele, a assinatura fica como está."
+                        "description": "Opcional, rota AST: substitui tudo o que antecede o `{` (assinatura, genéricos, where). Sem ele, a assinatura fica como está."
                     },
                     "budget_tokens": {
                         "type": "integer",
@@ -38,7 +46,7 @@ impl Tool for EditTool {
                         "description": "Teto de tokens (excedente em peek)."
                     }
                 },
-                "required": ["path", "symbol", "expected_hash", "new_body"]
+                "required": ["path", "expected_hash"]
             }),
         }
     }
